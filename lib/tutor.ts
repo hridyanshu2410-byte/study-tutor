@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 // What the tutor decides each turn. Everything under `private` stays on the
-// server: the student only ever receives `move`, `say`, `write` and `mark`.
+// server: the student only ever receives `move`, `say` and `annotations`.
 export const TutorTurnSchema = z.object({
   private: z.object({
     reading: z
@@ -16,29 +16,32 @@ export const TutorTurnSchema = z.object({
   }),
   move: z.enum(["wait", "ask_plan", "point", "name_concept", "simpler_example", "next_step", "worked_solution", "affirm", "check_understanding"]),
   say: z.string().describe("What you say out loud. Empty string if move is wait."),
-  write: z
-    .string()
-    .nullable()
-    .describe("A few words or a short expression you write on the page beside the student's work, or null."),
-  mark: z
-    .object({
-      line_id: z.string(),
-      kind: z.enum(["circle", "underline", "question", "check"]),
-    })
-    .nullable()
-    .describe("Ink you add to one of the student's lines, or null."),
+  annotations: z
+    .array(
+      z.object({
+        kind: z.enum(["circle", "underline", "strike", "check", "question", "note"]),
+        line_id: z.string().describe("The line this applies to, such as L2."),
+        from_token: z.number().int().nullable().describe("First token number in that line, or null for the whole line."),
+        to_token: z.number().int().nullable().describe("Last token number (inclusive), or null for a single token."),
+        text: z.string().nullable().describe("For a note: the few words or the expression you write. Otherwise null."),
+        placement: z.enum(["right", "above", "below"]).nullable().describe("For a note: where it goes relative to what it is about."),
+        arrow: z.boolean().describe("For a note: draw an arrow from the previous mark (or the target) to the note."),
+      }),
+    )
+    .describe("Ink you add to the page, drawn in this order like a pen. Usually zero to three items."),
 });
 
 export type TutorTurn = z.infer<typeof TutorTurnSchema>;
-export type PublicTurn = Pick<TutorTurn, "move" | "say" | "write" | "mark">;
+export type PublicTurn = Pick<TutorTurn, "move" | "say" | "annotations">;
 
 export type TutorRequest = {
   sessionId: string;
   problem: string;
   trigger: "pause" | "asked" | "spoke";
   speech: string | null;
-  lines: { id: string; box: { x: number; y: number; w: number; h: number } }[];
-  pageImage: string; // PNG data URL of the student's page with line labels
+  lines: { id: string; tokens: number }[];
+  pageImage: string; // PNG data URL of the student's page, clean
+  tokenImage: string; // the same page with each line's tokens boxed and numbered
 };
 
 export const LADDER: TutorTurn["move"][] = [
@@ -68,10 +71,14 @@ How you sound:
 - Treat mistakes as normal and useful: "Nice, this is exactly where most people slip." Never say "wrong" or "incorrect"; point at the line and ask.
 - Ask one question at a time and then stop.
 
-What you write on the page:
-- Very little: a word, a question, or a short expression, at most about six words, the way a tutor jots in the margin. Use null when speaking is enough.
-- Marks: "question" puts a small question mark beside a line, "circle" circles it, "underline" underlines it, "check" ticks a correct line. Only mark lines that exist (L1, L2, ...). When pointing at a mistake, mark the first wrong line.
+What you put on the page, like a tutor's pen:
+- You have two pictures of the page. The first is the student's work as written. The second is the same page with each line labelled (L1, L2, ...) and each line split into numbered tokens in small boxes, so you can point at an exact part: a sign, an exponent, one term.
+- Point at the smallest part that is wrong, not the whole line: circle the 2 in the exponent, underline the term that was dropped, strike a sign. Use token numbers (from_token to to_token, inclusive). Use null tokens only when the whole line is meant.
+- Marks: circle (the main way to point), underline (something missing or worth a second look), strike (only when the student asks you to correct it, or at next_step and later), check (tick a correct line, sparingly), question (a small question mark beside it).
+- A note is a few words you write, at most about six, the way a tutor jots in the margin: a question ("what's d/dx of x²?"), a nudge ("inside function?"), or, only from next_step onward, the correction itself. Put the note after the mark it belongs to and set arrow to true to connect them, so the student sees circle, then arrow, then your words. Prefer placement "right" unless the line is long; "above" for a part near the start of a line.
+- Most turns need no ink, or one mark and one short note. Never write the final answer as a note before worked_solution.
+- Write math in notes with plain characters a person would write: x², √, π, ≠, ±, →, and / for fractions.
 
 Honesty: if the problem is clearly a graded assignment, coach the ideas on a parallel example rather than working the submitted question.
 
-Read the student's lines carefully from the image. Each line is labelled at its left with its id in small grey text. Your private notes are never shown to the student; use them to transcribe each line, find the first mistake and keep the full solution for yourself.`;
+Read the student's lines carefully from the first image; use the second only to find line and token numbers. Your private notes are never shown to the student; use them to transcribe each line, find the first mistake and keep the full solution for yourself.`;

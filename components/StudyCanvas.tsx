@@ -7,33 +7,35 @@ import {
   groupLines,
   screenToWorld,
   zoomAt,
-  type Box,
   type Camera,
   type InkLine,
   type Point,
   type Stroke,
 } from "@/lib/ink";
 import type { PublicTurn, TutorRequest } from "@/lib/tutor";
+import { planAnnotations, strokeAt, type PenPlan } from "@/lib/handwriting";
 import { listen, speak, speechInputSupported, stopSpeaking } from "@/lib/voice";
 
 type Tool = "pen" | "eraser" | "hand";
 type TutorState = "idle" | "thinking" | "speaking" | "listening";
 
-type TutorInk =
-  | { id: string; kind: "text"; text: string; x: number; y: number; size: number; born: number; duration: number }
-  | { id: string; kind: "mark"; mark: "circle" | "underline" | "question" | "check"; box: Box; born: number; duration: number };
+// One turn's worth of tutor pen strokes. `born` is when the pen started, in
+// performance.now() time; 0 means already fully written (e.g. restored).
+type TutorInk = { id: string; plan: PenPlan; born: number };
 
 const STUDENT_INK = "#1f2a44";
 const TUTOR_INK = "#c2410c";
 const PAUSE_MS = 3200;
-const STORAGE_KEY = "study-tutor:page:v1";
+const STORAGE_KEY = "study-tutor:page:v2";
 
 export default function StudyCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const strokes = useRef<Stroke[]>([]);
   const paths = useRef(new Map<string, Path2D>());
+  const tutorPaths = useRef(new Map<string, Path2D>());
   const tutorInk = useRef<TutorInk[]>([]);
   const camera = useRef<Camera>({ x: -40, y: -40, z: 1 });
+  const glide = useRef<{ from: Camera; to: Camera; start: number } | null>(null);
   const drawing = useRef<{ stroke: Stroke; pointerId: number; simulate: boolean } | null>(null);
   const pointers = useRef(new Map<number, { x: number; y: number; type: string }>());
   const pinch = useRef<{ dist: number; cx: number; cy: number } | null>(null);
@@ -45,7 +47,6 @@ export default function StudyCanvas() {
   const undoStack = useRef<Stroke[][]>([]);
   const stopListening = useRef<(() => void) | null>(null);
   const sessionId = useRef("");
-  const fontFamily = useRef("cursive");
 
   const [tool, setTool] = useState<Tool>("pen");
   const [problem, setProblem] = useState("");
@@ -62,8 +63,6 @@ export default function StudyCanvas() {
   useEffect(() => {
     sessionId.current = crypto.randomUUID();
     setCanListen(speechInputSupported());
-    fontFamily.current =
-      getComputedStyle(document.documentElement).getPropertyValue("--font-tutor").trim() || "cursive";
     document.fonts?.ready.then(() => (dirty.current = true));
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null");
@@ -120,7 +119,15 @@ export default function StudyCanvas() {
       raf = requestAnimationFrame(frame);
       const canvas = canvasRef.current;
       if (!canvas) return;
-      const animating = tutorInk.current.some((t) => t.born > 0 && now - t.born < t.duration);
+      if (glide.current) {
+        const g = glide.current;
+        const f = Math.min(1, (now - g.start) / 450);
+        const e = f * f * (3 - 2 * f);
+        camera.current = { x: g.from.x + (g.to.x - g.from.x) * e, y: g.from.y + (g.to.y - g.from.y) * e, z: g.from.z };
+        if (f === 1) glide.current = null;
+        dirty.current = true;
+      }
+      const animating = tutorInk.current.some((t) => t.born > 0 && now - t.born < t.plan.duration + 50);
       if (!dirty.current && !animating) return;
       dirty.current = false;
 
@@ -141,7 +148,7 @@ export default function StudyCanvas() {
         ctx.fillStyle = s.color;
         ctx.fill(pathFor(s, drawing.current?.stroke.id === s.id ? drawing.current.simulate : false));
       }
-      for (const t of tutorInk.current) drawTutorInk(ctx, t, now, fontFamily.current);
+      for (const t of tutorInk.current) drawTutorInk(ctx, t, now, tutorPaths.current);
     };
     raf = requestAnimationFrame(frame);
     const onResize = () => (dirty.current = true);
@@ -172,8 +179,8 @@ export default function StudyCanvas() {
             problem: stateRef.current.problem,
             trigger,
             speech,
-            lines: lines.map(({ id, box }) => ({ id, box })),
-            pageImage: renderPageImage(strokes.current, lines),
+            lines: lines.map((l) => ({ id: l.id, tokens: l.tokens.length })),
+            ...renderPageImages(strokes.current, lines),
           } satisfies TutorRequest),
         });
         const data = await res.json();
@@ -189,30 +196,16 @@ export default function StudyCanvas() {
   );
 
   const respond = (turn: PublicTurn, lines: InkLine[]) => {
-    if (turn.move === "wait" || (!turn.say && !turn.write && !turn.mark)) {
+    if (turn.move === "wait" || (!turn.say && !turn.annotations.length)) {
       setTutorState("idle");
       return;
     }
-    const now = performance.now();
-    const target = turn.mark ? lines.find((l) => l.id === turn.mark!.line_id) : lines.at(-1);
-    let delay = 0;
-    if (turn.mark && target) {
-      tutorInk.current.push({ id: crypto.randomUUID(), kind: "mark", mark: turn.mark.kind, box: target.box, born: now, duration: 650 });
-      delay = 500;
-    }
-    if (turn.write) {
-      const anchor = target?.box ?? visibleTopLeft();
-      const size = Math.max(26, Math.min(44, (target?.box.h ?? 40) * 0.8));
-      tutorInk.current.push({
-        id: crypto.randomUUID(),
-        kind: "text",
-        text: turn.write,
-        x: anchor.x + anchor.w + 40,
-        y: anchor.y + anchor.h / 2 + size / 3,
-        size,
-        born: now + delay,
-        duration: 260 + turn.write.length * 75,
-      });
+    if (turn.annotations.length) {
+      const plan = planAnnotations(turn.annotations, lines, Math.floor(Math.random() * 2 ** 31));
+      if (plan.strokes.length) {
+        tutorInk.current.push({ id: crypto.randomUUID(), plan, born: performance.now() + 250 });
+        revealIfOffscreen(plan);
+      }
     }
     dirty.current = true;
     save();
@@ -229,9 +222,20 @@ export default function StudyCanvas() {
     }
   };
 
-  const visibleTopLeft = (): Box => {
-    const c = camera.current;
-    return { x: c.x + 40 / c.z, y: c.y + 80 / c.z, w: 0, h: 40 };
+  // If the tutor writes somewhere off screen, glide the page so it is visible.
+  const revealIfOffscreen = (plan: PenPlan) => {
+    const canvas = canvasRef.current;
+    if (!plan.box || !canvas) return;
+    const cam = camera.current;
+    const w = canvas.clientWidth / cam.z;
+    const h = (canvas.clientHeight - 160) / cam.z;
+    const b = plan.box;
+    const dx = b.x + b.w > cam.x + w - 40 ? b.x + b.w - (cam.x + w - 40) : b.x < cam.x + 20 ? b.x - (cam.x + 20) : 0;
+    const dy = b.y + b.h > cam.y + h ? b.y + b.h - (cam.y + h) : b.y < cam.y + 80 / cam.z ? b.y - (cam.y + 80 / cam.z) : 0;
+    if (dx || dy) {
+      glide.current = { from: cam, to: { ...cam, x: cam.x + dx, y: cam.y + dy }, start: performance.now() };
+      dirty.current = true;
+    }
   };
 
   const schedulePause = () => {
@@ -251,10 +255,10 @@ export default function StudyCanvas() {
     const [wx, wy] = screenToWorld(camera.current, sx, sy);
     const before = strokes.current.length;
     strokes.current = strokes.current.filter((s) => distanceToStroke(s, wx, wy) > 12 / camera.current.z);
-    tutorInk.current = tutorInk.current.filter((t) => {
-      const b = t.kind === "mark" ? t.box : { x: t.x, y: t.y - t.size, w: t.text.length * t.size * 0.45, h: t.size };
-      return !(wx > b.x && wx < b.x + b.w && wy > b.y && wy < b.y + b.h);
-    });
+    const reach = 12 / camera.current.z;
+    tutorInk.current = tutorInk.current.filter(
+      (t) => !t.plan.strokes.some((st) => st.points.some(([x, y]) => Math.abs(x - wx) < reach && Math.abs(y - wy) < reach)),
+    );
     if (strokes.current.length !== before) changedSinceTutor.current = true;
     dirty.current = true;
   };
@@ -266,6 +270,7 @@ export default function StudyCanvas() {
     pointers.current.set(e.pointerId, { x: sx, y: sy, type: e.pointerType });
     if (e.pointerType === "pen") penSeen.current = true;
     stopSpeaking();
+    glide.current = null;
     if (stateRef.current.tutorState === "speaking") setTutorState("idle");
 
     const touches = [...pointers.current.values()].filter((p) => p.type === "touch");
@@ -424,6 +429,7 @@ export default function StudyCanvas() {
     strokes.current = [];
     tutorInk.current = [];
     paths.current.clear();
+    tutorPaths.current.clear();
     sessionId.current = crypto.randomUUID();
     dirty.current = true;
     save();
@@ -523,70 +529,70 @@ function drawPaper(ctx: CanvasRenderingContext2D, cam: Camera, w: number, h: num
   for (let x = ox; x < w; x += step) for (let y = oy; y < h; y += step) ctx.fillRect(x - 0.75, y - 0.75, 1.5, 1.5);
 }
 
-function drawTutorInk(ctx: CanvasRenderingContext2D, t: TutorInk, now: number, family: string) {
-  const p = t.born === 0 ? 1 : Math.max(0, Math.min(1, (now - t.born) / t.duration));
-  if (p === 0) return;
+// Tutor strokes go through the same pen model as the student's ink, with
+// pressure simulated from speed so lines swell and taper like real ink.
+function drawTutorInk(ctx: CanvasRenderingContext2D, ink: TutorInk, now: number, cache: Map<string, Path2D>) {
+  const t = ink.born === 0 ? Infinity : now - ink.born;
   ctx.save();
-  ctx.strokeStyle = TUTOR_INK;
   ctx.fillStyle = TUTOR_INK;
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-  ctx.lineWidth = 2.6;
-
-  if (t.kind === "text") {
-    // Written left to right like a pen: reveal the glyphs through a moving clip.
-    ctx.font = `${t.size}px ${family}`;
-    const width = ctx.measureText(t.text).width;
-    ctx.beginPath();
-    ctx.rect(t.x - 4, t.y - t.size * 1.2, (width + 8) * easeOut(p), t.size * 1.8);
-    ctx.clip();
-    ctx.fillText(t.text, t.x, t.y);
-  } else {
-    const { x, y, w, h } = t.box;
-    const e = easeOut(p);
-    ctx.beginPath();
-    if (t.mark === "circle") {
-      // Slightly tilted and overshooting, the way a hand circles something.
-      const cx = x + w / 2, cy = y + h / 2;
-      const start = -Math.PI * 0.6;
-      ctx.ellipse(cx, cy, w / 2 + 18, h / 2 + 14, -0.04, start, start + Math.PI * 2.15 * e);
-    } else if (t.mark === "underline") {
-      ctx.moveTo(x - 4, y + h + 8);
-      ctx.quadraticCurveTo(x + w / 2, y + h + 14, x - 4 + (w + 8) * e, y + h + 7);
-    } else if (t.mark === "check") {
-      const cx = x + w + 24, cy = y + h / 2;
-      const pts: [number, number][] = [[cx - 10, cy], [cx - 2, cy + 10], [cx + 16, cy - 16]];
-      ctx.moveTo(...pts[0]);
-      if (e < 0.35) ctx.lineTo(pts[0][0] + (pts[1][0] - pts[0][0]) * (e / 0.35), pts[0][1] + (pts[1][1] - pts[0][1]) * (e / 0.35));
+  ink.plan.strokes.forEach((s, i) => {
+    const key = `${ink.id}:${i}`;
+    let path = cache.get(key);
+    if (!path) {
+      const pts = strokeAt(s, t);
+      if (!pts) return;
+      const done = t >= s.end;
+      path = outlinePath(
+        getStroke(pts, {
+          size: 3.6,
+          thinning: 0.55,
+          smoothing: 0.6,
+          streamline: 0.2,
+          simulatePressure: true,
+          start: { taper: 10 },
+          end: { taper: done ? 8 : 0 },
+          last: done,
+        }),
+      );
+      if (done) cache.set(key, path);
       else {
-        ctx.lineTo(...pts[1]);
-        const k = (e - 0.35) / 0.65;
-        ctx.lineTo(pts[1][0] + (pts[2][0] - pts[1][0]) * k, pts[1][1] + (pts[2][1] - pts[1][1]) * k);
+        // the pen nib, while it is moving
+        const [x, y] = pts[pts.length - 1];
+        ctx.beginPath();
+        ctx.arc(x, y, 2.2, 0, Math.PI * 2);
+        ctx.fill();
       }
-    } else {
-      ctx.font = `${Math.max(30, h)}px ${family}`;
-      ctx.globalAlpha = e;
-      ctx.fillText("?", x - 34, y + h * 0.8);
     }
-    ctx.stroke();
-  }
+    ctx.fill(path);
+  });
   ctx.restore();
 }
 
-function easeOut(p: number) {
-  return 1 - Math.pow(1 - p, 2);
+function outlinePath(outline: number[][]): Path2D {
+  const p = new Path2D();
+  if (!outline.length) return p;
+  p.moveTo(outline[0][0], outline[0][1]);
+  for (let i = 1; i < outline.length; i++) {
+    const [x0, y0] = outline[i];
+    const [x1, y1] = outline[(i + 1) % outline.length];
+    p.quadraticCurveTo(x0, y0, (x0 + x1) / 2, (y0 + y1) / 2);
+  }
+  p.closePath();
+  return p;
 }
 
-// The tutor sees exactly the student's ink, with each line labelled so it can
-// refer to lines by id. Tutor ink is left out so it never "reads" itself.
-function renderPageImage(strokes: Stroke[], lines: InkLine[]): string {
-  const canvas = document.createElement("canvas");
+// The tutor gets two pictures: the clean page to read, and the same page with
+// line ids and numbered token boxes so it can point at an exact part.
+// Tutor ink is left out of both so it never "reads" itself.
+function renderPageImages(strokes: Stroke[], lines: InkLine[]): { pageImage: string; tokenImage: string } {
   if (!lines.length) {
-    canvas.width = canvas.height = 64;
-    const ctx = canvas.getContext("2d")!;
+    const blank = document.createElement("canvas");
+    blank.width = blank.height = 64;
+    const ctx = blank.getContext("2d")!;
     ctx.fillStyle = "#fff";
     ctx.fillRect(0, 0, 64, 64);
-    return canvas.toDataURL("image/png");
+    const url = blank.toDataURL("image/png");
+    return { pageImage: url, tokenImage: url };
   }
   let box = lines[0].box;
   for (const l of lines) {
@@ -594,25 +600,37 @@ function renderPageImage(strokes: Stroke[], lines: InkLine[]): string {
     box = { x, y, w: Math.max(box.x + box.w, l.box.x + l.box.w) - x, h: Math.max(box.y + box.h, l.box.y + l.box.h) - y };
   }
   const margin = 60;
-  const scale = Math.min(1.5, 1600 / (box.w + 2 * margin), 1600 / (box.h + 2 * margin));
-  canvas.width = Math.ceil((box.w + 2 * margin) * scale);
-  canvas.height = Math.ceil((box.h + 2 * margin) * scale);
-  const ctx = canvas.getContext("2d")!;
-  ctx.fillStyle = "#fff";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.setTransform(scale, 0, 0, scale, (margin - box.x) * scale, (margin - box.y) * scale);
-  ctx.fillStyle = STUDENT_INK;
-  for (const s of strokes) {
-    const outline = getStroke(s.points, { size: s.size, thinning: 0.6, smoothing: 0.55, streamline: 0.45 });
-    if (!outline.length) continue;
-    ctx.beginPath();
-    ctx.moveTo(outline[0][0], outline[0][1]);
-    for (const [x, y] of outline.slice(1)) ctx.lineTo(x, y);
-    ctx.closePath();
-    ctx.fill();
-  }
-  ctx.fillStyle = "#9aa1ad";
-  ctx.font = `${14 / scale}px sans-serif`;
-  for (const l of lines) ctx.fillText(l.id, box.x - margin + 6 / scale, l.box.y + l.box.h / 2 + 5 / scale);
-  return canvas.toDataURL("image/png");
+  const scale = Math.min(1.5, 1500 / (box.w + 2 * margin), 1500 / (box.h + 2 * margin));
+
+  const draw = (labels: boolean) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.ceil((box.w + 2 * margin) * scale);
+    canvas.height = Math.ceil((box.h + 2 * margin) * scale);
+    const ctx = canvas.getContext("2d")!;
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.setTransform(scale, 0, 0, scale, (margin - box.x) * scale, (margin - box.y) * scale);
+    ctx.fillStyle = STUDENT_INK;
+    for (const s of strokes) {
+      const outline = getStroke(s.points, { size: s.size, thinning: 0.6, smoothing: 0.55, streamline: 0.45 });
+      if (outline.length) ctx.fill(outlinePath(outline));
+    }
+    if (labels) {
+      const px = 1 / scale;
+      ctx.font = `${13 * px}px sans-serif`;
+      ctx.lineWidth = px;
+      for (const l of lines) {
+        ctx.fillStyle = "#6b7280";
+        ctx.fillText(l.id, box.x - margin + 6 * px, l.box.y + l.box.h / 2 + 5 * px);
+        for (const t of l.tokens) {
+          ctx.strokeStyle = "rgba(37, 99, 235, 0.55)";
+          ctx.strokeRect(t.box.x - 2 * px, t.box.y - 2 * px, t.box.w + 4 * px, t.box.h + 4 * px);
+          ctx.fillStyle = "#2563eb";
+          ctx.fillText(String(t.n), t.box.x, t.box.y - 4 * px);
+        }
+      }
+    }
+    return canvas.toDataURL("image/png");
+  };
+  return { pageImage: draw(false), tokenImage: draw(true) };
 }

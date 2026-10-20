@@ -13,7 +13,9 @@ export type Stroke = {
 
 export type Box = { x: number; y: number; w: number; h: number };
 
-export type InkLine = { id: string; box: Box; strokeIds: string[] };
+export type InkToken = { n: number; box: Box; strokeIds: string[] };
+
+export type InkLine = { id: string; box: Box; strokeIds: string[]; tokens: InkToken[] };
 
 export type Camera = { x: number; y: number; z: number };
 
@@ -54,9 +56,64 @@ export function groupLines(strokes: Stroke[]): InkLine[] {
       lines.push({ box: item.box, strokeIds: [item.id] });
     }
   }
+  mergeSmallLines(lines);
+  const boxes = new Map(items.map((i) => [i.id, i.box]));
   return lines
     .sort((a, b) => a.box.y - b.box.y)
-    .map((l, i) => ({ id: `L${i + 1}`, box: l.box, strokeIds: l.strokeIds }));
+    .map((l, i) => ({ id: `L${i + 1}`, box: l.box, strokeIds: l.strokeIds, tokens: groupTokens(l.strokeIds, boxes, l.box.h) }));
+}
+
+// A first pass can leave thin pieces (the second bar of "=", a minus sign, an
+// exponent) as lines of their own. Fold any line that is much shorter than a
+// neighbour and sits within its band back into it.
+function mergeSmallLines(lines: { box: Box; strokeIds: string[] }[]) {
+  for (let merged = true; merged; ) {
+    merged = false;
+    outer: for (let i = 0; i < lines.length; i++) {
+      for (let j = 0; j < lines.length; j++) {
+        const big = lines[i];
+        const small = lines[j];
+        if (i === j || small.box.h >= big.box.h * 0.7) continue;
+        const cy = small.box.y + small.box.h / 2;
+        const inBand = cy > big.box.y - big.box.h * 0.3 && cy < big.box.y + big.box.h * 1.3;
+        const near = small.box.x < big.box.x + big.box.w + big.box.h && small.box.x + small.box.w > big.box.x - big.box.h;
+        if (inBand && near) {
+          big.box = unionBox(big.box, small.box);
+          big.strokeIds.push(...small.strokeIds);
+          lines.splice(j, 1);
+          merged = true;
+          break outer;
+        }
+      }
+    }
+  }
+}
+
+// Splits a line into tokens (roughly symbols or short terms) at horizontal
+// gaps, so the tutor can circle "the 2 in x squared" instead of a whole line.
+function groupTokens(strokeIds: string[], boxes: Map<string, Box>, lineHeight: number): InkToken[] {
+  const gap = Math.min(lineHeight, 70) * 0.12;
+  const sorted = strokeIds.map((id) => ({ id, box: boxes.get(id)! })).sort((a, b) => a.box.x - b.box.x);
+  const tokens: { box: Box; strokeIds: string[] }[] = [];
+  for (const s of sorted) {
+    const last = tokens.at(-1);
+    if (last && s.box.x <= last.box.x + last.box.w + gap) {
+      last.box = unionBox(last.box, s.box);
+      last.strokeIds.push(s.id);
+    } else {
+      tokens.push({ box: s.box, strokeIds: [s.id] });
+    }
+  }
+  return tokens.map((t, i) => ({ n: i + 1, ...t }));
+}
+
+export function spanBox(line: InkLine, from: number, to: number): Box {
+  const clamp = (n: number) => Math.max(1, Math.min(line.tokens.length, n));
+  const lo = clamp(Math.min(from, to));
+  const hi = clamp(Math.max(from, to));
+  const picked = line.tokens.filter((t) => t.n >= lo && t.n <= hi);
+  if (!picked.length) return line.box;
+  return picked.slice(1).reduce((b, t) => unionBox(b, t.box), picked[0].box);
 }
 
 function verticalOverlap(a: Box, b: Box): number {

@@ -14,9 +14,11 @@ export async function POST(req: Request) {
     return Response.json({ error: "The tutor needs ANTHROPIC_API_KEY in .env.local" }, { status: 500 });
   }
   const body = (await req.json()) as TutorRequest;
-  const match = /^data:image\/png;base64,(.+)$/.exec(body.pageImage ?? "");
-  if (!body.sessionId || !match) {
-    return Response.json({ error: "sessionId and a PNG pageImage are required" }, { status: 400 });
+  const png = (url: string | undefined) => /^data:image\/png;base64,(.+)$/.exec(url ?? "")?.[1];
+  const page = png(body.pageImage);
+  const tokens = png(body.tokenImage);
+  if (!body.sessionId || !page || !tokens) {
+    return Response.json({ error: "sessionId, pageImage and tokenImage (PNG) are required" }, { status: 400 });
   }
 
   const memory = sessions.get(body.sessionId) ?? { turns: [] };
@@ -28,15 +30,14 @@ export async function POST(req: Request) {
     .map(
       (t, i) =>
         `Turn ${i + 1} (${t.trigger})${t.speech ? `, student said: "${t.speech}"` : ""}\n` +
-        `  you chose ${t.turn.move}; said: "${t.turn.say}"; wrote: ${t.turn.write ?? "nothing"}; ` +
-        `mark: ${t.turn.mark ? `${t.turn.mark.kind} on ${t.turn.mark.line_id}` : "none"}\n` +
+        `  you chose ${t.turn.move}; said: "${t.turn.say}"; ink: ${describeInk(t.turn)}\n` +
         `  private diagnosis then: ${t.turn.private.diagnosis}`,
     )
     .join("\n");
 
   const situation = [
     `Problem the student is working on: ${body.problem.trim() || "not stated; infer it from the page"}`,
-    `Lines on the page: ${body.lines.map((l) => l.id).join(", ") || "none yet"}`,
+    `Lines on the page: ${body.lines.map((l) => `${l.id} (${l.tokens} tokens)`).join(", ") || "none yet"}`,
     history ? `Earlier turns this session:\n${history}` : "This is the first turn of the session.",
     `Last hint-ladder rung used: ${lastRung}`,
     body.trigger === "pause"
@@ -56,7 +57,10 @@ export async function POST(req: Request) {
         {
           role: "user",
           content: [
-            { type: "image", source: { type: "base64", media_type: "image/png", data: match[1] } },
+            { type: "text", text: "The student's page:" },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: page } },
+            { type: "text", text: "The same page with line ids and numbered tokens:" },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: tokens } },
             { type: "text", text: situation },
           ],
         },
@@ -69,10 +73,10 @@ export async function POST(req: Request) {
 
     const turn = response.parsed_output;
     const known = new Set(body.lines.map((l) => l.id));
-    if (turn.mark && !known.has(turn.mark.line_id)) turn.mark = null;
+    turn.annotations = turn.annotations.filter((a) => known.has(a.line_id) || a.kind === "note").slice(0, 4);
     memory.turns.push({ trigger: body.trigger, speech: body.speech, turn });
 
-    const publicTurn: PublicTurn = { move: turn.move, say: turn.say, write: turn.write, mark: turn.mark };
+    const publicTurn: PublicTurn = { move: turn.move, say: turn.say, annotations: turn.annotations };
     return Response.json(publicTurn);
   } catch (err) {
     if (err instanceof Anthropic.AuthenticationError) {
@@ -89,5 +93,15 @@ export async function POST(req: Request) {
 }
 
 function fallbackTurn(say: string): PublicTurn {
-  return { move: "ask_plan", say, write: null, mark: null };
+  return { move: "ask_plan", say, annotations: [] };
+}
+
+function describeInk(turn: TutorTurn): string {
+  if (!turn.annotations.length) return "none";
+  return turn.annotations
+    .map((a) => {
+      const where = a.from_token == null ? a.line_id : `${a.line_id} tokens ${a.from_token}-${a.to_token ?? a.from_token}`;
+      return a.kind === "note" ? `note "${a.text}" near ${where}` : `${a.kind} on ${where}`;
+    })
+    .join(", ");
 }

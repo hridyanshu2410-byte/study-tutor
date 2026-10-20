@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { groupLines, zoomAt, screenToWorld, type Stroke } from "./ink.ts";
+import { groupLines, spanBox, zoomAt, screenToWorld, type Stroke } from "./ink.ts";
 
 const stroke = (id: string, x: number, y: number, w = 40, h = 30): Stroke => ({
   id,
@@ -32,4 +32,22 @@ test("zooming keeps the world point under the cursor fixed", () => {
   const before = screenToWorld(cam, 300, 200);
   const after = screenToWorld(zoomAt(cam, 300, 200, 2), 300, 200);
   assert.deepEqual(after.map((v) => Math.round(v * 1e6)), before.map((v) => Math.round(v * 1e6)));
+});
+
+test("a line splits into tokens at gaps, and spans cover the chosen tokens", () => {
+  // "2x + 3": strokes at x=0..40 and 42..82 nearly touch (one token), then gaps.
+  const [line] = groupLines([stroke("2", 0, 0), stroke("x", 42, 0), stroke("+", 140, 0), stroke("3", 240, 0)]);
+  assert.deepEqual(line.tokens.map((t) => t.strokeIds), [["2", "x"], ["+"], ["3"]]);
+  const span = spanBox(line, 2, 3);
+  assert.equal(span.x, 140);
+  assert.equal(span.w, 140);
+  assert.deepEqual(spanBox(line, 9, 12), line.tokens[2].box);
+});
+
+test("the second bar of an equals sign stays on its line", () => {
+  const bar = (id: string, y: number): Stroke => ({ id, color: "#000", size: 3.6, createdAt: 0, points: [[200, y, 0.5], [240, y, 0.5]] });
+  const lines = groupLines([stroke("y", 120, 113, 30, 100), bar("eq1", 140), bar("eq2", 158), stroke("next", 120, 300, 30, 100)]);
+  assert.equal(lines.length, 2);
+  assert.deepEqual(lines[0].strokeIds.sort(), ["eq1", "eq2", "y"]);
+  assert.deepEqual(lines[0].tokens.map((t) => t.strokeIds.sort()), [["y"], ["eq1", "eq2"]]);
 });
