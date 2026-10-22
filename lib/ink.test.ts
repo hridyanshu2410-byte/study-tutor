@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { groupLines, spanBox, zoomAt, screenToWorld, type Stroke } from "./ink.ts";
+import { groupLines, spanBox, zoomAt, screenToWorld, strokesInLasso, type Stroke } from "./ink.ts";
 
 const stroke = (id: string, x: number, y: number, w = 40, h = 30): Stroke => ({
   id,
@@ -50,4 +50,15 @@ test("the second bar of an equals sign stays on its line", () => {
   assert.equal(lines.length, 2);
   assert.deepEqual(lines[0].strokeIds.sort(), ["eq1", "eq2", "y"]);
   assert.deepEqual(lines[0].tokens.map((t) => t.strokeIds.sort()), [["y"], ["eq1", "eq2"]]);
+});
+
+test("a lasso keeps the strokes it mostly encloses", () => {
+  const loop: [number, number][] = [
+    [0, 0],
+    [200, 0],
+    [200, 100],
+    [0, 100],
+  ];
+  const picked = strokesInLasso([stroke("in", 20, 20), stroke("edge", 180, 40, 60, 10), stroke("out", 300, 300)], loop);
+  assert.deepEqual(picked.map((s) => s.id), ["in"]);
 });

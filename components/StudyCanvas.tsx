@@ -1,11 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getStroke } from "perfect-freehand";
 import {
   distanceToStroke,
   groupLines,
   screenToWorld,
+  strokesInLasso,
   zoomAt,
   type Camera,
   type InkLine,
@@ -15,8 +16,29 @@ import {
 import type { PublicTurn, TutorRequest } from "@/lib/tutor";
 import { planAnnotations, strokeAt, type PenPlan } from "@/lib/handwriting";
 import { listen, speak, speechInputSupported, stopSpeaking } from "@/lib/voice";
+import { useStudyMemory } from "@/lib/memory-store";
+import type { AnkiNote } from "@/lib/anki";
+import {
+  dueCards,
+  gradeCard,
+  newCard,
+  OUTCOME_RATING,
+  RATING_LABEL,
+  recordEvidence,
+  shouldAddMistakeCard,
+  weakSpots,
+  whenText,
+  type ReviewCard,
+} from "@/lib/review";
+import type { Grade } from "ts-fsrs";
+import ReviewPanel from "./ReviewPanel";
 
-type Tool = "pen" | "eraser" | "hand";
+type Tool = "pen" | "eraser" | "hand" | "keep";
+type Mode = "study" | "review";
+type KeepDraft = { image: string; prompt: string; concept: string };
+type ReviewRun = { ids: string[]; index: number; suggested: Grade | null; revealed: boolean; done: number };
+
+const GRADES: Grade[] = [1, 2, 3, 4] as Grade[];
 type TutorState = "idle" | "thinking" | "speaking" | "listening";
 
 // One turn's worth of tutor pen strokes. `born` is when the pen started, in
@@ -47,6 +69,7 @@ export default function StudyCanvas() {
   const undoStack = useRef<Stroke[][]>([]);
   const stopListening = useRef<(() => void) | null>(null);
   const sessionId = useRef("");
+  const lasso = useRef<[number, number][] | null>(null);
 
   const [tool, setTool] = useState<Tool>("pen");
   const [problem, setProblem] = useState("");
@@ -55,27 +78,65 @@ export default function StudyCanvas() {
   const [muted, setMuted] = useState(false);
   const [canListen, setCanListen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [mode, setMode] = useState<Mode>("study");
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [keepDraft, setKeepDraft] = useState<KeepDraft | null>(null);
+  const [run, setRun] = useState<ReviewRun | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const { memory, memoryRef, update: updateMemory, storageFull, loaded } = useStudyMemory();
 
-  const stateRef = useRef({ tutorState, problem, muted });
-  stateRef.current = { tutorState, problem, muted };
+  // Re-check what's due every minute, as well as whenever cards change.
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 60_000);
+    return () => clearInterval(id);
+  }, []);
+  const now = useMemo(() => new Date(), [memory, tick]); // eslint-disable-line react-hooks/exhaustive-deps
+  const due = useMemo(() => dueCards(memory.cards, now), [memory, now]);
+  const currentCard: ReviewCard | null = run ? (memory.cards.find((c) => c.id === run.ids[run.index]) ?? null) : null;
+
+  const stateRef = useRef({ tutorState, problem, muted, mode, currentCard });
+  stateRef.current = { tutorState, problem, muted, mode, currentCard };
 
   // ---------- persistence ----------
   useEffect(() => {
     sessionId.current = crypto.randomUUID();
     setCanListen(speechInputSupported());
     document.fonts?.ready.then(() => (dirty.current = true));
+    restorePage();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // The study page lives in storage; a review session uses a scratch page
+  // and puts the study page back when it ends.
+  const restorePage = () => {
+    strokes.current = [];
+    tutorInk.current = [];
+    paths.current.clear();
+    tutorPaths.current.clear();
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null");
       if (saved?.strokes) strokes.current = saved.strokes;
       if (saved?.tutorInk) tutorInk.current = saved.tutorInk.map((t: TutorInk) => ({ ...t, born: 0 }));
-      if (saved?.problem) setProblem(saved.problem);
+      setProblem(saved?.problem ?? "");
     } catch {
       // A blocked or corrupt store just means a fresh page.
     }
+    undoStack.current = [];
     dirty.current = true;
-  }, []);
+  };
+
+  // Mention due cards once, when the page opens, like a tutor starting with a warm-up.
+  const greeted = useRef(false);
+  useEffect(() => {
+    if (greeted.current || !loaded) return;
+    greeted.current = true;
+    const n = dueCards(memoryRef.current.cards, new Date()).length;
+    if (n) setCaption(`Welcome back. ${n} review card${n === 1 ? " is" : "s are"} due. Want to warm up with Review first?`);
+  }, [loaded, memoryRef]);
 
   const save = useCallback(() => {
+    if (stateRef.current.mode === "review") return;
     try {
       localStorage.setItem(
         STORAGE_KEY,
@@ -149,6 +210,16 @@ export default function StudyCanvas() {
         ctx.fill(pathFor(s, drawing.current?.stroke.id === s.id ? drawing.current.simulate : false));
       }
       for (const t of tutorInk.current) drawTutorInk(ctx, t, now, tutorPaths.current);
+      if (lasso.current && lasso.current.length > 1) {
+        ctx.save();
+        ctx.strokeStyle = "rgba(37, 99, 235, 0.8)";
+        ctx.lineWidth = 1.5 / cam.z;
+        ctx.setLineDash([6 / cam.z, 5 / cam.z]);
+        ctx.beginPath();
+        lasso.current.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+        ctx.stroke();
+        ctx.restore();
+      }
     };
     raf = requestAnimationFrame(frame);
     const onResize = () => (dirty.current = true);
@@ -176,6 +247,16 @@ export default function StudyCanvas() {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             sessionId: sessionId.current,
+            mode: stateRef.current.mode,
+            review:
+              stateRef.current.mode === "review" && stateRef.current.currentCard
+                ? {
+                    concept: stateRef.current.currentCard.concept,
+                    answerText: stateRef.current.currentCard.answerText,
+                    answerImage: stateRef.current.currentCard.answerImage,
+                  }
+                : null,
+            weakSpots: weakSpots(memoryRef.current, new Date()),
             problem: stateRef.current.problem,
             trigger,
             speech,
@@ -196,6 +277,7 @@ export default function StudyCanvas() {
   );
 
   const respond = (turn: PublicTurn, lines: InkLine[]) => {
+    remember(turn);
     if (turn.move === "wait" || (!turn.say && !turn.annotations.length)) {
       setTutorState("idle");
       return;
@@ -220,6 +302,142 @@ export default function StudyCanvas() {
     } else {
       setTutorState("idle");
     }
+  };
+
+  // What a turn teaches us about the student: mastery evidence, a new review
+  // card after a fixed mistake, or the result of a review attempt.
+  const remember = (turn: PublicTurn) => {
+    const at = new Date();
+    if (stateRef.current.mode === "study") {
+      if (turn.skill?.concept) {
+        updateMemory((m) => ({ ...m, skills: recordEvidence(m.skills, turn.skill.concept, turn.skill.evidence, sessionId.current, at) }));
+      }
+      const c = turn.card;
+      if (c?.prompt && shouldAddMistakeCard(memoryRef.current.cards, c.concept, sessionId.current, at)) {
+        const card = newCard(
+          { concept: c.concept, source: "mistake", prompt: c.prompt, takeaway: c.takeaway, sessionId: sessionId.current },
+          at,
+          crypto.randomUUID(),
+        );
+        updateMemory((m) => ({ ...m, cards: [...m.cards, card] }));
+        flash(`Saved a review card on ${card.concept}`);
+      }
+    } else if (turn.review_result) {
+      const grade = OUTCOME_RATING[turn.review_result];
+      setRun((r) => (r ? { ...r, suggested: grade, revealed: true } : r));
+    }
+  };
+
+  const flash = (text: string) => {
+    setToast(text);
+    setTimeout(() => setToast((t) => (t === text ? null : t)), 3500);
+  };
+
+  // ---------- review ----------
+  const freshPage = () => {
+    strokes.current = [];
+    tutorInk.current = [];
+    paths.current.clear();
+    tutorPaths.current.clear();
+    undoStack.current = [];
+    sessionId.current = crypto.randomUUID();
+    changedSinceTutor.current = false;
+    if (pauseTimer.current) clearTimeout(pauseTimer.current);
+    dirty.current = true;
+  };
+
+  const startReview = () => {
+    const ids = dueCards(memoryRef.current.cards, new Date())
+      .slice(0, 20)
+      .map((c) => c.id);
+    if (!ids.length) return;
+    save();
+    stopSpeaking();
+    setPanelOpen(false);
+    stateRef.current.mode = "review";
+    setMode("review");
+    freshPage();
+    const first = memoryRef.current.cards.find((c) => c.id === ids[0])!;
+    setProblem(first.prompt);
+    setRun({ ids, index: 0, suggested: null, revealed: false, done: 0 });
+    setTool("pen");
+    setCaption(`From memory: ${first.prompt}`);
+  };
+
+  const nextCard = (grade: Grade | null) => {
+    if (!run) return;
+    const id = run.ids[run.index];
+    if (grade != null) {
+      updateMemory((m) => ({ ...m, cards: m.cards.map((c) => (c.id === id ? gradeCard(c, grade, new Date()) : c)) }));
+    }
+    stopSpeaking();
+    const index = run.index + 1;
+    const done = run.done + (grade != null ? 1 : 0);
+    if (index >= run.ids.length) {
+      finishReview(done);
+      return;
+    }
+    freshPage();
+    const card = memoryRef.current.cards.find((c) => c.id === run.ids[index]);
+    setProblem(card?.prompt ?? "");
+    setRun({ ...run, index, suggested: null, revealed: false, done });
+    setCaption(card ? `Next one: ${card.prompt}` : "");
+  };
+
+  const finishReview = (done: number) => {
+    stateRef.current.mode = "study";
+    setMode("study");
+    setRun(null);
+    restorePage();
+    sessionId.current = crypto.randomUUID();
+    const upcoming = memoryRef.current.cards.map((c) => new Date(c.fsrs.due).getTime()).filter((d) => d > Date.now());
+    const next = upcoming.length ? Math.min(...upcoming) : null;
+    setCaption(
+      done
+        ? `Nice work: ${done} card${done === 1 ? "" : "s"} reviewed.${next ? ` The next one comes back ${whenText(next, new Date())}.` : ""}`
+        : "Back to your page.",
+    );
+  };
+
+  const importDeck = (notes: AnkiNote[], fileName: string) => {
+    const at = new Date();
+    const seen = new Set(memoryRef.current.cards.filter((c) => c.source === "anki").map((c) => `${c.deck}\u0000${c.prompt}`));
+    const cards = notes
+      .filter((n) => !seen.has(`${n.deck}\u0000${n.front}`))
+      .map((n) =>
+        newCard(
+          {
+            concept: n.tags.find((t) => !/^(leech|marked)$/i.test(t))?.replace(/[_-]+/g, " ") ?? n.deck.split("::").pop() ?? fileName,
+            source: "anki",
+            prompt: n.front,
+            answerText: n.back || null,
+            takeaway: n.back || null,
+            deck: n.deck,
+          },
+          at,
+          crypto.randomUUID(),
+        ),
+      );
+    if (cards.length) updateMemory((m) => ({ ...m, cards: [...m.cards, ...cards] }));
+    return cards.length;
+  };
+
+  const saveKept = () => {
+    if (!keepDraft) return;
+    const card = newCard(
+      {
+        concept: keepDraft.concept || "my notes",
+        source: "kept",
+        prompt: keepDraft.prompt.trim() || "Write this out again from memory.",
+        answerImage: keepDraft.image,
+      },
+      new Date(),
+      crypto.randomUUID(),
+    );
+    updateMemory((m) => ({ ...m, cards: [...m.cards, card] }));
+    setKeepDraft(null);
+    setTool("pen");
+    flash("Kept as a review card. It comes back tomorrow-ish, then less often.");
   };
 
   // If the tutor writes somewhere off screen, glide the page so it is visible.
@@ -292,6 +510,11 @@ export default function StudyCanvas() {
       (e.pointerType === "touch" && penSeen.current); // palm rejection once a pen is in use
     if (pans) return;
 
+    if (tool === "keep") {
+      lasso.current = [screenToWorld(camera.current, sx, sy)];
+      return;
+    }
+
     if (tool === "eraser" || e.button === 5) {
       undoStack.current.push([...strokes.current]);
       eraseAt(sx, sy);
@@ -332,6 +555,12 @@ export default function StudyCanvas() {
       return;
     }
 
+    if (lasso.current && tool === "keep") {
+      lasso.current.push(screenToWorld(camera.current, sx, sy));
+      dirty.current = true;
+      return;
+    }
+
     const d = drawing.current;
     if (d && d.pointerId === e.pointerId) {
       const events = e.nativeEvent.getCoalescedEvents?.() ?? [e.nativeEvent];
@@ -362,6 +591,17 @@ export default function StudyCanvas() {
   const onPointerUp = (e: React.PointerEvent) => {
     pointers.current.delete(e.pointerId);
     if (pointers.current.size < 2) pinch.current = null;
+    if (lasso.current) {
+      const picked = strokesInLasso(strokes.current, lasso.current);
+      lasso.current = null;
+      dirty.current = true;
+      if (picked.length) {
+        setKeepDraft({ image: renderInkImage(picked, 640), prompt: "", concept: "" });
+      } else {
+        flash("Draw a loop around the writing you want to keep.");
+      }
+      return;
+    }
     const d = drawing.current;
     if (d && d.pointerId === e.pointerId) {
       drawing.current = null;
@@ -410,6 +650,7 @@ export default function StudyCanvas() {
       if (e.key === "p") setTool("pen");
       if (e.key === "e") setTool("eraser");
       if (e.key === "h") setTool("hand");
+      if (e.key === "k" && stateRef.current.mode === "study") setTool("keep");
     };
     const up = (e: KeyboardEvent) => {
       if (e.code === "Space") spaceHeld.current = false;
@@ -455,23 +696,113 @@ export default function StudyCanvas() {
     <div className="shell">
       <header className="bar">
         <span className="brand">Tutor</span>
-        <input
-          className="problem"
-          value={problem}
-          placeholder="What are we working on? (optional)"
-          onChange={(e) => setProblem(e.target.value)}
-          onBlur={save}
-        />
+        {mode === "review" && run && currentCard ? (
+          <div className="card-now" aria-live="polite">
+            <span className="card-meta">
+              Card {run.index + 1} of {run.ids.length} · {currentCard.concept}
+            </span>
+            <p className="card-prompt">{currentCard.prompt}</p>
+            {run.revealed && (currentCard.takeaway || currentCard.answerImage) && (
+              <div className="card-answer">
+                {currentCard.answerImage ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={currentCard.answerImage} alt="The writing you kept for this card" />
+                ) : (
+                  <p>{currentCard.takeaway}</p>
+                )}
+              </div>
+            )}
+          </div>
+        ) : (
+          <input
+            className="problem"
+            value={problem}
+            placeholder="What are we working on? (optional)"
+            onChange={(e) => setProblem(e.target.value)}
+            onBlur={save}
+          />
+        )}
         <div className="tools" role="toolbar" aria-label="Drawing tools">
-          {(["pen", "eraser", "hand"] as Tool[]).map((t) => (
-            <button key={t} className={tool === t ? "on" : ""} onClick={() => setTool(t)} aria-pressed={tool === t}>
-              {t === "pen" ? "Pen" : t === "eraser" ? "Eraser" : "Move"}
-            </button>
-          ))}
+          {(["pen", "eraser", "hand", "keep"] as Tool[])
+            .filter((t) => mode === "study" || t !== "keep")
+            .map((t) => (
+              <button
+                key={t}
+                className={tool === t ? "on" : ""}
+                onClick={() => setTool(t)}
+                aria-pressed={tool === t}
+                title={t === "keep" ? "Draw a loop around writing to keep it as a review card" : undefined}
+              >
+                {t === "pen" ? "Pen" : t === "eraser" ? "Eraser" : t === "hand" ? "Move" : "Keep"}
+              </button>
+            ))}
           <button onClick={undo}>Undo</button>
           <button onClick={clearPage}>Clear</button>
+          {mode === "study" ? (
+            <button className={panelOpen ? "on" : ""} onClick={() => setPanelOpen((o) => !o)} aria-expanded={panelOpen}>
+              Review{due.length ? <span className="badge">{due.length}</span> : null}
+            </button>
+          ) : (
+            <button onClick={() => finishReview(run?.done ?? 0)}>End review</button>
+          )}
         </div>
       </header>
+
+      {panelOpen && mode === "study" && (
+        <ReviewPanel
+          memory={memory}
+          due={due.length}
+          storageFull={storageFull}
+          onStart={startReview}
+          onImport={importDeck}
+          onClose={() => setPanelOpen(false)}
+        />
+      )}
+
+      {keepDraft && (
+        <form
+          className="keep"
+          onSubmit={(e) => {
+            e.preventDefault();
+            saveKept();
+          }}
+        >
+          <h2>Keep as a review card</h2>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={keepDraft.image} alt="The writing you circled" />
+          <label>
+            What should I ask you later?
+            <input
+              autoFocus
+              value={keepDraft.prompt}
+              placeholder="e.g. Differentiate sin(x²)"
+              onChange={(e) => setKeepDraft({ ...keepDraft, prompt: e.target.value })}
+            />
+          </label>
+          <label>
+            Topic
+            <input
+              value={keepDraft.concept}
+              placeholder="e.g. chain rule"
+              onChange={(e) => setKeepDraft({ ...keepDraft, concept: e.target.value })}
+            />
+          </label>
+          <div className="keep-actions">
+            <button type="button" onClick={() => setKeepDraft(null)}>
+              Cancel
+            </button>
+            <button type="submit" className="primary">
+              Keep card
+            </button>
+          </div>
+        </form>
+      )}
+
+      {toast && (
+        <div className="toast" role="status">
+          {toast}
+        </div>
+      )}
 
       <canvas
         ref={canvasRef}
@@ -484,11 +815,33 @@ export default function StudyCanvas() {
         onContextMenu={(e) => e.preventDefault()}
       />
 
-      <footer className="tutor">
+      <footer className={mode === "review" ? "tutor reviewing" : "tutor"}>
         <div className={`presence ${tutorState}`} aria-hidden />
         <p className="caption" aria-live="polite">
           {error ?? (tutorState === "thinking" ? "Looking at your work…" : tutorState === "listening" ? "Listening…" : caption)}
         </p>
+        {mode === "review" && run && (
+          <div className="grades" role="group" aria-label="How well did you remember?">
+            {run.revealed ? (
+              <>
+                <span className="grades-label">How did it go?</span>
+                {GRADES.map((g) => (
+                  <button key={g} className={run.suggested === g ? "on" : ""} onClick={() => nextCard(g)}>
+                    {RATING_LABEL[g]}
+                  </button>
+                ))}
+              </>
+            ) : (
+              <>
+                <button onClick={() => askTutor("spoke", "I'm done with this card. Can you check it?")} disabled={tutorState === "thinking"}>
+                  Check my answer
+                </button>
+                <button onClick={() => setRun({ ...run, revealed: true })}>Show answer</button>
+                <button onClick={() => nextCard(null)}>Skip</button>
+              </>
+            )}
+          </div>
+        )}
         <div className="actions">
           {canListen && (
             <button className={tutorState === "listening" ? "talk on" : "talk"} onClick={toggleListening}>
@@ -633,4 +986,33 @@ function renderPageImages(strokes: Stroke[], lines: InkLine[]): { pageImage: str
     return canvas.toDataURL("image/png");
   };
   return { pageImage: draw(false), tokenImage: draw(true) };
+}
+
+// A small picture of some of the student's ink, for a kept review card.
+function renderInkImage(strokes: Stroke[], maxSize: number): string {
+  let box = { x: Infinity, y: Infinity, w: 0, h: 0 };
+  let x2 = -Infinity, y2 = -Infinity;
+  for (const s of strokes)
+    for (const [x, y] of s.points) {
+      box.x = Math.min(box.x, x);
+      box.y = Math.min(box.y, y);
+      x2 = Math.max(x2, x);
+      y2 = Math.max(y2, y);
+    }
+  const margin = 16;
+  box = { x: box.x - margin, y: box.y - margin, w: x2 - box.x + 2 * margin, h: y2 - box.y + 2 * margin };
+  const scale = Math.min(1.5, maxSize / box.w, maxSize / box.h);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.ceil(box.w * scale);
+  canvas.height = Math.ceil(box.h * scale);
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(scale, 0, 0, scale, -box.x * scale, -box.y * scale);
+  ctx.fillStyle = STUDENT_INK;
+  for (const s of strokes) {
+    const outline = getStroke(s.points, { size: s.size, thinning: 0.6, smoothing: 0.55, streamline: 0.45 });
+    if (outline.length) ctx.fill(outlinePath(outline));
+  }
+  return canvas.toDataURL("image/png");
 }

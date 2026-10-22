@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
-import { LADDER, TUTOR_SYSTEM_PROMPT, TutorTurnSchema, type PublicTurn, type TutorRequest, type TutorTurn } from "@/lib/tutor";
+import { LADDER, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, TutorTurnSchema, type PublicTurn, type TutorRequest, type TutorTurn } from "@/lib/tutor";
 
 const client = new Anthropic();
 
@@ -21,6 +21,10 @@ export async function POST(req: Request) {
     return Response.json({ error: "sessionId, pageImage and tokenImage (PNG) are required" }, { status: 400 });
   }
 
+  const reviewing = body.mode === "review" && body.review != null;
+  const reference = reviewing ? png(body.review?.answerImage ?? undefined) : undefined;
+  const weakSpots = (body.weakSpots ?? []).slice(0, 5).map((w) => String(w).slice(0, 60));
+
   const memory = sessions.get(body.sessionId) ?? { turns: [] };
   sessions.set(body.sessionId, memory);
 
@@ -36,7 +40,12 @@ export async function POST(req: Request) {
     .join("\n");
 
   const situation = [
-    `Problem the student is working on: ${body.problem.trim() || "not stated; infer it from the page"}`,
+    reviewing
+      ? `Review card (concept: ${body.review!.concept}). The question: ${body.problem.trim()}` +
+        (body.review!.answerText ? `\nReference answer from the student's card: ${body.review!.answerText.slice(0, 2000)}` : "") +
+        (reference ? "\nThe reference answer is the ink in the last image." : "")
+      : `Problem the student is working on: ${body.problem.trim() || "not stated; infer it from the page"}`,
+    weakSpots.length ? `Concepts this student has slipped on before: ${weakSpots.join(", ")}` : "",
     `Lines on the page: ${body.lines.map((l) => `${l.id} (${l.tokens} tokens)`).join(", ") || "none yet"}`,
     history ? `Earlier turns this session:\n${history}` : "This is the first turn of the session.",
     `Last hint-ladder rung used: ${lastRung}`,
@@ -45,14 +54,16 @@ export async function POST(req: Request) {
       : body.trigger === "asked"
         ? "The student tapped to ask for your help."
         : `The student just said: "${body.speech ?? ""}"`,
-  ].join("\n\n");
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
   try {
     const response = await client.messages.parse({
       model: "claude-opus-5-5",
       max_tokens: 16000,
       output_config: { effort: "medium", format: zodOutputFormat(TutorTurnSchema) },
-      system: TUTOR_SYSTEM_PROMPT,
+      system: reviewing ? `${TUTOR_SYSTEM_PROMPT}\n\n${REVIEW_PROMPT}` : TUTOR_SYSTEM_PROMPT,
       messages: [
         {
           role: "user",
@@ -61,6 +72,12 @@ export async function POST(req: Request) {
             { type: "image", source: { type: "base64", media_type: "image/png", data: page } },
             { type: "text", text: "The same page with line ids and numbered tokens:" },
             { type: "image", source: { type: "base64", media_type: "image/png", data: tokens } },
+            ...(reference
+              ? [
+                  { type: "text" as const, text: "The reference answer the student kept on their card:" },
+                  { type: "image" as const, source: { type: "base64" as const, media_type: "image/png" as const, data: reference } },
+                ]
+              : []),
             { type: "text", text: situation },
           ],
         },
@@ -74,9 +91,19 @@ export async function POST(req: Request) {
     const turn = response.parsed_output;
     const known = new Set(body.lines.map((l) => l.id));
     turn.annotations = turn.annotations.filter((a) => known.has(a.line_id) || a.kind === "note").slice(0, 4);
+    if (reviewing) turn.card = null;
+    else turn.review_result = null;
+    turn.skill.concept = turn.skill.concept.slice(0, 60);
     memory.turns.push({ trigger: body.trigger, speech: body.speech, turn });
 
-    const publicTurn: PublicTurn = { move: turn.move, say: turn.say, annotations: turn.annotations };
+    const publicTurn: PublicTurn = {
+      move: turn.move,
+      say: turn.say,
+      annotations: turn.annotations,
+      skill: turn.skill,
+      card: turn.card,
+      review_result: turn.review_result,
+    };
     return Response.json(publicTurn);
   } catch (err) {
     if (err instanceof Anthropic.AuthenticationError) {
@@ -93,7 +120,7 @@ export async function POST(req: Request) {
 }
 
 function fallbackTurn(say: string): PublicTurn {
-  return { move: "ask_plan", say, annotations: [] };
+  return { move: "ask_plan", say, annotations: [], skill: { concept: "", evidence: "none" }, card: null, review_result: null };
 }
 
 function describeInk(turn: TutorTurn): string {

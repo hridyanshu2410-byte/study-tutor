@@ -29,13 +29,43 @@ export const TutorTurnSchema = z.object({
       }),
     )
     .describe("Ink you add to the page, drawn in this order like a pen. Usually zero to three items."),
+  skill: z
+    .object({
+      concept: z.string().describe("The one concept this moment is about, in two to four plain words, such as \"chain rule\" or \"u-substitution\". Empty string if none."),
+      evidence: z
+        .enum(["slip", "progress", "solved", "none"])
+        .describe("slip: a mistake on this concept is on the page. progress: correct work on it. solved: the student finished a step or problem using it correctly. none: nothing to record."),
+    })
+    .describe("What this turn shows about the student's grasp of a concept. Used for their mastery map."),
+  card: z
+    .object({
+      concept: z.string().describe("The concept, in the same words as skill.concept."),
+      prompt: z.string().describe("A fresh, short problem of the same kind, for the student to work by hand in a later review. Plain characters, no LaTeX. Not the current problem."),
+      takeaway: z.string().describe("The idea to remember, under 15 words, shown after the review attempt. Not the answer to the current problem."),
+    })
+    .nullable()
+    .describe("A spaced-review card for a real misconception. Only once the student has fixed that mistake or finished, never while they are still working on it, and at most once per misconception. Null otherwise."),
+  review_result: z
+    .enum(["forgot", "struggled", "recalled", "easy"])
+    .nullable()
+    .describe("Review mode only: set once the card attempt is over. Null while the student is still working, and always null in study mode."),
 });
 
 export type TutorTurn = z.infer<typeof TutorTurnSchema>;
-export type PublicTurn = Pick<TutorTurn, "move" | "say" | "annotations">;
+export type PublicTurn = Pick<TutorTurn, "move" | "say" | "annotations" | "skill" | "card" | "review_result">;
+
+export type ReviewContext = {
+  concept: string;
+  // Reference answer from the student's own card: the back of an Anki card, or ink they kept.
+  answerText: string | null;
+  answerImage: string | null;
+};
 
 export type TutorRequest = {
   sessionId: string;
+  mode: "study" | "review";
+  review: ReviewContext | null;
+  weakSpots: string[];
   problem: string;
   trigger: "pause" | "asked" | "spoke";
   speech: string | null;
@@ -81,4 +111,12 @@ What you put on the page, like a tutor's pen:
 
 Honesty: if the problem is clearly a graded assignment, coach the ideas on a parallel example rather than working the submitted question.
 
+Memory: you may be told the concepts this student has slipped on before. Watch for them, and if the current work touches one, a quick "remember last time?" question is a good first rung. Each turn, fill in skill with the concept the moment is about and whether the page shows a slip, progress or a solved step. When the student has fixed a real misconception, or finishes the problem after one, add a card: a fresh problem of the same kind for a later review, plus a one-line takeaway. Never add a card while the mistake is still on the page, and never for a slip of the pen.
+
 Read the student's lines carefully from the first image; use the second only to find line and token numbers. Your private notes are never shown to the student; use them to transcribe each line, find the first mistake and keep the full solution for yourself.`;
+
+export const REVIEW_PROMPT = `This is a spaced-review session, not a lesson. The student is answering a review card from memory, by hand. The card's question is given as the problem. Your goal is to find out how well they remember, so help less than usual:
+- Wait while they work. If they stall, at most ask_plan, point or name_concept. Each hint you give lowers the result.
+- If they ask for the answer or clearly cannot start, use next_step or worked_solution as usual and set review_result to "forgot".
+- When the attempt is over (a correct final answer, or the answer given), set review_result: "easy" if correct quickly with no help, "recalled" if correct with at most a small nudge, "struggled" if correct only after real hints, "forgot" if they could not do it. Say one short sentence that closes the card, such as praise for the step they nailed, and use the affirm move. Do not add a card in review mode.
+- If you are given a reference answer, it comes from the student's own notes: check their work against it, but judge the math, not the wording.`;
