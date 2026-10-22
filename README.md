@@ -12,6 +12,8 @@ cp .env.example .env.local   # add your ANTHROPIC_API_KEY
 npm run dev                   # http://localhost:3000
 ```
 
+That runs the tutor on one device with everything saved in the browser. To put it online for research testers, with sign-up, consent, cloud saving and a researcher dashboard, follow [DEPLOY.md](DEPLOY.md).
+
 To use it on an iPad, run `npm run dev -- -H 0.0.0.0` and open your computer's local address in Safari. Voice input needs HTTPS or localhost, so for the microphone on a tablet use a tunnel such as `cloudflared tunnel --url http://localhost:3000`.
 
 ## Using it
@@ -40,6 +42,11 @@ To use it on an iPad, run `npm run dev -- -H 0.0.0.0` and open your computer's l
 | Where cards and mastery are saved (this device for now) | `lib/memory-store.ts` |
 | Review panel: due cards, mastery, deck import | `components/ReviewPanel.tsx` |
 | Anki `.apkg` reader | `lib/anki.ts` |
+| Research mode: sign-up, consent, account menu | `app/login/`, `app/consent/`, `components/AccountMenu.tsx`, `proxy.ts` |
+| Cloud saving and study event logging | `lib/cloud.ts`, `app/api/tutor/route.ts` |
+| Researcher dashboard and CSV export | `app/admin/`, `lib/research.ts` |
+| Database schema and privacy rules | `supabase/migrations/` |
+| Optional natural voice (OpenAI TTS) | `app/api/voice/route.ts` |
 
 On each turn the browser groups your strokes into lines (L1, L2, …) and splits each line into tokens at the gaps between symbols. It sends two images to `/api/tutor`: your page as written, and the same page with each token boxed and numbered. Claude returns a structured turn: a private part (its reading of each line, the first wrong line, its diagnosis and the full solution) and a public part (the move, what to say, and the ink to add). Only the public part ever leaves the server, so the answer cannot leak into the page before the tutor decides to give it.
 
@@ -58,4 +65,4 @@ Each tutor turn also reports the concept the moment is about and whether the pag
 
 ## Not yet
 
-Accounts and sync, Canvas and Moodle import, and the study planner are later phases in the plan. Cards and mastery are saved in this browser only, and the tutor's turn-by-turn session memory is in-process and resets when the server restarts.
+Canvas and Moodle import and the study planner are later phases in the plan. The tutor's turn-by-turn memory within a session is in-process, so a server restart mid-session starts the hint ladder over (pages, cards and mastery are saved).

@@ -32,6 +32,8 @@ import {
 } from "@/lib/review";
 import type { Grade } from "ts-fsrs";
 import ReviewPanel from "./ReviewPanel";
+import AccountMenu from "./AccountMenu";
+import { flushCloud, loadCloud, logEvent, saveCloud, type Account } from "@/lib/cloud";
 
 type Tool = "pen" | "eraser" | "hand" | "keep";
 type Mode = "study" | "review";
@@ -44,13 +46,15 @@ type TutorState = "idle" | "thinking" | "speaking" | "listening";
 // One turn's worth of tutor pen strokes. `born` is when the pen started, in
 // performance.now() time; 0 means already fully written (e.g. restored).
 type TutorInk = { id: string; plan: PenPlan; born: number };
+type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string };
 
 const STUDENT_INK = "#1f2a44";
 const TUTOR_INK = "#c2410c";
 const PAUSE_MS = 3200;
 const STORAGE_KEY = "study-tutor:page:v2";
 
-export default function StudyCanvas() {
+export default function StudyCanvas({ account }: { account: Account | null }) {
+  const pageKey = account ? `${STORAGE_KEY}:${account.userId}` : STORAGE_KEY;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const strokes = useRef<Stroke[]>([]);
   const paths = useRef(new Map<string, Path2D>());
@@ -83,7 +87,7 @@ export default function StudyCanvas() {
   const [keepDraft, setKeepDraft] = useState<KeepDraft | null>(null);
   const [run, setRun] = useState<ReviewRun | null>(null);
   const [toast, setToast] = useState<string | null>(null);
-  const { memory, memoryRef, update: updateMemory, storageFull, loaded } = useStudyMemory();
+  const { memory, memoryRef, update: updateMemory, storageFull, loaded } = useStudyMemory(account);
 
   // Re-check what's due every minute, as well as whenever cards change.
   const [tick, setTick] = useState(0);
@@ -104,26 +108,47 @@ export default function StudyCanvas() {
     setCanListen(speechInputSupported());
     document.fonts?.ready.then(() => (dirty.current = true));
     restorePage();
+    // In research mode the account copy of the page wins, unless the tester
+    // has already started writing before it arrived.
+    if (account) {
+      const before = strokes.current.length;
+      loadCloud(account.userId, "page")
+        .then((page) => {
+          if (stateRef.current.mode !== "study" || strokes.current.length !== before || !page) return;
+          applyPage(page as SavedPage);
+          try {
+            localStorage.setItem(pageKey, JSON.stringify(page));
+          } catch {
+            // Local copy is only a cache.
+          }
+        })
+        .catch(() => {
+          // Offline: the local copy is shown and syncs on the next save.
+        });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const applyPage = (saved: SavedPage | null) => {
+    strokes.current = saved?.strokes ?? [];
+    tutorInk.current = (saved?.tutorInk ?? []).map((t) => ({ ...t, born: 0 }));
+    paths.current.clear();
+    tutorPaths.current.clear();
+    setProblem(saved?.problem ?? "");
+    undoStack.current = [];
+    dirty.current = true;
+  };
 
   // The study page lives in storage; a review session uses a scratch page
   // and puts the study page back when it ends.
   const restorePage = () => {
-    strokes.current = [];
-    tutorInk.current = [];
-    paths.current.clear();
-    tutorPaths.current.clear();
+    let saved: SavedPage | null = null;
     try {
-      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null");
-      if (saved?.strokes) strokes.current = saved.strokes;
-      if (saved?.tutorInk) tutorInk.current = saved.tutorInk.map((t: TutorInk) => ({ ...t, born: 0 }));
-      setProblem(saved?.problem ?? "");
+      saved = JSON.parse(localStorage.getItem(pageKey) ?? "null");
     } catch {
       // A blocked or corrupt store just means a fresh page.
     }
-    undoStack.current = [];
-    dirty.current = true;
+    applyPage(saved);
   };
 
   // Mention due cards once, when the page opens, like a tutor starting with a warm-up.
@@ -137,15 +162,14 @@ export default function StudyCanvas() {
 
   const save = useCallback(() => {
     if (stateRef.current.mode === "review") return;
+    const page: SavedPage = { strokes: strokes.current, tutorInk: tutorInk.current, problem: stateRef.current.problem };
+    if (account) saveCloud(account.userId, "page", page);
     try {
-      localStorage.setItem(
-        STORAGE_KEY,
-        JSON.stringify({ strokes: strokes.current, tutorInk: tutorInk.current, problem: stateRef.current.problem }),
-      );
+      localStorage.setItem(pageKey, JSON.stringify(page));
     } catch {
       // Storage is a convenience; the page keeps working without it.
     }
-  }, []);
+  }, [account, pageKey]);
 
   // ---------- rendering ----------
   const pathFor = useCallback((s: Stroke, simulate = false) => {
@@ -320,6 +344,7 @@ export default function StudyCanvas() {
           crypto.randomUUID(),
         );
         updateMemory((m) => ({ ...m, cards: [...m.cards, card] }));
+        logEvent(account, "card_created", { source: "mistake", concept: card.concept, card_id: card.id }, sessionId.current);
         flash(`Saved a review card on ${card.concept}`);
       }
     } else if (turn.review_result) {
@@ -360,6 +385,7 @@ export default function StudyCanvas() {
     const first = memoryRef.current.cards.find((c) => c.id === ids[0])!;
     setProblem(first.prompt);
     setRun({ ids, index: 0, suggested: null, revealed: false, done: 0 });
+    logEvent(account, "review_started", { due: ids.length }, null);
     setTool("pen");
     setCaption(`From memory: ${first.prompt}`);
   };
@@ -367,9 +393,24 @@ export default function StudyCanvas() {
   const nextCard = (grade: Grade | null) => {
     if (!run) return;
     const id = run.ids[run.index];
+    const card = memoryRef.current.cards.find((c) => c.id === id);
     if (grade != null) {
       updateMemory((m) => ({ ...m, cards: m.cards.map((c) => (c.id === id ? gradeCard(c, grade, new Date()) : c)) }));
     }
+    logEvent(
+      account,
+      "review_graded",
+      {
+        card_id: id,
+        concept: card?.concept,
+        source: card?.source,
+        rating: grade,
+        suggested: run.suggested,
+        skipped: grade == null,
+        prior_reviews: card?.reviews.length ?? 0,
+      },
+      sessionId.current,
+    );
     stopSpeaking();
     const index = run.index + 1;
     const done = run.done + (grade != null ? 1 : 0);
@@ -378,10 +419,10 @@ export default function StudyCanvas() {
       return;
     }
     freshPage();
-    const card = memoryRef.current.cards.find((c) => c.id === run.ids[index]);
-    setProblem(card?.prompt ?? "");
+    const nextUp = memoryRef.current.cards.find((c) => c.id === run.ids[index]);
+    setProblem(nextUp?.prompt ?? "");
     setRun({ ...run, index, suggested: null, revealed: false, done });
-    setCaption(card ? `Next one: ${card.prompt}` : "");
+    setCaption(nextUp ? `Next one: ${nextUp.prompt}` : "");
   };
 
   const finishReview = (done: number) => {
@@ -419,6 +460,7 @@ export default function StudyCanvas() {
         ),
       );
     if (cards.length) updateMemory((m) => ({ ...m, cards: [...m.cards, ...cards] }));
+    logEvent(account, "deck_imported", { notes: notes.length, added: cards.length }, null);
     return cards.length;
   };
 
@@ -435,6 +477,7 @@ export default function StudyCanvas() {
       crypto.randomUUID(),
     );
     updateMemory((m) => ({ ...m, cards: [...m.cards, card] }));
+    logEvent(account, "card_created", { source: "kept", concept: card.concept, card_id: card.id }, sessionId.current);
     setKeepDraft(null);
     setTool("pen");
     flash("Kept as a review card. It comes back tomorrow-ish, then less often.");
@@ -746,6 +789,7 @@ export default function StudyCanvas() {
             <button onClick={() => finishReview(run?.done ?? 0)}>End review</button>
           )}
         </div>
+        {account && <AccountMenu account={account} sessionId={sessionId} onSignOut={flushCloud} />}
       </header>
 
       {panelOpen && mode === "study" && (

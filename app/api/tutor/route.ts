@@ -1,18 +1,60 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
+import { adminClient, createClient } from "@/lib/supabase/server";
+import { researchMode } from "@/lib/supabase/env";
+import { dailyTutorLimit, startOfUtcDay } from "@/lib/study";
 import { LADDER, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, TutorTurnSchema, type PublicTurn, type TutorRequest, type TutorTurn } from "@/lib/tutor";
 
 const client = new Anthropic();
 
-type SessionMemory = { turns: { trigger: string; speech: string | null; turn: TutorTurn }[] };
+// What the tutor remembers of earlier turns in a session.
+type PastTurn = { trigger: string; speech: string | null; move: TutorTurn["move"]; say: string; ink: string; diagnosis: string };
 
-// MVP memory: in-process, per session. Moves to Postgres with accounts in phase 2.
-const sessions = new Map<string, SessionMemory>();
+// Without accounts, sessions live in this process. In research mode they are
+// read back from the event log, so they survive across serverless instances.
+const sessions = new Map<string, PastTurn[]>();
+
+async function pastTurns(db: ReturnType<typeof adminClient> | null, userId: string | null, sessionId: string): Promise<PastTurn[]> {
+  if (!db || !userId) return sessions.get(sessionId) ?? [];
+  const { data } = await db
+    .from("events")
+    .select("data")
+    .eq("user_id", userId)
+    .eq("session_id", sessionId)
+    .eq("kind", "tutor_turn")
+    .order("id", { ascending: false })
+    .limit(12);
+  return (data ?? []).map((r) => r.data as PastTurn).reverse();
+}
 
 export async function POST(req: Request) {
   if (!process.env.ANTHROPIC_API_KEY) {
     return Response.json({ error: "The tutor needs ANTHROPIC_API_KEY in .env.local" }, { status: 500 });
   }
+  // In research mode only signed-in testers reach the tutor, within a daily cap.
+  // Testers can't read the event log (it holds the tutor's private
+  // diagnosis), so the server counts and writes tutor turns with the service role.
+  const supabase = researchMode ? adminClient() : null;
+  let userId: string | null = null;
+  if (supabase) {
+    const {
+      data: { user },
+    } = await (await createClient()).auth.getUser();
+    if (!user) return Response.json({ error: "Please sign in again." }, { status: 401 });
+    userId = user.id;
+    const { count } = await supabase
+      .from("events")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", user.id)
+      .eq("kind", "tutor_turn")
+      .gte("created_at", startOfUtcDay(new Date()));
+    if ((count ?? 0) >= dailyTutorLimit()) {
+      return Response.json(fallbackTurn("That's a lot of great work for one day. I need a rest; let's pick this up tomorrow."), {
+        status: 429,
+      });
+    }
+  }
+
   const body = (await req.json()) as TutorRequest;
   const png = (url: string | undefined) => /^data:image\/png;base64,(.+)$/.exec(url ?? "")?.[1];
   const page = png(body.pageImage);
@@ -25,17 +67,15 @@ export async function POST(req: Request) {
   const reference = reviewing ? png(body.review?.answerImage ?? undefined) : undefined;
   const weakSpots = (body.weakSpots ?? []).slice(0, 5).map((w) => String(w).slice(0, 60));
 
-  const memory = sessions.get(body.sessionId) ?? { turns: [] };
-  sessions.set(body.sessionId, memory);
-
-  const lastRung = [...memory.turns].reverse().find((t) => LADDER.includes(t.turn.move))?.turn.move ?? "wait";
-  const history = memory.turns
+  const past = await pastTurns(supabase, userId, body.sessionId);
+  const lastRung = [...past].reverse().find((t) => LADDER.includes(t.move))?.move ?? "wait";
+  const history = past
     .slice(-12)
     .map(
       (t, i) =>
         `Turn ${i + 1} (${t.trigger})${t.speech ? `, student said: "${t.speech}"` : ""}\n` +
-        `  you chose ${t.turn.move}; said: "${t.turn.say}"; ink: ${describeInk(t.turn)}\n` +
-        `  private diagnosis then: ${t.turn.private.diagnosis}`,
+        `  you chose ${t.move}; said: "${t.say}"; ink: ${t.ink}\n` +
+        `  private diagnosis then: ${t.diagnosis}`,
     )
     .join("\n");
 
@@ -58,6 +98,7 @@ export async function POST(req: Request) {
     .filter(Boolean)
     .join("\n\n");
 
+  const started = Date.now();
   try {
     const response = await client.messages.parse({
       model: "claude-opus-5-5",
@@ -94,7 +135,40 @@ export async function POST(req: Request) {
     if (reviewing) turn.card = null;
     else turn.review_result = null;
     turn.skill.concept = turn.skill.concept.slice(0, 60);
-    memory.turns.push({ trigger: body.trigger, speech: body.speech, turn });
+    const record: PastTurn = {
+      trigger: body.trigger,
+      speech: body.speech,
+      move: turn.move,
+      say: turn.say,
+      ink: describeInk(turn),
+      diagnosis: turn.private.diagnosis,
+    };
+    if (!supabase) sessions.set(body.sessionId, [...past, record].slice(-12));
+
+    if (supabase && userId) {
+      // The study log keeps what the tutor did and why, never the hidden solution.
+      const { error } = await supabase.from("events").insert({
+        user_id: userId,
+        session_id: body.sessionId,
+        kind: "tutor_turn",
+        data: {
+          ...record,
+          mode: reviewing ? "review" : "study",
+          problem: body.problem.slice(0, 500),
+          lines: body.lines.length,
+          annotations: turn.annotations.map((a) => a.kind),
+          concept: turn.skill.concept,
+          evidence: turn.skill.evidence,
+          card_proposed: Boolean(turn.card),
+          review_result: turn.review_result,
+          first_error_line: turn.private.first_error_line,
+          latency_ms: Date.now() - started,
+          input_tokens: response.usage.input_tokens,
+          output_tokens: response.usage.output_tokens,
+        },
+      });
+      if (error) console.warn("Could not log tutor turn", error.message);
+    }
 
     const publicTurn: PublicTurn = {
       move: turn.move,

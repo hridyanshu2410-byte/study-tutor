@@ -1,8 +1,42 @@
-// Browser speech for the MVP: the Web Speech API on both sides keeps latency
-// low and needs no keys. A streaming TTS voice replaces `speak` later.
+// The tutor's voice. With OPENAI_API_KEY set on the server, /api/voice reads
+// the line in a warm, natural voice; otherwise (or if it fails) the browser's
+// own speech is used, which needs no keys. Listening is always the browser's.
+
+let serverVoice: boolean | null = null; // null until the first try
+let audio: HTMLAudioElement | null = null;
+let generation = 0;
 
 export function speak(text: string, onEnd?: () => void) {
-  if (typeof window === "undefined" || !("speechSynthesis" in window) || !text) {
+  if (typeof window === "undefined" || !text) {
+    onEnd?.();
+    return;
+  }
+  stopSpeaking();
+  const mine = ++generation;
+  if (serverVoice === false) return speakInBrowser(text, onEnd);
+  fetch("/api/voice", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }) })
+    .then(async (res) => {
+      if (res.status === 404) serverVoice = false;
+      if (!res.ok) throw new Error(`voice ${res.status}`);
+      serverVoice = true;
+      const url = URL.createObjectURL(await res.blob());
+      if (mine !== generation) return URL.revokeObjectURL(url); // interrupted while loading
+      audio = new Audio(url);
+      const done = () => {
+        URL.revokeObjectURL(url);
+        if (mine === generation) onEnd?.();
+      };
+      audio.onended = done;
+      audio.onerror = done;
+      await audio.play();
+    })
+    .catch(() => {
+      if (mine === generation) speakInBrowser(text, onEnd);
+    });
+}
+
+function speakInBrowser(text: string, onEnd?: () => void) {
+  if (!("speechSynthesis" in window)) {
     onEnd?.();
     return;
   }
@@ -18,6 +52,12 @@ export function speak(text: string, onEnd?: () => void) {
 }
 
 export function stopSpeaking() {
+  generation++;
+  if (audio) {
+    audio.onended = audio.onerror = null;
+    audio.pause();
+    audio = null;
+  }
   if (typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
 }
 
