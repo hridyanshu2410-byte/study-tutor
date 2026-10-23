@@ -5,6 +5,8 @@
 import type { Box, InkLine } from "./ink.ts";
 import { spanBox, unionBox } from "./ink.ts";
 import hand from "./tutor-hand/ems-felix.json" with { type: "json" };
+import { drawFigure } from "./figures.ts";
+import type { Figure } from "./figure-schema.ts";
 
 export type PenStroke = { points: [number, number][]; start: number; end: number };
 export type PenPlan = { strokes: PenStroke[]; duration: number; box: Box | null };
@@ -33,11 +35,11 @@ export function seeded(seed: number) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-type Rng = () => number;
-const jitter = (rng: Rng, amount: number) => (rng() * 2 - 1) * amount;
+export type Rng = () => number;
+export const jitter = (rng: Rng, amount: number) => (rng() * 2 - 1) * amount;
 
 // ---------- a pen that keeps time ----------
-class Pen {
+export class Pen {
   strokes: PenStroke[] = [];
   t = 0;
   box: Box | null = null;
@@ -142,7 +144,7 @@ function check(pen: Pen, box: Box, rng: Rng) {
 }
 
 // A bowed line with a quick two-winged head drawn in one motion.
-function arrow(pen: Pen, from: [number, number], to: [number, number], rng: Rng) {
+export function arrow(pen: Pen, from: [number, number], to: [number, number], rng: Rng) {
   const [x0, y0] = from;
   const [x1, y1] = to;
   const d = Math.hypot(x1 - x0, y1 - y0);
@@ -173,22 +175,29 @@ function arrow(pen: Pen, from: [number, number], to: [number, number], rng: Rng)
 }
 
 // ---------- handwriting ----------
+// Characters the hand doesn't have, written as the nearest one it does.
+const ALIAS: Record<string, string> = { "−": "–", "′": "'", "″": "\"", "‘": "'", "’": "'", "≈": "~", "∙": "·", "⋅": "·", "∞": "oo" };
+const glyph = (ch: string) => font.glyphs[ch] ?? font.glyphs[ALIAS[ch] ?? ""] ?? font.glyphs["?"];
+
 export function measureText(text: string, size: number): number {
   const scale = size / font.capHeight;
   let w = 0;
-  for (const ch of text) w += (font.glyphs[ch] ?? font.glyphs["?"]).w * scale * 0.96;
+  for (const ch of text) w += glyph(ch).w * scale * 0.96 * (ch === " " ? SPACE : 1);
   return w;
 }
 
+// The font's word space is wide for math; people write "5x + 5" tighter than prose.
+const SPACE = 0.55;
+
 // Writes glyph by glyph with a drifting baseline, small changes in size and
 // slant, and pauses where the pen lifts.
-function write(pen: Pen, text: string, x: number, baseline: number, size: number, rng: Rng) {
+export function write(pen: Pen, text: string, x: number, baseline: number, size: number, rng: Rng) {
   const scale = size / font.capHeight;
   let cursor = x;
   let drift = 0;
   const slant = jitter(rng, 0.03);
   for (const ch of text) {
-    const g = font.glyphs[ch] ?? font.glyphs["?"];
+    const g = glyph(ch);
     drift = drift * 0.7 + jitter(rng, size * 0.035);
     const s = scale * (1 + jitter(rng, 0.04));
     const rot = slant + jitter(rng, 0.035);
@@ -199,20 +208,47 @@ function write(pen: Pen, text: string, x: number, baseline: number, size: number
         const gy = -stroke[k + 1] * s;
         pts.push([cursor + gx * Math.cos(rot) - gy * Math.sin(rot), baseline + drift + gx * Math.sin(rot) + gy * Math.cos(rot)]);
       }
+      // A full stop or decimal point is too small to show at the pen's width; dab it instead.
+      const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+      if (Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)) < size * 0.2) {
+        const cx = (Math.max(...xs) + Math.min(...xs)) / 2, cy = (Math.max(...ys) + Math.min(...ys)) / 2, r = Math.max(1.2, size * 0.045);
+        pts.length = 0;
+        for (let i = 0; i <= 10; i++) pts.push([cx + Math.cos(i * 1.3) * r * (1 - i / 14), cy + Math.sin(i * 1.3) * r * (1 - i / 14)]);
+      }
       pen.draw(pts);
       pen.lift(35 + rng() * 30);
     }
     if (ch === " ") pen.lift(90);
-    cursor += g.w * scale * (0.96 + jitter(rng, 0.03));
+    cursor += g.w * scale * (0.96 + jitter(rng, 0.03)) * (ch === " " ? SPACE : 1);
   }
   pen.lift(60);
 }
 
 // ---------- a whole turn ----------
-export function planAnnotations(annotations: Annotation[], lines: InkLine[], seed: number): PenPlan {
+export type PlanOptions = {
+  // Lines of math the tutor writes in its own space, below everything on the page.
+  write?: string[];
+  // Graphs, diagrams and tables, drawn below the written lines.
+  figures?: Figure[];
+  // Earlier tutor ink to keep clear of.
+  avoid?: Box[];
+  // Where to write on an empty page (top left of the visible area).
+  origin?: { x: number; y: number };
+  // Paper mode: the tutor writes in the workspace beside the paper, starting
+  // near the top of what's on screen rather than below everything.
+  column?: { x: number; top: number };
+  // Passages in the paper the tutor points at (the app highlights or rules
+  // them), each with an optional margin note in the workspace joined by an
+  // arrow from the page edge.
+  marks?: { boxes: Box[]; kind: "highlight" | "underline"; note: string | null; edge: number }[];
+  // Writing size, when it shouldn't follow the student's handwriting (beside a paper's small print).
+  size?: number;
+};
+
+export function planAnnotations(annotations: Annotation[], lines: InkLine[], seed: number, opts: PlanOptions = {}): PenPlan {
   const rng = seeded(seed);
   const lineH = lines.length ? lines.reduce((s, l) => s + l.box.h, 0) / lines.length : 40;
-  const size = Math.max(20, Math.min(40, lineH * 0.62));
+  const size = opts.size ?? Math.max(20, Math.min(40, lineH * 0.62));
   const pen = new Pen(size * 0.045);
   const occupied: Box[] = lines.map((l) => l.box);
 
@@ -249,6 +285,56 @@ export function planAnnotations(annotations: Annotation[], lines: InkLine[], see
     else if (a.kind === "check") check(pen, box, rng);
     else if (a.kind === "question") write(pen, "?", box.x + box.w + 16, box.y + box.h * 0.85, Math.max(size, box.h * 0.8), rng);
     lastTarget = { box, line, ellipse };
+  }
+
+  const col = opts.column;
+  // In the workspace column, the first gap at least `room` tall at or below `from`.
+  const freeY = (from: number, room: number, width: number) => {
+    const inCol = [...occupied, ...(opts.avoid ?? [])].filter((b) => col && b.x < col.x + width && b.x + b.w > col.x - 10);
+    let y = from;
+    for (let pass = 0; pass < 40; pass++) {
+      const hit = inCol.find((b) => b.y < y + room && b.y + b.h > y);
+      if (!hit) break;
+      y = hit.y + hit.h + 16;
+    }
+    return y;
+  };
+  for (const m of opts.marks ?? []) {
+    if (!m.boxes.length) continue;
+    pen.lift(pen.t ? 200 : 0);
+    if (!m.note?.trim() || !col) continue;
+    const u = m.boxes.reduce(unionBox);
+    const width = measureText(m.note, size);
+    const top = freeY(u.y + u.h / 2 - size * 0.8, size * 1.5, width + 20);
+    const baseline = top + size * 1.05;
+    pen.lift(160);
+    arrow(pen, [m.edge + 6, u.y + u.h / 2], [col.x - 12, baseline - size * 0.4], rng);
+    pen.lift(120);
+    write(pen, m.note.trim(), col.x, baseline, size, rng);
+    occupied.push({ x: col.x, y: top, w: width, h: size * 1.5 });
+  }
+
+  const work = (opts.write ?? []).map((w) => w.trim()).filter(Boolean);
+  const figures = opts.figures ?? [];
+  if (work.length || figures.length) {
+    const workSize = size * 0.95;
+    const below = [...occupied, ...(opts.avoid ?? [])];
+    const left = col ? col.x : lines.length ? Math.min(...lines.map((l) => l.box.x)) : (opts.origin?.x ?? 0) + 60;
+    const bottom = col ? freeY(col.top, 320, 640) : below.length ? Math.max(...below.map((b) => b.y + b.h)) : (opts.origin?.y ?? 0) + 80;
+    let baseline = bottom + workSize * 1.9;
+    pen.lift(pen.t ? 300 : 0);
+    for (const text of work) {
+      write(pen, text, left + jitter(rng, 6), baseline, workSize, rng);
+      pen.lift(180);
+      baseline += workSize * 2;
+    }
+    let figTop = work.length ? baseline - workSize * 0.6 : bottom + workSize * 1.2;
+    for (const fig of figures) {
+      pen.lift(300);
+      // Figures need room to be read, however small the student writes.
+      drawFigure(pen, fig, left, figTop, Math.max(workSize, 28), rng);
+      figTop = Math.max(figTop, pen.box ? pen.box.y + pen.box.h : figTop) + workSize * 1.2;
+    }
   }
 
   return { strokes: pen.strokes, duration: pen.t, box: pen.box };

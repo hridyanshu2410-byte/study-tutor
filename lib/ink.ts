@@ -143,3 +143,24 @@ export function distanceToStroke(stroke: Stroke, x: number, y: number): number {
   }
   return best;
 }
+
+// The strokes a lasso loop encloses: most of a stroke's points must fall
+// inside, so a loop drawn a little loosely still picks up a whole expression.
+export function strokesInLasso(strokes: Stroke[], loop: [number, number][]): Stroke[] {
+  if (loop.length < 3) return [];
+  return strokes.filter((s) => {
+    if (!s.points.length) return false;
+    const inside = s.points.filter(([x, y]) => pointInPolygon(x, y, loop)).length;
+    return inside / s.points.length >= 0.6;
+  });
+}
+
+function pointInPolygon(x: number, y: number, poly: [number, number][]): boolean {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, yi] = poly[i];
+    const [xj, yj] = poly[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
