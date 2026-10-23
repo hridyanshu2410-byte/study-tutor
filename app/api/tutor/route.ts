@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import OpenAI from "openai";
+import { firstBreak } from "@/lib/check";
 import { zodResponseFormat } from "openai/helpers/zod";
 import { adminClient, createClient } from "@/lib/supabase/server";
 import { researchMode } from "@/lib/supabase/env";
@@ -176,14 +177,37 @@ export async function POST(req: Request) {
 
   const started = Date.now();
   try {
-    const { turn, usage } = await askTutor({
-      schema: tutorTurnSchema(allowedMoves(lastRung)),
-      system: reviewing ? `${TUTOR_SYSTEM_PROMPT}\n\n${REVIEW_PROMPT}` : TUTOR_SYSTEM_PROMPT,
-      page,
-      tokens,
-      reference,
-      situation,
-    });
+    // A reply that breaks the turn's schema (a model ignoring the allowed
+    // moves, say) counts as no reply, never as a crash.
+    const ask = (extra = "") =>
+      askTutor({
+        schema: tutorTurnSchema(allowedMoves(lastRung)),
+        system: reviewing ? `${TUTOR_SYSTEM_PROMPT}\n\n${REVIEW_PROMPT}` : TUTOR_SYSTEM_PROMPT,
+        page,
+        tokens,
+        reference,
+        situation: situation + extra,
+      }).catch((err): Answer => {
+        if (err instanceof Anthropic.APIError || err instanceof OpenAI.APIError) throw err;
+        console.warn("Unusable tutor reply", err instanceof Error ? err.message.slice(0, 200) : err);
+        return { turn: null, usage: { input: 0, output: 0 } };
+      });
+    let { turn, usage } = await ask();
+
+    // A math checker reads the turn. If it disagrees with the tutor about the
+    // student's work, or finds a slip in the tutor's own math, the tutor gets
+    // one chance to look again before anything reaches the student.
+    const flags = turn ? mathFlags(turn) : [];
+    let retried = false;
+    if (turn && flags.length) {
+      retried = true;
+      const second = await ask(
+        `\n\nA math checker reviewed your answer and found:\n- ${flags.join("\n- ")}\nLook again. If the checker is right, fix your turn: a slip by the student is their first mistake, and a slip of yours must not reach the page. If you are sure you were right, keep your answer.`,
+      );
+      if (second.turn) turn = second.turn;
+      usage = { input: usage.input + second.usage.input, output: usage.output + second.usage.output };
+    }
+    if (turn) stripBadMath(turn);
 
     if (!turn) {
       return Response.json(fallbackTurn("Let's look at this together. What are you trying to do on this line?"));
@@ -223,6 +247,8 @@ export async function POST(req: Request) {
           card_proposed: Boolean(turn.card),
           review_result: turn.review_result,
           first_error_line: turn.private.first_error_line,
+          math_flags: flags,
+          math_retried: retried,
           latency_ms: Date.now() - started,
           model: provider === "openai" ? openaiModel : "claude-opus-5-5",
           input_tokens: usage.input,
@@ -292,4 +318,37 @@ function describeFigure(f: TutorTurn["draw"][number]): string {
   if (f.kind === "table") return `drew a table: ${f.rows.map((r) => r.join(" | ")).join(" / ")}`;
   if (f.kind === "forces") return `drew a force diagram: ${f.forces.map((x) => x.label).join(", ")}`;
   return `wrote steps: ${f.lines.map((l) => l.math).join(" ; ")}`;
+}
+
+function mathFlags(turn: TutorTurn): string[] {
+  const flags: string[] = [];
+  const reading = turn.private.reading;
+  const student = firstBreak(reading.map((r) => r.latex));
+  if (student) {
+    const id = reading[student.index].line_id;
+    const said = turn.private.first_error_line;
+    const saidAt = said ? reading.findIndex((r) => r.line_id === said) : -1;
+    if (saidAt < 0 || saidAt > student.index) {
+      flags.push(`On the student's page, ${student.detail} (line ${id}), but your first_error_line is ${said ?? "null"}. Check your reading of ${id} and the line before it.`);
+    }
+  }
+  for (const f of turn.draw) {
+    if (f.kind !== "steps") continue;
+    const b = firstBreak(f.lines.map((l) => l.math));
+    if (b) flags.push(`In the steps you drew, ${b.detail}.`);
+  }
+  const w = firstBreak(turn.write);
+  if (w) flags.push(`In what you wrote, ${w.detail}.`);
+  return flags;
+}
+
+// What the tutor writes must be right: cut its working at the first slip.
+function stripBadMath(turn: TutorTurn) {
+  for (const f of turn.draw) {
+    if (f.kind !== "steps") continue;
+    const b = firstBreak(f.lines.map((l) => l.math));
+    if (b) f.lines = f.lines.slice(0, b.index);
+  }
+  const w = firstBreak(turn.write);
+  if (w) turn.write = turn.write.slice(0, w.index);
 }

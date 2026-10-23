@@ -26,7 +26,7 @@ const CONSTS: Record<string, number> = { pi: Math.PI, π: Math.PI, e: Math.E };
 
 type Tok = { t: "num"; v: number } | { t: "id"; v: string } | { t: "op"; v: string };
 
-function tokenize(src: string): Tok[] {
+function tokenize(src: string, variable: string): Tok[] {
   const s = src
     .replace(/[−–]/g, "-")
     .replace(/[×·]/g, "*")
@@ -35,7 +35,7 @@ function tokenize(src: string): Tok[] {
     .replace(/³/g, "^3")
     .replace(/√/g, "sqrt")
     .replace(/\*\*/g, "^")
-    .replace(/^\s*[a-z]\s*(\(\s*x\s*\))?\s*=/i, ""); // "y =" or "f(x) ="
+    .replace(variable === "x" ? /^\s*[a-wyz]\s*(\(\s*x\s*\))?\s*=/i : /^(?!)/, ""); // "y =" or "f(x) =" when plotting
   const out: Tok[] = [];
   let i = 0;
   while (i < s.length) {
@@ -47,7 +47,7 @@ function tokenize(src: string): Tok[] {
       i += m[0].length;
     } else if (/[a-zπ]/i.test(c)) {
       const m = /^[a-zπ]+/i.exec(s.slice(i))!;
-      out.push(...splitName(m[0].toLowerCase()));
+      out.push(...splitName(m[0].toLowerCase(), variable));
       i += m[0].length;
     } else if ("+-*/^(),".includes(c)) {
       out.push({ t: "op", v: c });
@@ -57,10 +57,10 @@ function tokenize(src: string): Tok[] {
   return out;
 }
 
-// "xsin" or "2pix" style runs of letters: split into known names and x.
-function splitName(name: string): Tok[] {
+// "xsin" or "2pix" style runs of letters: split into known names and the variable.
+function splitName(name: string, variable: string): Tok[] {
   const out: Tok[] = [];
-  const known = [...Object.keys(FUNCS), ...Object.keys(CONSTS), "x"].sort((a, b) => b.length - a.length);
+  const known = [...Object.keys(FUNCS), ...Object.keys(CONSTS), variable].sort((a, b) => b.length - a.length);
   let rest = name;
   while (rest) {
     const k = known.find((n) => rest.startsWith(n));
@@ -71,8 +71,8 @@ function splitName(name: string): Tok[] {
   return out;
 }
 
-export function compile(src: string): Node {
-  const toks = tokenize(src);
+export function compile(src: string, variable = "x"): Node {
+  const toks = tokenize(src, variable.toLowerCase());
   let p = 0;
   const peek = () => toks[p];
   const isOp = (v: string) => toks[p]?.t === "op" && toks[p].v === v;
@@ -137,7 +137,7 @@ export function compile(src: string): Node {
       return inner;
     }
     if (tok.t === "id") {
-      if (tok.v === "x") return (x) => x;
+      if (tok.v === variable.toLowerCase()) return (x) => x;
       if (tok.v in CONSTS) return () => CONSTS[tok.v];
       const f = FUNCS[tok.v];
       // sin x, sin(x), sin^2(x) are all common ways to write it
@@ -156,4 +156,25 @@ export function compile(src: string): Node {
   const fn = sum();
   if (p < toks.length) throw new Error(`Unexpected "${toks[p].v}"`);
   return fn;
+}
+
+// The one letter a formula is written in, such as "t" in "4.9t^2", or null
+// for plain arithmetic. Throws when there are several (x and y), since a
+// single-variable check can't judge those.
+export function variableOf(src: string): string | null {
+  const names = new Set<string>();
+  const known = [...Object.keys(FUNCS), ...Object.keys(CONSTS)].sort((a, b) => b.length - a.length);
+  for (const run of src.toLowerCase().match(/[a-zπ]+/g) ?? []) {
+    let rest = run;
+    while (rest) {
+      const k = known.find((n) => rest.startsWith(n));
+      if (k) rest = rest.slice(k.length);
+      else {
+        names.add(rest[0]);
+        rest = rest.slice(1);
+      }
+    }
+  }
+  if (names.size > 1) throw new Error(`Several variables: ${[...names].join(", ")}`);
+  return [...names][0] ?? null;
 }
