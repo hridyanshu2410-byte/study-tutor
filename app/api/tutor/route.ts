@@ -20,12 +20,14 @@ const openaiModel = process.env.OPENAI_TUTOR_MODEL || "gpt-6-luna";
 const client = provider === "anthropic" ? new Anthropic() : null;
 const openai = provider === "openai" && process.env.OPENAI_API_KEY ? new OpenAI() : null;
 
-type Ask = { schema: ReturnType<typeof tutorTurnSchema>; system: string; page: string; tokens: string; reference?: string; situation: string };
+// A page picture: PNG for plain ink, JPEG when a photo or PDF is under the ink.
+type Pic = { data: string; type: "image/png" | "image/jpeg" };
+type Ask = { schema: ReturnType<typeof tutorTurnSchema>; system: string; page: Pic; tokens: Pic; reference?: Pic; situation: string };
 type Answer = { turn: TutorTurn | null; usage: { input: number; output: number } };
 
 async function askTutor(a: Ask): Promise<Answer> {
   if (provider === "openai") {
-    const png = (data: string) => ({ type: "image_url" as const, image_url: { url: `data:image/png;base64,${data}` } });
+    const png = (p: Pic) => ({ type: "image_url" as const, image_url: { url: `data:${p.type};base64,${p.data}` } });
     const res = await openai!.chat.completions.parse({
       model: openaiModel,
       response_format: zodResponseFormat(a.schema, "tutor_turn"),
@@ -60,13 +62,13 @@ async function askTutor(a: Ask): Promise<Answer> {
         role: "user",
         content: [
           { type: "text", text: "The student's page:" },
-          { type: "image", source: { type: "base64", media_type: "image/png", data: a.page } },
+          { type: "image", source: { type: "base64", media_type: a.page.type, data: a.page.data } },
           { type: "text", text: "The same page with line ids and numbered tokens:" },
-          { type: "image", source: { type: "base64", media_type: "image/png", data: a.tokens } },
+          { type: "image", source: { type: "base64", media_type: a.tokens.type, data: a.tokens.data } },
           ...(a.reference
             ? [
                 { type: "text" as const, text: "The reference answer the student kept on their card:" },
-                { type: "image" as const, source: { type: "base64" as const, media_type: "image/png" as const, data: a.reference } },
+                { type: "image" as const, source: { type: "base64" as const, media_type: a.reference.type, data: a.reference.data } },
               ]
             : []),
           { type: "text", text: a.situation },
@@ -132,11 +134,14 @@ export async function POST(req: Request) {
   }
 
   const body = (await req.json()) as TutorRequest;
-  const png = (url: string | undefined) => /^data:image\/png;base64,(.+)$/.exec(url ?? "")?.[1];
+  const png = (url: string | undefined): Pic | undefined => {
+    const m = /^data:(image\/png|image\/jpeg);base64,(.+)$/.exec(url ?? "");
+    return m ? { type: m[1] as Pic["type"], data: m[2] } : undefined;
+  };
   const page = png(body.pageImage);
   const tokens = png(body.tokenImage);
   if (!body.sessionId || !page || !tokens) {
-    return Response.json({ error: "sessionId, pageImage and tokenImage (PNG) are required" }, { status: 400 });
+    return Response.json({ error: "sessionId, pageImage and tokenImage (PNG or JPEG) are required" }, { status: 400 });
   }
 
   const reviewing = body.mode === "review" && body.review != null;
@@ -163,6 +168,9 @@ export async function POST(req: Request) {
       : `Problem the student is working on: ${body.problem.trim() || "not stated; infer it from the page"}`,
     weakSpots.length ? `Concepts this student has slipped on before: ${weakSpots.join(", ")}` : "",
     `Lines on the page: ${body.lines.map((l) => `${l.id} (${l.tokens} tokens)`).join(", ") || "none yet"}`,
+    body.hasPhoto
+      ? "The page has a photo or PDF of printed material (a worksheet, textbook page or notes) under the student's ink. Line ids and token boxes cover only the student's handwriting. Read the printed problems from the image; if several are printed and the student hasn't said or shown which one, ask which they're on."
+      : "",
     history ? `Earlier turns this session:\n${history}` : "This is the first turn of the session.",
     `Last hint-ladder rung used: ${lastRung}`,
     body.idleSeconds != null ? `The student last wrote ${Math.round(body.idleSeconds)} seconds ago.` : "",

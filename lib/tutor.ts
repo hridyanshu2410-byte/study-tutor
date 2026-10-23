@@ -93,9 +93,11 @@ export type TutorRequest = {
   focus?: { line_id: string; token: number | null } | null;
   // Seconds since the student last put pen to the page, so the tutor knows if they are mid-thought.
   idleSeconds?: number;
+  // A photo or PDF of printed material sits under the student's ink.
+  hasPhoto?: boolean;
   speech: string | null;
   lines: { id: string; tokens: number }[];
-  pageImage: string; // PNG data URL of the student's page, clean
+  pageImage: string; // PNG (or JPEG when there is a photo) data URL of the student's page, clean
   tokenImage: string; // the same page with each line's tokens boxed and numbered
 };
 

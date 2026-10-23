@@ -35,6 +35,7 @@ import type { Grade } from "ts-fsrs";
 import ReviewPanel from "./ReviewPanel";
 import AccountMenu from "./AccountMenu";
 import { flushCloud, loadCloud, logEvent, saveCloud, type Account } from "@/lib/cloud";
+import { picturesFrom, type PageImage } from "@/lib/photo";
 
 type Tool = "pen" | "eraser" | "hand" | "keep";
 type Mode = "study" | "review";
@@ -48,7 +49,7 @@ type TutorState = "idle" | "thinking" | "speaking";
 // performance.now() time; 0 means already fully written (e.g. restored), and
 // Infinity means waiting to start with the voice.
 type TutorInk = { id: string; plan: PenPlan; born: number };
-type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string };
+type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string; images?: PageImage[] };
 
 // What happened this session, for the wrap-up summary.
 type SessionStats = { startedAt: number; turns: number; concepts: Record<string, { slips: number; solved: number }>; cards: string[] };
@@ -70,6 +71,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const paths = useRef(new Map<string, Path2D>());
   const tutorPaths = useRef(new Map<string, Path2D>());
   const tutorInk = useRef<TutorInk[]>([]);
+  // Photos and PDF pages under the ink, and their decoded pictures.
+  const images = useRef<PageImage[]>([]);
+  const imageEls = useRef(new Map<string, HTMLImageElement>());
   const camera = useRef<Camera>({ x: -40, y: -40, z: 1 });
   const glide = useRef<{ from: Camera; to: Camera; start: number } | null>(null);
   const drawing = useRef<{ stroke: Stroke; pointerId: number; simulate: boolean } | null>(null);
@@ -108,6 +112,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const [run, setRun] = useState<ReviewRun | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [summary, setSummary] = useState<{ recap: string; stats: SessionStats } | null>(null);
+  const [hasPhoto, setHasPhoto] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const photoInput = useRef<HTMLInputElement>(null);
   const { memory, memoryRef, update: updateMemory, storageFull, loaded } = useStudyMemory(account);
 
   // Re-check what's due every minute, as well as whenever cards change.
@@ -166,6 +173,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const applyPage = (saved: SavedPage | null) => {
     strokes.current = saved?.strokes ?? [];
     tutorInk.current = (saved?.tutorInk ?? []).map((t) => ({ ...t, born: 0 }));
+    setImages(saved?.images ?? []);
     paths.current.clear();
     tutorPaths.current.clear();
     setProblem(saved?.problem ?? "");
@@ -196,7 +204,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   const save = useCallback(() => {
     if (stateRef.current.mode === "review") return;
-    const page: SavedPage = { strokes: strokes.current, tutorInk: tutorInk.current, problem: stateRef.current.problem };
+    const page: SavedPage = { strokes: strokes.current, tutorInk: tutorInk.current, problem: stateRef.current.problem, images: images.current };
     if (account) saveCloud(account.userId, "page", page);
     try {
       localStorage.setItem(pageKey, JSON.stringify(page));
@@ -204,6 +212,30 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       // Storage is a convenience; the page keeps working without it.
     }
   }, [account, pageKey]);
+
+  const setImages = (next: PageImage[]) => {
+    images.current = next;
+    for (const id of imageEls.current.keys()) if (!next.some((i) => i.id === id)) imageEls.current.delete(id);
+    setHasPhoto(next.length > 0);
+    dirty.current = true;
+  };
+
+  // The decoded picture for a page image, once it has loaded.
+  const pictureFor = (img: PageImage): HTMLImageElement | null => {
+    let el = imageEls.current.get(img.id);
+    if (!el) {
+      el = new Image();
+      el.onload = () => (dirty.current = true);
+      el.src = img.src;
+      imageEls.current.set(img.id, el);
+    }
+    return el.complete && el.naturalWidth ? el : null;
+  };
+  const loadedPictures = () =>
+    images.current.flatMap((img) => {
+      const el = pictureFor(img);
+      return el ? [{ img, el }] : [];
+    });
 
   // ---------- rendering ----------
   const pathFor = useCallback((s: Stroke, simulate = false) => {
@@ -263,6 +295,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       drawPaper(ctx, cam, w, h);
 
       ctx.setTransform(dpr * cam.z, 0, 0, dpr * cam.z, -cam.x * cam.z * dpr, -cam.y * cam.z * dpr);
+      for (const img of images.current) drawPicture(ctx, img, pictureFor(img), cam.z);
       for (const s of strokes.current) {
         ctx.fillStyle = s.color;
         ctx.fill(pathFor(s, drawing.current?.stroke.id === s.id ? drawing.current.simulate : false));
@@ -311,7 +344,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       }
       if (pauseTimer.current) clearTimeout(pauseTimer.current);
       const lines = groupLines(strokes.current);
-      if (!lines.length && !speech && !stateRef.current.problem.trim()) return;
+      if (!lines.length && !speech && !stateRef.current.problem.trim() && !images.current.length) return;
       if (trigger !== "pause") stopSpeaking();
 
       const abort = new AbortController();
@@ -342,8 +375,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
             speech,
             idleSeconds: lastPenAt.current ? (Date.now() - lastPenAt.current) / 1000 : undefined,
             focus: trigger === "pause" ? null : focusOn(lines),
+            hasPhoto: images.current.length > 0,
             lines: lines.map((l) => ({ id: l.id, tokens: l.tokens.length })),
-            ...renderPageImages(strokes.current, lines),
+            ...renderPageImages(strokes.current, lines, loadedPictures()),
           } satisfies TutorRequest),
         });
         const data = await res.json();
@@ -501,6 +535,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const freshPage = () => {
     strokes.current = [];
     tutorInk.current = [];
+    setImages([]);
     paths.current.clear();
     tutorPaths.current.clear();
     undoStack.current = [];
@@ -922,12 +957,13 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   }, [undo]);
 
   const clearPage = () => {
-    if (!strokes.current.length && !tutorInk.current.length) return;
+    if (!strokes.current.length && !tutorInk.current.length && !images.current.length) return;
     if (!confirm("Clear the whole page?")) return;
     hush();
     undoStack.current.push([...strokes.current]);
     strokes.current = [];
     tutorInk.current = [];
+    setImages([]);
     paths.current.clear();
     tutorPaths.current.clear();
     sessionId.current = crypto.randomUUID();
@@ -939,7 +975,14 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   // A picture of the whole page, both inks, to keep or hand in.
   const saveNotes = () => {
     const tutorStrokes = tutorInk.current.flatMap((t) => t.plan.strokes.map((st) => st.points));
-    const all = [...strokes.current.flatMap((s) => s.points.map((p) => [p[0], p[1]])), ...tutorStrokes.flat()];
+    const all = [
+      ...strokes.current.flatMap((s) => s.points.map((p) => [p[0], p[1]])),
+      ...tutorStrokes.flat(),
+      ...images.current.flatMap((i) => [
+        [i.x, i.y],
+        [i.x + i.w, i.y + i.h],
+      ]),
+    ];
     if (!all.length) return;
     const m = 40;
     const x0 = Math.min(...all.map((p) => p[0])) - m, y0 = Math.min(...all.map((p) => p[1])) - m;
@@ -952,6 +995,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     ctx.fillStyle = "#fff";
     ctx.fillRect(0, 0, c.width, c.height);
     ctx.setTransform(scale, 0, 0, scale, -x0 * scale, -y0 * scale);
+    for (const { img, el } of loadedPictures()) ctx.drawImage(el, img.x, img.y, img.w, img.h);
     ctx.fillStyle = STUDENT_INK;
     for (const s of strokes.current) ctx.fill(outlinePath(getStroke(s.points, { size: s.size, thinning: 0.6, smoothing: 0.55, streamline: 0.45 })));
     ctx.fillStyle = TUTOR_INK;
@@ -966,6 +1010,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     hush();
     strokes.current = [];
     tutorInk.current = [];
+    setImages([]);
     paths.current.clear();
     tutorPaths.current.clear();
     undoStack.current = [];
@@ -975,6 +1020,47 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     setSummary(null);
     setCaption("Fresh page. What are we working on next?");
     dirty.current = true;
+    save();
+  };
+
+  // A photo, screenshot or PDF of a worksheet goes under the ink, starting
+  // where the student is looking, pages stacked downward.
+  const addPhoto = async (file: File) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    setImporting(true);
+    setError(null);
+    try {
+      const pictures = await picturesFrom(file);
+      const cam = camera.current;
+      const viewW = canvas.clientWidth / cam.z;
+      const width = Math.min(900, Math.max(320, viewW * 0.6));
+      const x = cam.x + 30 / cam.z;
+      let y = cam.y + 90 / cam.z;
+      const added: PageImage[] = [];
+      for (const p of pictures) {
+        const h = (width * p.h) / p.w;
+        added.push({ id: crypto.randomUUID(), src: p.src, x, y, w: width, h });
+        y += h + 24;
+      }
+      setImages([...images.current, ...added]);
+      save();
+      logEvent(account, "photo_added", { pages: added.length, pdf: file.type === "application/pdf" }, sessionId.current);
+      setCaption(
+        added.length > 1
+          ? `Got all ${added.length} pages. Write right on them, and tell me which problem you're on.`
+          : "Got it. Write right on it, and tell me which problem you're on.",
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "That file couldn't be opened.");
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const removePhotos = () => {
+    if (!images.current.length || !confirm("Take the photo off the page? Your writing stays.")) return;
+    setImages([]);
     save();
   };
 
@@ -1059,6 +1145,25 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
             ))}
           <button onClick={undo}>Undo</button>
           <button onClick={clearPage}>Clear</button>
+          {mode === "study" && (
+            <>
+              <button onClick={() => photoInput.current?.click()} disabled={importing} title="Put a photo, screenshot or PDF of a worksheet under your writing">
+                {importing ? "Opening…" : "Add photo"}
+              </button>
+              {hasPhoto && <button onClick={removePhotos}>Remove photo</button>}
+              <input
+                ref={photoInput}
+                type="file"
+                accept="image/*,application/pdf"
+                hidden
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  e.target.value = "";
+                  if (f) addPhoto(f);
+                }}
+              />
+            </>
+          )}
           {mode === "study" ? (
             <button className={panelOpen ? "on" : ""} onClick={() => setPanelOpen((o) => !o)} aria-expanded={panelOpen}>
               Review{due.length ? <span className="badge">{due.length}</span> : null}
@@ -1259,6 +1364,20 @@ function drawPaper(ctx: CanvasRenderingContext2D, cam: Camera, w: number, h: num
 
 // Tutor strokes go through the same pen model as the student's ink, with
 // pressure simulated from speed so lines swell and taper like real ink.
+// A photo or PDF page under the ink, with a faint edge so it reads as paper.
+function drawPicture(ctx: CanvasRenderingContext2D, img: PageImage, el: HTMLImageElement | null, z: number) {
+  ctx.save();
+  ctx.shadowColor = "rgba(15, 23, 42, 0.12)";
+  ctx.shadowBlur = 8; // shadows ignore the transform
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(img.x, img.y, img.w, img.h);
+  ctx.restore();
+  if (el) ctx.drawImage(el, img.x, img.y, img.w, img.h);
+  ctx.strokeStyle = "rgba(15, 23, 42, 0.15)";
+  ctx.lineWidth = 1 / z;
+  ctx.strokeRect(img.x, img.y, img.w, img.h);
+}
+
 function drawTutorInk(ctx: CanvasRenderingContext2D, ink: TutorInk, now: number, cache: Map<string, Path2D>) {
   const t = ink.born === 0 ? Infinity : now - ink.born;
   ctx.save();
@@ -1312,8 +1431,10 @@ function outlinePath(outline: number[][]): Path2D {
 // The tutor gets two pictures: the clean page to read, and the same page with
 // line ids and numbered token boxes so it can point at an exact part.
 // Tutor ink is left out of both so it never "reads" itself.
-function renderPageImages(strokes: Stroke[], lines: InkLine[]): { pageImage: string; tokenImage: string } {
-  if (!lines.length) {
+type LoadedPicture = { img: PageImage; el: HTMLImageElement };
+
+function renderPageImages(strokes: Stroke[], lines: InkLine[], pictures: LoadedPicture[] = []): { pageImage: string; tokenImage: string } {
+  if (!lines.length && !pictures.length) {
     const blank = document.createElement("canvas");
     blank.width = blank.height = 64;
     const ctx = blank.getContext("2d")!;
@@ -1322,10 +1443,11 @@ function renderPageImages(strokes: Stroke[], lines: InkLine[]): { pageImage: str
     const url = blank.toDataURL("image/png");
     return { pageImage: url, tokenImage: url };
   }
-  let box = lines[0].box;
-  for (const l of lines) {
-    const x = Math.min(box.x, l.box.x), y = Math.min(box.y, l.box.y);
-    box = { x, y, w: Math.max(box.x + box.w, l.box.x + l.box.w) - x, h: Math.max(box.y + box.h, l.box.y + l.box.h) - y };
+  const boxes = [...lines.map((l) => l.box), ...pictures.map(({ img }) => ({ x: img.x, y: img.y, w: img.w, h: img.h }))];
+  let box = boxes[0];
+  for (const b of boxes) {
+    const x = Math.min(box.x, b.x), y = Math.min(box.y, b.y);
+    box = { x, y, w: Math.max(box.x + box.w, b.x + b.w) - x, h: Math.max(box.y + box.h, b.y + b.h) - y };
   }
   const margin = 60;
   const scale = Math.min(1.5, 1500 / (box.w + 2 * margin), 1500 / (box.h + 2 * margin));
@@ -1338,6 +1460,7 @@ function renderPageImages(strokes: Stroke[], lines: InkLine[]): { pageImage: str
     ctx.fillStyle = "#fff";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.setTransform(scale, 0, 0, scale, (margin - box.x) * scale, (margin - box.y) * scale);
+    for (const { img, el } of pictures) ctx.drawImage(el, img.x, img.y, img.w, img.h);
     ctx.fillStyle = STUDENT_INK;
     for (const s of strokes) {
       const outline = getStroke(s.points, { size: s.size, thinning: 0.6, smoothing: 0.55, streamline: 0.45 });
@@ -1358,7 +1481,8 @@ function renderPageImages(strokes: Stroke[], lines: InkLine[]): { pageImage: str
         }
       }
     }
-    return canvas.toDataURL("image/png");
+    // A photo makes a PNG huge; JPEG keeps the request small.
+    return pictures.length ? canvas.toDataURL("image/jpeg", 0.85) : canvas.toDataURL("image/png");
   };
   return { pageImage: draw(false), tokenImage: draw(true) };
 }

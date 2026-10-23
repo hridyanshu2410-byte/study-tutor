@@ -5,3 +5,4 @@ node_modules
 next-env.d.ts
 *.tsbuildinfo
 public/sql-wasm-browser.wasm
+public/pdf.worker.min.mjs
