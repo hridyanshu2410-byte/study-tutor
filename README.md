@@ -8,7 +8,7 @@ The full plan (pedagogy, architecture, roadmap) lives in the project doc: [Study
 
 ```bash
 npm install
-cp .env.example .env.local   # add your ANTHROPIC_API_KEY
+cp .env.example .env.local   # add ANTHROPIC_API_KEY, or OPENAI_API_KEY to run the tutor on GPT-6 Luna
 npm run dev                   # http://localhost:3000
 ```
 

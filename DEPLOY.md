@@ -20,14 +20,14 @@ This puts the tutor online so testers can sign up, give consent, and use it on t
 
    | Name | Value |
    | --- | --- |
-   | `ANTHROPIC_API_KEY` | your Anthropic key (required) |
+   | `ANTHROPIC_API_KEY` | your Anthropic key (the tutor runs on Claude when set) |
    | `NEXT_PUBLIC_SUPABASE_URL` | the Project URL |
    | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | the anon / publishable key |
    | `SUPABASE_SERVICE_ROLE_KEY` | the service_role / secret key |
    | `ADMIN_EMAILS` | your email (and any co-researchers), comma-separated |
    | `STUDY_INVITE_CODE` | optional: a code testers must enter to join |
    | `DAILY_TUTOR_LIMIT` | optional: tutor turns per tester per day, default 300 |
-   | `OPENAI_API_KEY` | optional: natural tutor voice |
+   | `OPENAI_API_KEY` | runs the tutor on GPT-6 Luna if no Anthropic key is set (`OPENAI_TUTOR_MODEL` changes the model); also the natural tutor voice |
 
 3. Deploy. Copy the site address Vercel gives you (for example `https://study-tutor.vercel.app`).
 4. Back in Supabase, open **Authentication → URL Configuration**. Set **Site URL** to that address and add `https://<your-address>/auth/callback` under **Redirect URLs**, so confirmation and password-reset links come back to the app.

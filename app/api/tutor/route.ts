@@ -1,11 +1,83 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
+import OpenAI from "openai";
+import { zodResponseFormat } from "openai/helpers/zod";
 import { adminClient, createClient } from "@/lib/supabase/server";
 import { researchMode } from "@/lib/supabase/env";
 import { dailyTutorLimit, startOfUtcDay } from "@/lib/study";
 import { LADDER, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, TutorTurnSchema, type PublicTurn, type TutorRequest, type TutorTurn } from "@/lib/tutor";
 
-const client = new Anthropic();
+// The tutor runs on Claude when ANTHROPIC_API_KEY is set, otherwise on OpenAI
+// (OPENAI_TUTOR_MODEL, default GPT-6 Luna). TUTOR_PROVIDER forces one.
+const provider: "anthropic" | "openai" =
+  process.env.TUTOR_PROVIDER === "openai" || process.env.TUTOR_PROVIDER === "anthropic"
+    ? process.env.TUTOR_PROVIDER
+    : process.env.ANTHROPIC_API_KEY
+      ? "anthropic"
+      : "openai";
+const openaiModel = process.env.OPENAI_TUTOR_MODEL || "gpt-6-luna";
+const client = provider === "anthropic" ? new Anthropic() : null;
+const openai = provider === "openai" && process.env.OPENAI_API_KEY ? new OpenAI() : null;
+
+type Ask = { system: string; page: string; tokens: string; reference?: string; situation: string };
+type Answer = { turn: TutorTurn | null; usage: { input: number; output: number } };
+
+async function askTutor(a: Ask): Promise<Answer> {
+  if (provider === "openai") {
+    const png = (data: string) => ({ type: "image_url" as const, image_url: { url: `data:image/png;base64,${data}` } });
+    const res = await openai!.chat.completions.parse({
+      model: openaiModel,
+      response_format: zodResponseFormat(TutorTurnSchema, "tutor_turn"),
+      messages: [
+        { role: "system", content: a.system },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "The student's page:" },
+            png(a.page),
+            { type: "text", text: "The same page with line ids and numbered tokens:" },
+            png(a.tokens),
+            ...(a.reference ? [{ type: "text" as const, text: "The reference answer the student kept on their card:" }, png(a.reference)] : []),
+            { type: "text", text: a.situation },
+          ],
+        },
+      ],
+    });
+    const choice = res.choices[0];
+    return {
+      turn: choice?.message.refusal ? null : (choice?.message.parsed ?? null),
+      usage: { input: res.usage?.prompt_tokens ?? 0, output: res.usage?.completion_tokens ?? 0 },
+    };
+  }
+  const response = await client!.messages.parse({
+    model: "claude-opus-5-5",
+    max_tokens: 16000,
+    output_config: { effort: "medium", format: zodOutputFormat(TutorTurnSchema) },
+    system: a.system,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "The student's page:" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: a.page } },
+          { type: "text", text: "The same page with line ids and numbered tokens:" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: a.tokens } },
+          ...(a.reference
+            ? [
+                { type: "text" as const, text: "The reference answer the student kept on their card:" },
+                { type: "image" as const, source: { type: "base64" as const, media_type: "image/png" as const, data: a.reference } },
+              ]
+            : []),
+          { type: "text", text: a.situation },
+        ],
+      },
+    ],
+  });
+  return {
+    turn: response.stop_reason === "refusal" ? null : response.parsed_output,
+    usage: { input: response.usage.input_tokens, output: response.usage.output_tokens },
+  };
+}
 
 // What the tutor remembers of earlier turns in a session.
 type PastTurn = { trigger: string; speech: string | null; move: TutorTurn["move"]; say: string; ink: string; diagnosis: string };
@@ -28,8 +100,11 @@ async function pastTurns(db: ReturnType<typeof adminClient> | null, userId: stri
 }
 
 export async function POST(req: Request) {
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return Response.json({ error: "The tutor needs ANTHROPIC_API_KEY in .env.local" }, { status: 500 });
+  if (provider === "anthropic" ? !process.env.ANTHROPIC_API_KEY : !openai) {
+    return Response.json(
+      { error: provider === "anthropic" ? "The tutor needs ANTHROPIC_API_KEY in .env.local" : "The tutor needs OPENAI_API_KEY in .env.local" },
+      { status: 500 },
+    );
   }
   // In research mode only signed-in testers reach the tutor, within a daily cap.
   // Testers can't read the event log (it holds the tutor's private
@@ -100,36 +175,18 @@ export async function POST(req: Request) {
 
   const started = Date.now();
   try {
-    const response = await client.messages.parse({
-      model: "claude-opus-5-5",
-      max_tokens: 16000,
-      output_config: { effort: "medium", format: zodOutputFormat(TutorTurnSchema) },
+    const { turn, usage } = await askTutor({
       system: reviewing ? `${TUTOR_SYSTEM_PROMPT}\n\n${REVIEW_PROMPT}` : TUTOR_SYSTEM_PROMPT,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "The student's page:" },
-            { type: "image", source: { type: "base64", media_type: "image/png", data: page } },
-            { type: "text", text: "The same page with line ids and numbered tokens:" },
-            { type: "image", source: { type: "base64", media_type: "image/png", data: tokens } },
-            ...(reference
-              ? [
-                  { type: "text" as const, text: "The reference answer the student kept on their card:" },
-                  { type: "image" as const, source: { type: "base64" as const, media_type: "image/png" as const, data: reference } },
-                ]
-              : []),
-            { type: "text", text: situation },
-          ],
-        },
-      ],
+      page,
+      tokens,
+      reference,
+      situation,
     });
 
-    if (response.stop_reason === "refusal" || !response.parsed_output) {
+    if (!turn) {
       return Response.json(fallbackTurn("Let's look at this together. What are you trying to do on this line?"));
     }
 
-    const turn = response.parsed_output;
     const known = new Set(body.lines.map((l) => l.id));
     turn.annotations = turn.annotations.filter((a) => known.has(a.line_id) || a.kind === "note").slice(0, 4);
     if (reviewing) turn.card = null;
@@ -163,8 +220,9 @@ export async function POST(req: Request) {
           review_result: turn.review_result,
           first_error_line: turn.private.first_error_line,
           latency_ms: Date.now() - started,
-          input_tokens: response.usage.input_tokens,
-          output_tokens: response.usage.output_tokens,
+          model: provider === "openai" ? openaiModel : "claude-opus-5-5",
+          input_tokens: usage.input,
+          output_tokens: usage.output,
         },
       });
       if (error) console.warn("Could not log tutor turn", error.message);
@@ -180,6 +238,16 @@ export async function POST(req: Request) {
     };
     return Response.json(publicTurn);
   } catch (err) {
+    if (err instanceof OpenAI.AuthenticationError) {
+      return Response.json({ error: "Check OPENAI_API_KEY in .env.local" }, { status: 500 });
+    }
+    if (err instanceof OpenAI.RateLimitError) {
+      return Response.json(fallbackTurn("Give me a second, then ask me again."), { status: 429 });
+    }
+    if (err instanceof OpenAI.APIError) {
+      console.warn("OpenAI tutor error", err.status, err.message);
+      return Response.json({ error: `Tutor service error ${err.status}` }, { status: 502 });
+    }
     if (err instanceof Anthropic.AuthenticationError) {
       return Response.json({ error: "Set ANTHROPIC_API_KEY in .env.local" }, { status: 500 });
     }
