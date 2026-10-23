@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import OpenAI from "openai";
 import { firstBreak } from "@/lib/check";
+import { describeSim, sanitizeSim } from "@/lib/sims";
 import { zodResponseFormat } from "openai/helpers/zod";
 import { adminClient, createClient } from "@/lib/supabase/server";
 import { researchMode } from "@/lib/supabase/env";
@@ -189,7 +190,9 @@ export async function POST(req: Request) {
           : "The student tapped to ask for your help."
         : body.trigger === "wrap_up"
           ? "The student is ending the session. Wrap up."
-          : `The student just said: "${body.speech ?? ""}"`,
+          : body.trigger === "watched"
+            ? `The student just played the simulation and watched it. What happened: ${String(body.watched ?? "").slice(0, 600)}. Compare it with any prediction they marked or said, and ask them to explain the difference or why it happened.`
+            : `The student just said: "${body.speech ?? ""}"`,
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -239,6 +242,7 @@ export async function POST(req: Request) {
     turn.skill.concept = turn.skill.concept.slice(0, 60);
     turn.draw = turn.move === "wait" ? [] : turn.draw.slice(0, 2);
     turn.write = turn.move === "wait" ? [] : turn.write.map((w) => w.trim().slice(0, 48)).filter(Boolean).slice(0, 4);
+    turn.simulate = turn.move === "wait" || !turn.simulate ? null : sanitizeSim(turn.simulate);
     const record: PastTurn = {
       trigger: body.trigger,
       speech: body.speech,
@@ -284,6 +288,7 @@ export async function POST(req: Request) {
       say: turn.say,
       write: turn.write,
       draw: turn.draw,
+      simulate: turn.simulate,
       annotations: turn.annotations,
       skill: turn.skill,
       card: turn.card,
@@ -315,12 +320,12 @@ export async function POST(req: Request) {
 }
 
 function fallbackTurn(say: string): PublicTurn {
-  return { move: "ask_plan", say, write: [], draw: [], annotations: [], skill: { concept: "", evidence: "none" }, card: null, review_result: null };
+  return { move: "ask_plan", say, write: [], draw: [], simulate: null, annotations: [], skill: { concept: "", evidence: "none" }, card: null, review_result: null };
 }
 
 function describeInk(turn: TutorTurn): string {
   const wrote = turn.write.length ? `wrote below the work: ${turn.write.map((w) => `"${w}"`).join(", ")}` : "";
-  const drew = turn.draw.map(describeFigure).join(", ");
+  const drew = [...turn.draw.map(describeFigure), ...(turn.simulate ? [`set up a ${describeSim(turn.simulate)}`] : [])].join(", ");
   if (!turn.annotations.length) return [wrote, drew].filter(Boolean).join(", ") || "none";
   return [wrote, drew, ...turn.annotations
     .map((a) => {

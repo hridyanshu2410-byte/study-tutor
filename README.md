@@ -19,8 +19,11 @@ To use it on an iPad, run `npm run dev -- -H 0.0.0.0` and open your computer's l
 ## Using it
 
 - **Write** anywhere. With a pen in use, fingers only pan and pinch-zoom (palm rejection). With a mouse, drag to write, hold Space or right-drag to pan, Ctrl/Cmd + scroll to zoom.
-- **Pause** for about three seconds and the tutor looks at your work. Most of the time it stays quiet, because you are on track.
-- **I'm stuck** asks for help now. **Talk** lets you ask out loud.
+- **Just talk and write.** The mic turns on with your first touch of the page (Mic off turns it off). The tutor glances at your work a moment after your pen lifts, and mostly stays quiet while you're on track. It answers when you finish a sentence, and writes the math it says, or sketches a graph, number line, triangle, table, flow or force diagram, as it talks. Tap the dot beside its words to interrupt.
+- **Double-tap** part of your work to point at it ("what about this?"). **Scribble** over a stroke to erase it.
+- **I'm stuck** asks for help now. **Finish** wraps up with a recap, your stats, and Save notes.
+- **Add photo** puts a photo, screenshot or PDF of a worksheet under your ink, so you can write on it and the tutor reads it too.
+- **Simulations**: for projectile and pendulum questions the tutor can set one up on the page. Mark your prediction, tap play, and it runs at real speed with the real physics; then the tutor asks you to explain what you saw.
 - **Keep** (`k`): draw a loop around some of your writing to save it as a review card. You type the question it should ask you later; the circled ink is the answer side.
 - **Review** shows how many cards are due and a mastery map of the concepts the tutor has seen you work on. Start review clears to a fresh page and asks each card by hand, from memory. The tutor helps less than usual, grades the attempt and suggests Again, Hard, Good or Easy; you can change it, or use Show answer to grade yourself.
 - When the tutor helps you fix a real misconception, it saves a card for it on its own: a fresh problem of the same kind, plus a one-line takeaway shown after you answer.
@@ -36,7 +39,12 @@ To use it on an iPad, run `npm run dev -- -H 0.0.0.0` and open your computer's l
 | Tutor pen: circles, underlines, strikes, arrows, handwritten notes | `lib/handwriting.ts` |
 | Tutor handwriting (single-stroke EMS Felix, OFL) | `lib/tutor-hand/` |
 | Tutor prompt, hint ladder, response schema | `lib/tutor.ts` |
-| Tutor API route (Claude, structured output) | `app/api/tutor/route.ts` |
+| Figures the tutor sketches, and the safe formula reader for graphs | `lib/figure-schema.ts`, `lib/figures.ts`, `lib/expr.ts` |
+| Math checker that catches slips in the tutor's and student's steps | `lib/check.ts` |
+| Projectile and pendulum simulations | `lib/sims.ts` |
+| Photo and PDF pages under the ink | `lib/photo.ts` |
+| Study arms, quizzes and their items | `lib/study.ts`, `lib/study-tests.ts`, `app/quiz/` |
+| Tutor API route (Claude or OpenAI, structured output) | `app/api/tutor/route.ts` |
 | Browser voice in and out | `lib/voice.ts` |
 | Review cards, FSRS scheduling, mastery map | `lib/review.ts` |
 | Where cards and mastery are saved (this device for now) | `lib/memory-store.ts` |

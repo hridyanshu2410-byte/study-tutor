@@ -37,6 +37,7 @@ import AccountMenu from "./AccountMenu";
 import SessionSurvey from "./SessionSurvey";
 import { flushCloud, loadCloud, logEvent, saveCloud, type Account } from "@/lib/cloud";
 import { picturesFrom, type PageImage } from "@/lib/photo";
+import { drawSim, playButton, runSeconds, SIM_H, SIM_W, simResult, type PageSim } from "@/lib/sims";
 
 type Tool = "pen" | "eraser" | "hand" | "keep";
 type Mode = "study" | "review";
@@ -50,7 +51,7 @@ type TutorState = "idle" | "thinking" | "speaking";
 // performance.now() time; 0 means already fully written (e.g. restored), and
 // Infinity means waiting to start with the voice.
 type TutorInk = { id: string; plan: PenPlan; born: number };
-type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string; images?: PageImage[] };
+type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string; images?: PageImage[]; sims?: PageSim[] };
 
 // What happened this session, for the wrap-up summary.
 type SessionStats = { startedAt: number; turns: number; concepts: Record<string, { slips: number; solved: number }>; cards: string[] };
@@ -75,6 +76,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   // Photos and PDF pages under the ink, and their decoded pictures.
   const images = useRef<PageImage[]>([]);
   const imageEls = useRef(new Map<string, HTMLImageElement>());
+  // Simulations on the page, and when each one started playing.
+  const sims = useRef<PageSim[]>([]);
+  const simRuns = useRef(new Map<string, number>());
+  const tutorFont = useRef("cursive");
   const camera = useRef<Camera>({ x: -40, y: -40, z: 1 });
   const glide = useRef<{ from: Camera; to: Camera; start: number } | null>(null);
   const drawing = useRef<{ stroke: Stroke; pointerId: number; simulate: boolean } | null>(null);
@@ -149,6 +154,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       },
     });
     document.fonts?.ready.then(() => (dirty.current = true));
+    tutorFont.current = `${getComputedStyle(document.documentElement).getPropertyValue("--font-tutor").trim() || "cursive"}, cursive`;
     restorePage();
     // In research mode the account copy of the page wins, unless the tester
     // has already started writing before it arrived.
@@ -175,6 +181,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     strokes.current = saved?.strokes ?? [];
     tutorInk.current = (saved?.tutorInk ?? []).map((t) => ({ ...t, born: 0 }));
     setImages(saved?.images ?? []);
+    sims.current = saved?.sims ?? [];
+    simRuns.current.clear();
     paths.current.clear();
     tutorPaths.current.clear();
     setProblem(saved?.problem ?? "");
@@ -205,7 +213,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   const save = useCallback(() => {
     if (stateRef.current.mode === "review") return;
-    const page: SavedPage = { strokes: strokes.current, tutorInk: tutorInk.current, problem: stateRef.current.problem, images: images.current };
+    const page: SavedPage = { strokes: strokes.current, tutorInk: tutorInk.current, problem: stateRef.current.problem, images: images.current, sims: sims.current };
     if (account) saveCloud(account.userId, "page", page);
     try {
       localStorage.setItem(pageKey, JSON.stringify(page));
@@ -279,7 +287,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         if (f === 1) glide.current = null;
         dirty.current = true;
       }
-      const animating = tutorInk.current.some((t) => t.born > 0 && now - t.born < t.plan.duration + 50);
+      const animating = simRuns.current.size > 0 || tutorInk.current.some((t) => t.born > 0 && now - t.born < t.plan.duration + 50);
       if (!dirty.current && !animating) return;
       dirty.current = false;
 
@@ -297,6 +305,15 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
       ctx.setTransform(dpr * cam.z, 0, 0, dpr * cam.z, -cam.x * cam.z * dpr, -cam.y * cam.z * dpr);
       for (const img of images.current) drawPicture(ctx, img, pictureFor(img), cam.z);
+      for (const sim of sims.current) {
+        const start = simRuns.current.get(sim.id);
+        const t = start == null ? null : (now - start) / 1000;
+        drawSim(ctx, sim, t, tutorFont.current, cam.z);
+        if (t != null && t >= runSeconds(sim.spec)) {
+          simRuns.current.delete(sim.id);
+          setTimeout(() => finishSim(sim), 0);
+        }
+      }
       for (const s of strokes.current) {
         ctx.fillStyle = s.color;
         ctx.fill(pathFor(s, drawing.current?.stroke.id === s.id ? drawing.current.simulate : false));
@@ -334,7 +351,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   // ---------- tutor ----------
   const askTutor = useCallback(
-    async (trigger: TutorRequest["trigger"], speech: string | null = null) => {
+    async (trigger: TutorRequest["trigger"], speech: string | null = null, watched: string | null = null) => {
       const busy = inFlight.current;
       if (busy) {
         // A glance at the page waits its turn; the student's own words never do.
@@ -345,7 +362,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       }
       if (pauseTimer.current) clearTimeout(pauseTimer.current);
       const lines = groupLines(strokes.current);
-      if (!lines.length && !speech && !stateRef.current.problem.trim() && !images.current.length) return;
+      if (!lines.length && !speech && !watched && !stateRef.current.problem.trim() && !images.current.length) return;
       if (trigger !== "pause") stopSpeaking();
 
       const abort = new AbortController();
@@ -374,6 +391,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
             problem: stateRef.current.problem,
             trigger,
             speech,
+            watched,
             idleSeconds: lastPenAt.current ? (Date.now() - lastPenAt.current) / 1000 : undefined,
             focus: trigger === "pause" ? null : focusOn(lines),
             hasPhoto: images.current.length > 0,
@@ -440,7 +458,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     }
     const write = turn.write ?? [];
     const figures = turn.draw ?? [];
-    if (turn.move === "wait" || (!turn.say && !turn.annotations.length && !write.length && !figures.length)) {
+    if (turn.move === "wait" || (!turn.say && !turn.annotations.length && !write.length && !figures.length && !turn.simulate)) {
       settle();
       return;
     }
@@ -457,9 +475,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       if (plan.strokes.length) {
         ink = { id: crypto.randomUUID(), plan, born: Infinity };
         tutorInk.current.push(ink);
-        revealIfOffscreen(plan);
+        if (plan.box) reveal(plan.box);
       }
     }
+    if (turn.simulate) placeSim(turn.simulate, lines);
     const startPen = () => {
       if (ink && ink.born === Infinity) ink.born = performance.now();
       dirty.current = true;
@@ -537,6 +556,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     strokes.current = [];
     tutorInk.current = [];
     setImages([]);
+    sims.current = [];
+    simRuns.current.clear();
     paths.current.clear();
     tutorPaths.current.clear();
     undoStack.current = [];
@@ -660,14 +681,43 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     flash("Kept as a review card. It comes back tomorrow-ish, then less often.");
   };
 
+  // A simulation goes below everything on the page, at the left of the view.
+  const placeSim = (spec: PageSim["spec"], lines: InkLine[]) => {
+    const cam = camera.current;
+    const boxes: Box[] = [
+      ...lines.map((l) => l.box),
+      ...tutorInk.current.map((t) => t.plan.box).filter((b): b is Box => b != null),
+      ...sims.current,
+    ];
+    const below = boxes.length ? Math.max(...boxes.map((b) => b.y + b.h)) + 36 : cam.y + 90 / cam.z;
+    const sim: PageSim = { id: crypto.randomUUID(), spec, x: cam.x + 40 / cam.z, y: below, w: SIM_W, h: SIM_H, ran: false };
+    sims.current.push(sim);
+    reveal(sim);
+  };
+
+  // A run finished: keep its results on the page and let the tutor see what happened.
+  const finishSim = (sim: PageSim) => {
+    sim.ran = true;
+    dirty.current = true;
+    save();
+    logEvent(account, "sim_watched", { kind: sim.spec.kind, spec: sim.spec }, sessionId.current);
+    askTutor("watched", null, simResult(sim.spec));
+  };
+
+  // A tap on a simulation's play button, in page coordinates.
+  const simPlayAt = (wx: number, wy: number) =>
+    sims.current.find((sim) => {
+      const b = playButton(sim);
+      return wx >= b.x - 6 && wx <= b.x + b.w + 6 && wy >= b.y - 6 && wy <= b.y + b.h + 6;
+    });
+
   // If the tutor writes somewhere off screen, glide the page so it is visible.
-  const revealIfOffscreen = (plan: PenPlan) => {
+  const reveal = (b: Box) => {
     const canvas = canvasRef.current;
-    if (!plan.box || !canvas) return;
+    if (!canvas) return;
     const cam = camera.current;
     const w = canvas.clientWidth / cam.z;
     const h = (canvas.clientHeight - 160) / cam.z;
-    const b = plan.box;
     const dx = b.x + b.w > cam.x + w - 40 ? b.x + b.w - (cam.x + w - 40) : b.x < cam.x + 20 ? b.x - (cam.x + 20) : 0;
     const dy = b.y + b.h > cam.y + h ? b.y + b.h - (cam.y + h) : b.y < cam.y + 80 / cam.z ? b.y - (cam.y + 80 / cam.z) : 0;
     if (dx || dy) {
@@ -704,6 +754,11 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     tutorInk.current = tutorInk.current.filter(
       (t) => !t.plan.strokes.some((st) => st.points.some(([x, y]) => Math.abs(x - wx) < reach && Math.abs(y - wy) < reach)),
     );
+    // Rubbing out a simulation's dashed frame takes it off the page.
+    const onEdge = (b: Box) =>
+      wx > b.x - reach && wx < b.x + b.w + reach && wy > b.y - reach && wy < b.y + b.h + reach &&
+      (Math.abs(wx - b.x) < reach || Math.abs(wx - b.x - b.w) < reach || Math.abs(wy - b.y) < reach || Math.abs(wy - b.y - b.h) < reach);
+    sims.current = sims.current.filter((sim) => !onEdge(sim));
     if (strokes.current.length !== before) changedSinceTutor.current = true;
     dirty.current = true;
   };
@@ -740,6 +795,16 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       e.button === 2 ||
       (e.pointerType === "touch" && penSeen.current); // palm rejection once a pen is in use
     if (pans) return;
+
+    {
+      const [wx, wy] = screenToWorld(camera.current, sx, sy);
+      const sim = simPlayAt(wx, wy);
+      if (sim && !simRuns.current.has(sim.id)) {
+        simRuns.current.set(sim.id, performance.now());
+        dirty.current = true;
+        return;
+      }
+    }
 
     if (tool === "keep") {
       lasso.current = [screenToWorld(camera.current, sx, sy)];
@@ -960,7 +1025,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   }, [undo]);
 
   const clearPage = () => {
-    if (!strokes.current.length && !tutorInk.current.length && !images.current.length) return;
+    if (!strokes.current.length && !tutorInk.current.length && !images.current.length && !sims.current.length) return;
     if (!confirm("Clear the whole page?")) return;
     hush();
     undoStack.current.push([...strokes.current]);
@@ -970,6 +1035,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     paths.current.clear();
     tutorPaths.current.clear();
     sessionId.current = crypto.randomUUID();
+    sims.current = [];
+    simRuns.current.clear();
     stats.current = newStats();
     dirty.current = true;
     save();
@@ -1014,6 +1081,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     strokes.current = [];
     tutorInk.current = [];
     setImages([]);
+    sims.current = [];
+    simRuns.current.clear();
     paths.current.clear();
     tutorPaths.current.clear();
     undoStack.current = [];
