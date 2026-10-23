@@ -176,9 +176,12 @@ function arrow(pen: Pen, from: [number, number], to: [number, number], rng: Rng)
 export function measureText(text: string, size: number): number {
   const scale = size / font.capHeight;
   let w = 0;
-  for (const ch of text) w += (font.glyphs[ch] ?? font.glyphs["?"]).w * scale * 0.96;
+  for (const ch of text) w += (font.glyphs[ch] ?? font.glyphs["?"]).w * scale * 0.96 * (ch === " " ? SPACE : 1);
   return w;
 }
+
+// The font's word space is wide for math; people write "5x + 5" tighter than prose.
+const SPACE = 0.55;
 
 // Writes glyph by glyph with a drifting baseline, small changes in size and
 // slant, and pauses where the pen lifts.
@@ -203,13 +206,22 @@ function write(pen: Pen, text: string, x: number, baseline: number, size: number
       pen.lift(35 + rng() * 30);
     }
     if (ch === " ") pen.lift(90);
-    cursor += g.w * scale * (0.96 + jitter(rng, 0.03));
+    cursor += g.w * scale * (0.96 + jitter(rng, 0.03)) * (ch === " " ? SPACE : 1);
   }
   pen.lift(60);
 }
 
 // ---------- a whole turn ----------
-export function planAnnotations(annotations: Annotation[], lines: InkLine[], seed: number): PenPlan {
+export type PlanOptions = {
+  // Lines of math the tutor writes in its own space, below everything on the page.
+  write?: string[];
+  // Earlier tutor ink to keep clear of.
+  avoid?: Box[];
+  // Where to write on an empty page (top left of the visible area).
+  origin?: { x: number; y: number };
+};
+
+export function planAnnotations(annotations: Annotation[], lines: InkLine[], seed: number, opts: PlanOptions = {}): PenPlan {
   const rng = seeded(seed);
   const lineH = lines.length ? lines.reduce((s, l) => s + l.box.h, 0) / lines.length : 40;
   const size = Math.max(20, Math.min(40, lineH * 0.62));
@@ -249,6 +261,21 @@ export function planAnnotations(annotations: Annotation[], lines: InkLine[], see
     else if (a.kind === "check") check(pen, box, rng);
     else if (a.kind === "question") write(pen, "?", box.x + box.w + 16, box.y + box.h * 0.85, Math.max(size, box.h * 0.8), rng);
     lastTarget = { box, line, ellipse };
+  }
+
+  const work = (opts.write ?? []).map((w) => w.trim()).filter(Boolean);
+  if (work.length) {
+    const workSize = size * 0.95;
+    const below = [...occupied, ...(opts.avoid ?? [])];
+    const left = lines.length ? Math.min(...lines.map((l) => l.box.x)) : (opts.origin?.x ?? 0) + 60;
+    const bottom = below.length ? Math.max(...below.map((b) => b.y + b.h)) : (opts.origin?.y ?? 0) + 80;
+    let baseline = bottom + workSize * 1.9;
+    pen.lift(pen.t ? 300 : 0);
+    for (const text of work) {
+      write(pen, text, left + jitter(rng, 6), baseline, workSize, rng);
+      pen.lift(180);
+      baseline += workSize * 1.65;
+    }
   }
 
   return { strokes: pen.strokes, duration: pen.t, box: pen.box };

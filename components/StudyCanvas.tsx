@@ -15,7 +15,8 @@ import {
 } from "@/lib/ink";
 import type { PublicTurn, TutorRequest } from "@/lib/tutor";
 import { planAnnotations, strokeAt, type PenPlan } from "@/lib/handwriting";
-import { listen, speak, speechInputSupported, stopSpeaking } from "@/lib/voice";
+import type { Box } from "@/lib/ink";
+import { Conversation, speak, speechInputSupported, stopSpeaking } from "@/lib/voice";
 import { useStudyMemory } from "@/lib/memory-store";
 import type { AnkiNote } from "@/lib/anki";
 import {
@@ -41,16 +42,18 @@ type KeepDraft = { image: string; prompt: string; concept: string };
 type ReviewRun = { ids: string[]; index: number; suggested: Grade | null; revealed: boolean; done: number };
 
 const GRADES: Grade[] = [1, 2, 3, 4] as Grade[];
-type TutorState = "idle" | "thinking" | "speaking" | "listening";
+type TutorState = "idle" | "thinking" | "speaking";
 
 // One turn's worth of tutor pen strokes. `born` is when the pen started, in
-// performance.now() time; 0 means already fully written (e.g. restored).
+// performance.now() time; 0 means already fully written (e.g. restored), and
+// Infinity means waiting to start with the voice.
 type TutorInk = { id: string; plan: PenPlan; born: number };
 type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string };
 
 const STUDENT_INK = "#1f2a44";
 const TUTOR_INK = "#c2410c";
-const PAUSE_MS = 3200;
+// The tutor glances at the page this long after the pen lifts.
+const WATCH_MS = 1500;
 const STORAGE_KEY = "study-tutor:page:v2";
 
 export default function StudyCanvas({ account }: { account: Account | null }) {
@@ -71,7 +74,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const pauseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const changedSinceTutor = useRef(false);
   const undoStack = useRef<Stroke[][]>([]);
-  const stopListening = useRef<(() => void) | null>(null);
+  const ear = useRef<Conversation | null>(null);
+  const hearing = useRef(false);
+  const inFlight = useRef<{ trigger: TutorRequest["trigger"]; speech: string | null; abort: AbortController } | null>(null);
+  const lastPenAt = useRef(0);
   const sessionId = useRef("");
   const lasso = useRef<[number, number][] | null>(null);
 
@@ -81,6 +87,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const [caption, setCaption] = useState("Write your problem anywhere on the page. I'll be right here.");
   const [muted, setMuted] = useState(false);
   const [canListen, setCanListen] = useState(false);
+  // The mic turns on with the first touch of the page, unless the student turned it off.
+  const [micOn, setMicOn] = useState(false);
+  const micDeclined = useRef(false);
+  const [heard, setHeard] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [mode, setMode] = useState<Mode>("study");
   const [panelOpen, setPanelOpen] = useState(false);
@@ -106,6 +116,18 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   useEffect(() => {
     sessionId.current = crypto.randomUUID();
     setCanListen(speechInputSupported());
+    ear.current = new Conversation({
+      onUtterance: (text) => askTutor("spoke", text),
+      onHearing: (h) => {
+        hearing.current = h;
+        setHeard(h);
+      },
+      onBlocked: (reason) => {
+        micDeclined.current = true;
+        setMicOn(false);
+        setError(reason);
+      },
+    });
     document.fonts?.ready.then(() => (dirty.current = true));
     restorePage();
     // In research mode the account copy of the page wins, unless the tester
@@ -257,11 +279,22 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   // ---------- tutor ----------
   const askTutor = useCallback(
     async (trigger: TutorRequest["trigger"], speech: string | null = null) => {
-      if (stateRef.current.tutorState === "thinking") return;
+      const busy = inFlight.current;
+      if (busy) {
+        // A glance at the page waits its turn; the student's own words never do.
+        if (trigger === "pause") return;
+        busy.abort.abort();
+        // If they spoke twice before the tutor answered, it hears both.
+        if (busy.speech && trigger === "spoke") speech = `${busy.speech} ${speech ?? ""}`.trim();
+      }
       if (pauseTimer.current) clearTimeout(pauseTimer.current);
       const lines = groupLines(strokes.current);
       if (!lines.length && !speech && !stateRef.current.problem.trim()) return;
+      if (trigger !== "pause") stopSpeaking();
 
+      const abort = new AbortController();
+      const mine = { trigger, speech, abort };
+      inFlight.current = mine;
       changedSinceTutor.current = false;
       setTutorState("thinking");
       setError(null);
@@ -269,6 +302,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         const res = await fetch("/api/tutor", {
           method: "POST",
           headers: { "content-type": "application/json" },
+          signal: abort.signal,
           body: JSON.stringify({
             sessionId: sessionId.current,
             mode: stateRef.current.mode,
@@ -284,16 +318,26 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
             problem: stateRef.current.problem,
             trigger,
             speech,
+            idleSeconds: lastPenAt.current ? (Date.now() - lastPenAt.current) / 1000 : undefined,
             lines: lines.map((l) => ({ id: l.id, tokens: l.tokens.length })),
             ...renderPageImages(strokes.current, lines),
           } satisfies TutorRequest),
         });
         const data = await res.json();
+        if (inFlight.current !== mine) return;
+        inFlight.current = null;
         if (!res.ok && !data.say) throw new Error(data.error ?? `Tutor error ${res.status}`);
+        // Don't talk over a student who started speaking while we looked.
+        if (trigger === "pause" && hearing.current) {
+          setTutorState("idle");
+          return;
+        }
         respond(data as PublicTurn, lines);
       } catch (e) {
+        if (abort.signal.aborted) return; // replaced by a newer turn
+        if (inFlight.current === mine) inFlight.current = null;
         setError(e instanceof Error ? e.message : "The tutor could not be reached.");
-        setTutorState("idle");
+        settle();
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -302,30 +346,60 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   const respond = (turn: PublicTurn, lines: InkLine[]) => {
     remember(turn);
-    if (turn.move === "wait" || (!turn.say && !turn.annotations.length)) {
-      setTutorState("idle");
+    const write = turn.write ?? [];
+    if (turn.move === "wait" || (!turn.say && !turn.annotations.length && !write.length)) {
+      settle();
       return;
     }
-    if (turn.annotations.length) {
-      const plan = planAnnotations(turn.annotations, lines, Math.floor(Math.random() * 2 ** 31));
+    // The pen starts when the voice does, so the math appears as it is said.
+    let ink: TutorInk | null = null;
+    if (turn.annotations.length || write.length) {
+      const cam = camera.current;
+      const plan = planAnnotations(turn.annotations, lines, Math.floor(Math.random() * 2 ** 31), {
+        write,
+        avoid: tutorInk.current.map((t) => t.plan.box).filter((b): b is Box => b != null),
+        origin: { x: cam.x, y: cam.y + 60 / cam.z },
+      });
       if (plan.strokes.length) {
-        tutorInk.current.push({ id: crypto.randomUUID(), plan, born: performance.now() + 250 });
+        ink = { id: crypto.randomUUID(), plan, born: Infinity };
+        tutorInk.current.push(ink);
         revealIfOffscreen(plan);
       }
     }
+    const startPen = () => {
+      if (ink && ink.born === Infinity) ink.born = performance.now();
+      dirty.current = true;
+    };
     dirty.current = true;
     save();
-    if (turn.say) {
-      setCaption(turn.say);
-      if (stateRef.current.muted) {
-        setTutorState("idle");
-      } else {
-        setTutorState("speaking");
-        speak(turn.say, () => setTutorState("idle"));
-      }
-    } else {
-      setTutorState("idle");
+    if (turn.say) setCaption(turn.say);
+    if (!turn.say || stateRef.current.muted) {
+      startPen();
+      settle();
+      return;
     }
+    setTutorState("speaking");
+    ear.current?.pause();
+    setTimeout(startPen, 2500); // if the voice is slow to start, write anyway
+    speak(turn.say, settle, startPen);
+  };
+
+  // Stop talking now (a new page, a new card) and go back to listening.
+  const hush = () => {
+    stopSpeaking();
+    inFlight.current?.abort.abort();
+    inFlight.current = null;
+    setTutorState("idle");
+    stateRef.current.tutorState = "idle";
+    ear.current?.resume();
+  };
+
+  // Back to listening and watching after a turn.
+  const settle = () => {
+    setTutorState("idle");
+    stateRef.current.tutorState = "idle";
+    ear.current?.resume();
+    if (changedSinceTutor.current) schedulePause();
   };
 
   // What a turn teaches us about the student: mastery evidence, a new review
@@ -377,7 +451,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       .map((c) => c.id);
     if (!ids.length) return;
     save();
-    stopSpeaking();
+    hush();
     setPanelOpen(false);
     stateRef.current.mode = "review";
     setMode("review");
@@ -411,7 +485,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       },
       sessionId.current,
     );
-    stopSpeaking();
+    hush();
     const index = run.index + 1;
     const done = run.done + (grade != null ? 1 : 0);
     if (index >= run.ids.length) {
@@ -499,11 +573,16 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     }
   };
 
+  // Look at the page shortly after the pen lifts, whether or not the mic is on.
+  // While the tutor is talking or the student is mid-sentence it holds off;
+  // the next turn sees the page anyway.
   const schedulePause = () => {
     if (pauseTimer.current) clearTimeout(pauseTimer.current);
     pauseTimer.current = setTimeout(() => {
-      if (changedSinceTutor.current && !drawing.current && stateRef.current.tutorState === "idle") askTutor("pause");
-    }, PAUSE_MS);
+      if (!changedSinceTutor.current || drawing.current) return;
+      if (stateRef.current.tutorState === "speaking" || hearing.current) return schedulePause();
+      askTutor("pause");
+    }, WATCH_MS);
   };
 
   // ---------- input ----------
@@ -530,9 +609,13 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     const [sx, sy] = local(e);
     pointers.current.set(e.pointerId, { x: sx, y: sy, type: e.pointerType });
     if (e.pointerType === "pen") penSeen.current = true;
-    stopSpeaking();
     glide.current = null;
-    if (stateRef.current.tutorState === "speaking") setTutorState("idle");
+    // The first touch of the page starts the conversation.
+    if (!ear.current?.active && !micDeclined.current && speechInputSupported()) {
+      ear.current?.start();
+      setMicOn(true);
+      if (stateRef.current.tutorState === "speaking") ear.current?.pause();
+    }
 
     const touches = [...pointers.current.values()].filter((p) => p.type === "touch");
     if (touches.length >= 2) {
@@ -650,6 +733,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       drawing.current = null;
       paths.current.delete(d.stroke.id); // rebuild with the finished tail
       changedSinceTutor.current = true;
+      lastPenAt.current = Date.now();
       dirty.current = true;
       save();
       schedulePause();
@@ -709,6 +793,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const clearPage = () => {
     if (!strokes.current.length && !tutorInk.current.length) return;
     if (!confirm("Clear the whole page?")) return;
+    hush();
     undoStack.current.push([...strokes.current]);
     strokes.current = [];
     tutorInk.current = [];
@@ -719,21 +804,40 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     save();
   };
 
-  const toggleListening = () => {
-    if (stopListening.current) {
-      stopListening.current();
+  const toggleMic = () => {
+    if (ear.current?.active) {
+      ear.current.stop();
+      micDeclined.current = true;
+      setMicOn(false);
       return;
     }
-    stopSpeaking();
-    setTutorState("listening");
-    stopListening.current = listen(
-      (text) => askTutor("spoke", text),
-      () => {
-        stopListening.current = null;
-        setTutorState((s) => (s === "listening" ? "idle" : s));
-      },
-    );
+    micDeclined.current = false;
+    setError(null);
+    ear.current?.start();
+    setMicOn(true);
+    if (stateRef.current.tutorState === "speaking") ear.current?.pause();
   };
+
+  // Tapping the tutor while it talks cuts it short, like raising a hand.
+  const interrupt = () => {
+    if (stateRef.current.tutorState !== "speaking") return;
+    stopSpeaking();
+    tutorInk.current.forEach((t) => t.born === Infinity && (t.born = performance.now()));
+    settle();
+  };
+
+  const status =
+    tutorState === "speaking"
+      ? "Tap to interrupt"
+      : tutorState === "thinking"
+        ? inFlight.current?.trigger === "pause"
+          ? "Looking"
+          : "Thinking"
+        : heard
+          ? "Hearing you"
+          : micOn
+            ? "Listening"
+            : "";
 
   return (
     <div className="shell">
@@ -860,10 +964,18 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       />
 
       <footer className={mode === "review" ? "tutor reviewing" : "tutor"}>
-        <div className={`presence ${tutorState}`} aria-hidden />
-        <p className="caption" aria-live="polite">
-          {error ?? (tutorState === "thinking" ? "Looking at your work…" : tutorState === "listening" ? "Listening…" : caption)}
-        </p>
+        <button
+          className={`presence ${tutorState}${heard ? " hearing" : micOn ? " listening" : ""}`}
+          onClick={interrupt}
+          aria-label={tutorState === "speaking" ? "Stop talking" : "Tutor"}
+          title={status}
+        />
+        <div className="caption-wrap">
+          <p className="caption" aria-live="polite">
+            {error ?? caption}
+          </p>
+          {status && <span className="status">{status}</span>}
+        </div>
         {mode === "review" && run && (
           <div className="grades" role="group" aria-label="How well did you remember?">
             {run.revealed ? (
@@ -888,8 +1000,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         )}
         <div className="actions">
           {canListen && (
-            <button className={tutorState === "listening" ? "talk on" : "talk"} onClick={toggleListening}>
-              {tutorState === "listening" ? "Done talking" : "Talk"}
+            <button className={micOn ? "talk on" : "talk"} onClick={toggleMic} aria-pressed={micOn}>
+              {micOn ? "Mic on" : "Mic off"}
             </button>
           )}
           <button onClick={() => askTutor("asked")} disabled={tutorState === "thinking"}>
@@ -898,7 +1010,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           <button
             onClick={() => {
               setMuted((m) => !m);
-              stopSpeaking();
+              hush();
             }}
             aria-pressed={muted}
           >

@@ -30,6 +30,6 @@ test("daily limit and day boundary", () => {
   process.env.DAILY_TUTOR_LIMIT = "50";
   assert.equal(dailyTutorLimit(), 50);
   process.env.DAILY_TUTOR_LIMIT = "abc";
-  assert.equal(dailyTutorLimit(), 300);
+  assert.equal(dailyTutorLimit(), 800);
   assert.equal(startOfUtcDay(new Date("2026-10-22T23:59:00-07:00")), "2026-10-23T00:00:00.000Z");
 });

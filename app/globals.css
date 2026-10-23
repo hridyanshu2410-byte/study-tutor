@@ -115,20 +115,27 @@ button:disabled { opacity: 0.5; cursor: default; }
   flex: none;
   width: 14px;
   height: 14px;
+  padding: 0;
+  border: 0;
   border-radius: 50%;
   background: var(--tutor);
   opacity: 0.35;
-  transition: opacity 0.2s;
+  transition: opacity 0.2s, box-shadow 0.2s;
+  cursor: default;
 }
+.presence:hover { background: var(--tutor); }
+.presence.speaking { cursor: pointer; }
+.presence.listening:not(.speaking):not(.thinking) { box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.25); opacity: 0.6; }
 .presence.thinking { animation: breathe 1.2s ease-in-out infinite; opacity: 0.8; }
 .presence.speaking { animation: speak 0.5s ease-in-out infinite alternate; opacity: 1; }
-.presence.listening { background: #2563eb; opacity: 1; animation: breathe 0.9s ease-in-out infinite; }
+.presence.hearing:not(.speaking) { background: #2563eb; opacity: 1; animation: breathe 0.9s ease-in-out infinite; }
 
 @keyframes breathe { 50% { transform: scale(0.7); opacity: 0.4; } }
 @keyframes speak { to { transform: scale(1.35); } }
 
+.caption-wrap { flex: 1; min-width: 0; }
+.status { display: block; margin-top: 2px; font-size: 12px; color: #6b7280; letter-spacing: 0.02em; }
 .caption {
-  flex: 1;
   margin: 0;
   font-family: var(--font-tutor), cursive;
   font-size: 24px;
@@ -143,7 +150,8 @@ button:disabled { opacity: 0.5; cursor: default; }
   .bar { flex-wrap: wrap; }
   .problem { order: 3; flex-basis: 100%; max-width: none; }
   .tutor { flex-wrap: wrap; }
-  .caption { flex-basis: calc(100% - 30px); font-size: 21px; }
+  .caption-wrap { flex-basis: calc(100% - 30px); }
+  .caption { font-size: 21px; }
   .actions { margin-left: auto; }
 }
 

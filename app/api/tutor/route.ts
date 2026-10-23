@@ -5,7 +5,7 @@ import { zodResponseFormat } from "openai/helpers/zod";
 import { adminClient, createClient } from "@/lib/supabase/server";
 import { researchMode } from "@/lib/supabase/env";
 import { dailyTutorLimit, startOfUtcDay } from "@/lib/study";
-import { LADDER, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, TutorTurnSchema, type PublicTurn, type TutorRequest, type TutorTurn } from "@/lib/tutor";
+import { allowedMoves, LADDER, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, tutorTurnSchema, type PublicTurn, type TutorRequest, type TutorTurn } from "@/lib/tutor";
 
 // The tutor runs on Claude when ANTHROPIC_API_KEY is set, otherwise on OpenAI
 // (OPENAI_TUTOR_MODEL, default GPT-6 Luna). TUTOR_PROVIDER forces one.
@@ -19,7 +19,7 @@ const openaiModel = process.env.OPENAI_TUTOR_MODEL || "gpt-6-luna";
 const client = provider === "anthropic" ? new Anthropic() : null;
 const openai = provider === "openai" && process.env.OPENAI_API_KEY ? new OpenAI() : null;
 
-type Ask = { system: string; page: string; tokens: string; reference?: string; situation: string };
+type Ask = { schema: ReturnType<typeof tutorTurnSchema>; system: string; page: string; tokens: string; reference?: string; situation: string };
 type Answer = { turn: TutorTurn | null; usage: { input: number; output: number } };
 
 async function askTutor(a: Ask): Promise<Answer> {
@@ -27,7 +27,7 @@ async function askTutor(a: Ask): Promise<Answer> {
     const png = (data: string) => ({ type: "image_url" as const, image_url: { url: `data:image/png;base64,${data}` } });
     const res = await openai!.chat.completions.parse({
       model: openaiModel,
-      response_format: zodResponseFormat(TutorTurnSchema, "tutor_turn"),
+      response_format: zodResponseFormat(a.schema, "tutor_turn"),
       messages: [
         { role: "system", content: a.system },
         {
@@ -52,7 +52,7 @@ async function askTutor(a: Ask): Promise<Answer> {
   const response = await client!.messages.parse({
     model: "claude-opus-5-5",
     max_tokens: 16000,
-    output_config: { effort: "medium", format: zodOutputFormat(TutorTurnSchema) },
+    output_config: { effort: "medium", format: zodOutputFormat(a.schema) },
     system: a.system,
     messages: [
       {
@@ -164,6 +164,7 @@ export async function POST(req: Request) {
     `Lines on the page: ${body.lines.map((l) => `${l.id} (${l.tokens} tokens)`).join(", ") || "none yet"}`,
     history ? `Earlier turns this session:\n${history}` : "This is the first turn of the session.",
     `Last hint-ladder rung used: ${lastRung}`,
+    body.idleSeconds != null ? `The student last wrote ${Math.round(body.idleSeconds)} seconds ago.` : "",
     body.trigger === "pause"
       ? "The student has paused writing."
       : body.trigger === "asked"
@@ -176,6 +177,7 @@ export async function POST(req: Request) {
   const started = Date.now();
   try {
     const { turn, usage } = await askTutor({
+      schema: tutorTurnSchema(allowedMoves(lastRung)),
       system: reviewing ? `${TUTOR_SYSTEM_PROMPT}\n\n${REVIEW_PROMPT}` : TUTOR_SYSTEM_PROMPT,
       page,
       tokens,
@@ -192,6 +194,7 @@ export async function POST(req: Request) {
     if (reviewing) turn.card = null;
     else turn.review_result = null;
     turn.skill.concept = turn.skill.concept.slice(0, 60);
+    turn.write = turn.move === "wait" ? [] : turn.write.map((w) => w.trim().slice(0, 48)).filter(Boolean).slice(0, 4);
     const record: PastTurn = {
       trigger: body.trigger,
       speech: body.speech,
@@ -231,6 +234,7 @@ export async function POST(req: Request) {
     const publicTurn: PublicTurn = {
       move: turn.move,
       say: turn.say,
+      write: turn.write,
       annotations: turn.annotations,
       skill: turn.skill,
       card: turn.card,
@@ -262,15 +266,17 @@ export async function POST(req: Request) {
 }
 
 function fallbackTurn(say: string): PublicTurn {
-  return { move: "ask_plan", say, annotations: [], skill: { concept: "", evidence: "none" }, card: null, review_result: null };
+  return { move: "ask_plan", say, write: [], annotations: [], skill: { concept: "", evidence: "none" }, card: null, review_result: null };
 }
 
 function describeInk(turn: TutorTurn): string {
-  if (!turn.annotations.length) return "none";
-  return turn.annotations
+  const wrote = turn.write.length ? `wrote below the work: ${turn.write.map((w) => `"${w}"`).join(", ")}` : "";
+  if (!turn.annotations.length) return wrote || "none";
+  return [wrote, ...turn.annotations
     .map((a) => {
       const where = a.from_token == null ? a.line_id : `${a.line_id} tokens ${a.from_token}-${a.to_token ?? a.from_token}`;
       return a.kind === "note" ? `note "${a.text}" near ${where}` : `${a.kind} on ${where}`;
-    })
+    })]
+    .filter(Boolean)
     .join(", ");
 }

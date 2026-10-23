@@ -42,3 +42,12 @@ test("a stroke is revealed progressively", () => {
   assert.ok(strokeAt(s, 150)!.length < 10);
   assert.equal(strokeAt(s, 250)!.length, 10);
 });
+
+test("written work goes below the student's lines and any earlier tutor ink, line after line", () => {
+  const avoid = [{ x: 0, y: 60, w: 100, h: 40 }];
+  const plan = planAnnotations([], lines, 3, { write: ["Try: 2y + 3 = 7", "2y = 4"], avoid });
+  assert.ok(plan.strokes.length > 10);
+  const top = Math.min(...plan.strokes.flatMap((s) => s.points.map(([, y]) => y)));
+  assert.ok(top > 100, `work starts below earlier ink (top ${top})`);
+  for (let i = 1; i < plan.strokes.length; i++) assert.ok(plan.strokes[i].start >= plan.strokes[i - 1].end);
+});

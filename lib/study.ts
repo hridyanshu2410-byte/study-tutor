@@ -50,7 +50,7 @@ export function parseIntake(form: { get(name: string): unknown }): Intake | null
 // "wait" moves, but every one sends two page images to the model.
 export function dailyTutorLimit(): number {
   const n = Number(process.env.DAILY_TUTOR_LIMIT);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 300;
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 800;
 }
 
 export function startOfUtcDay(now: Date): string {

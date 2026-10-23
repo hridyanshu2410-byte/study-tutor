@@ -26,7 +26,7 @@ This puts the tutor online so testers can sign up, give consent, and use it on t
    | `SUPABASE_SERVICE_ROLE_KEY` | the service_role / secret key |
    | `ADMIN_EMAILS` | your email (and any co-researchers), comma-separated |
    | `STUDY_INVITE_CODE` | optional: a code testers must enter to join |
-   | `DAILY_TUTOR_LIMIT` | optional: tutor turns per tester per day, default 300 |
+   | `DAILY_TUTOR_LIMIT` | optional: tutor turns per tester per day, default 800 (the tutor glances at the page after each pause in writing, so turns add up) |
    | `OPENAI_API_KEY` | runs the tutor on GPT-6 Luna if no Anthropic key is set (`OPENAI_TUTOR_MODEL` changes the model); also the natural tutor voice |
 
 3. Deploy. Copy the site address Vercel gives you (for example `https://study-tutor.vercel.app`).

@@ -1,8 +1,12 @@
 import { z } from "zod";
 
+const MOVES = ["wait", "ask_plan", "point", "name_concept", "simpler_example", "next_step", "worked_solution", "affirm", "check_understanding"] as const;
+type Move = (typeof MOVES)[number];
+
 // What the tutor decides each turn. Everything under `private` stays on the
-// server: the student only ever receives `move`, `say` and `annotations`.
-export const TutorTurnSchema = z.object({
+// server: the student only ever receives the public fields. `moves` narrows
+// the choice of move, which is how the hint ladder is held to one rung at a time.
+export const tutorTurnSchema = (moves: readonly Move[] = MOVES) => z.object({
   private: z.object({
     reading: z
       .array(z.object({ line_id: z.string(), latex: z.string() }))
@@ -14,8 +18,13 @@ export const TutorTurnSchema = z.object({
     diagnosis: z.string().describe("What the student understands and what the misconception is, in one or two sentences."),
     solution_sketch: z.string().describe("The full solution path, for your own reference. Never revealed."),
   }),
-  move: z.enum(["wait", "ask_plan", "point", "name_concept", "simpler_example", "next_step", "worked_solution", "affirm", "check_understanding"]),
+  move: z.enum(moves as [Move, ...Move[]]),
   say: z.string().describe("What you say out loud. Empty string if move is wait."),
+  write: z
+    .array(z.string())
+    .describe(
+      "The math in what you say, written on the page in your hand as you speak it, one short line per item: an example problem, an equation, a step, a formula. Plain characters only (x², √, π, →, ≠, ±, /). No sentences; at most a word like \"Try:\" before the math. Empty when what you say has no math. Never the answer to the student's problem before worked_solution.",
+    ),
   annotations: z
     .array(
       z.object({
@@ -51,8 +60,16 @@ export const TutorTurnSchema = z.object({
     .describe("Review mode only: set once the card attempt is over. Null while the student is still working, and always null in study mode."),
 });
 
+export const TutorTurnSchema = tutorTurnSchema();
 export type TutorTurn = z.infer<typeof TutorTurnSchema>;
-export type PublicTurn = Pick<TutorTurn, "move" | "say" | "annotations" | "skill" | "card" | "review_result">;
+export type PublicTurn = Pick<TutorTurn, "move" | "say" | "write" | "annotations" | "skill" | "card" | "review_result">;
+
+// Moves allowed this turn: anything off the ladder, any rung at or below the
+// last one used, and the next rung up. Never two rungs at once.
+export function allowedMoves(lastRung: Move): Move[] {
+  const top = Math.max(LADDER.indexOf(lastRung), 0) + 1;
+  return MOVES.filter((m) => !LADDER.includes(m) || LADDER.indexOf(m) <= top);
+}
 
 export type ReviewContext = {
   concept: string;
@@ -68,13 +85,15 @@ export type TutorRequest = {
   weakSpots: string[];
   problem: string;
   trigger: "pause" | "asked" | "spoke";
+  // Seconds since the student last put pen to the page, so the tutor knows if they are mid-thought.
+  idleSeconds?: number;
   speech: string | null;
   lines: { id: string; tokens: number }[];
   pageImage: string; // PNG data URL of the student's page, clean
   tokenImage: string; // the same page with each line's tokens boxed and numbered
 };
 
-export const LADDER: TutorTurn["move"][] = [
+export const LADDER: Move[] = [
   "wait",
   "ask_plan",
   "point",
@@ -95,13 +114,23 @@ How you choose a move, each turn:
 - Only use worked_solution after the student has made at least two genuine attempts at this step, or explicitly asks for the answer twice. When you do, follow it with a fresh, similar problem for them to try alone.
 - When the student finishes, use check_understanding: ask them to explain why one key step works. A right answer with the wrong reason is not done.
 - If the student speaks to you, answer what they said first. If they ask a direct question about a concept, explain the concept briefly with your own example, not by doing their problem.
+- A page with only the problem written on it is not an attempt. Start by asking how they would begin, never with an example or a step.
+- You are only offered the moves that fit where the student is on the ladder this turn.
+
+This is a live conversation, like sitting together:
+- You watch the page as they write, so you will often be called while they are mid-problem. If they are working and nothing is wrong, wait.
+- When they talk, reply like a person would: briefly, then hand the turn back. "Mm, go on" style replies are fine when they are thinking aloud.
 
 How you sound:
 - Like a warm, calm person talking, not a textbook. Short turns: one idea or one question, under 25 words. No lists, no markdown, no LaTeX in what you say; say math the way people say it ("x squared").
 - Treat mistakes as normal and useful: "Nice, this is exactly where most people slip." Never say "wrong" or "incorrect"; point at the line and ask.
 - Ask one question at a time and then stop.
 
-What you put on the page, like a tutor's pen:
+Writing as you talk:
+- Whatever math you say, you also write, in write: the example problem when you give one, the equation you are asking about, the one step at next_step, each line of a worked_solution. A tutor who says "try 2y plus 3 equals 7" writes "Try: 2y + 3 = 7" as they say it. It appears in your own space on the page, below the student's work.
+- Keep it to the math, not the sentence: "d/dx sin(u) = cos(u)·u′", not "Remember the chain rule says...". One to four short lines.
+
+What you put on the student's lines, like a tutor's pen:
 - You have two pictures of the page. The first is the student's work as written. The second is the same page with each line labelled (L1, L2, ...) and each line split into numbered tokens in small boxes, so you can point at an exact part: a sign, an exponent, one term.
 - Point at the smallest part that is wrong, not the whole line: circle the 2 in the exponent, underline the term that was dropped, strike a sign. Use token numbers (from_token to to_token, inclusive). Use null tokens only when the whole line is meant.
 - Marks: circle (the main way to point), underline (something missing or worth a second look), strike (only when the student asks you to correct it, or at next_step and later), check (tick a correct line, sparingly), question (a small question mark beside it).
