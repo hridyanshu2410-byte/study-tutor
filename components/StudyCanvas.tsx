@@ -347,16 +347,18 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const respond = (turn: PublicTurn, lines: InkLine[]) => {
     remember(turn);
     const write = turn.write ?? [];
-    if (turn.move === "wait" || (!turn.say && !turn.annotations.length && !write.length)) {
+    const figures = turn.draw ?? [];
+    if (turn.move === "wait" || (!turn.say && !turn.annotations.length && !write.length && !figures.length)) {
       settle();
       return;
     }
     // The pen starts when the voice does, so the math appears as it is said.
     let ink: TutorInk | null = null;
-    if (turn.annotations.length || write.length) {
+    if (turn.annotations.length || write.length || figures.length) {
       const cam = camera.current;
       const plan = planAnnotations(turn.annotations, lines, Math.floor(Math.random() * 2 ** 31), {
         write,
+        figures,
         avoid: tutorInk.current.map((t) => t.plan.box).filter((b): b is Box => b != null),
         origin: { x: cam.x, y: cam.y + 60 / cam.z },
       });

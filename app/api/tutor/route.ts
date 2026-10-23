@@ -194,6 +194,7 @@ export async function POST(req: Request) {
     if (reviewing) turn.card = null;
     else turn.review_result = null;
     turn.skill.concept = turn.skill.concept.slice(0, 60);
+    turn.draw = turn.move === "wait" ? [] : turn.draw.slice(0, 2);
     turn.write = turn.move === "wait" ? [] : turn.write.map((w) => w.trim().slice(0, 48)).filter(Boolean).slice(0, 4);
     const record: PastTurn = {
       trigger: body.trigger,
@@ -235,6 +236,7 @@ export async function POST(req: Request) {
       move: turn.move,
       say: turn.say,
       write: turn.write,
+      draw: turn.draw,
       annotations: turn.annotations,
       skill: turn.skill,
       card: turn.card,
@@ -266,17 +268,28 @@ export async function POST(req: Request) {
 }
 
 function fallbackTurn(say: string): PublicTurn {
-  return { move: "ask_plan", say, write: [], annotations: [], skill: { concept: "", evidence: "none" }, card: null, review_result: null };
+  return { move: "ask_plan", say, write: [], draw: [], annotations: [], skill: { concept: "", evidence: "none" }, card: null, review_result: null };
 }
 
 function describeInk(turn: TutorTurn): string {
   const wrote = turn.write.length ? `wrote below the work: ${turn.write.map((w) => `"${w}"`).join(", ")}` : "";
-  if (!turn.annotations.length) return wrote || "none";
-  return [wrote, ...turn.annotations
+  const drew = turn.draw.map(describeFigure).join(", ");
+  if (!turn.annotations.length) return [wrote, drew].filter(Boolean).join(", ") || "none";
+  return [wrote, drew, ...turn.annotations
     .map((a) => {
       const where = a.from_token == null ? a.line_id : `${a.line_id} tokens ${a.from_token}-${a.to_token ?? a.from_token}`;
       return a.kind === "note" ? `note "${a.text}" near ${where}` : `${a.kind} on ${where}`;
     })]
     .filter(Boolean)
     .join(", ");
+}
+
+function describeFigure(f: TutorTurn["draw"][number]): string {
+  if (f.kind === "graph") return `drew a graph of ${f.curves.map((c) => c.formula).join(" and ") || "points"}`;
+  if (f.kind === "number_line") return `drew a number line from ${f.from} to ${f.to}`;
+  if (f.kind === "shape") return `drew a shape ${f.vertices.map((v) => v.label ?? "").join("")}`.trim();
+  if (f.kind === "flow") return `drew a flow: ${f.nodes.map((n) => n.text).join(" → ")}`;
+  if (f.kind === "table") return `drew a table: ${f.rows.map((r) => r.join(" | ")).join(" / ")}`;
+  if (f.kind === "forces") return `drew a force diagram: ${f.forces.map((x) => x.label).join(", ")}`;
+  return `wrote steps: ${f.lines.map((l) => l.math).join(" ; ")}`;
 }

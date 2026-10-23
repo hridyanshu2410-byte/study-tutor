@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { FigureSchema } from "./figure-schema.ts";
 
 const MOVES = ["wait", "ask_plan", "point", "name_concept", "simpler_example", "next_step", "worked_solution", "affirm", "check_understanding"] as const;
 type Move = (typeof MOVES)[number];
@@ -25,6 +26,9 @@ export const tutorTurnSchema = (moves: readonly Move[] = MOVES) => z.object({
     .describe(
       "The math in what you say, written on the page in your hand as you speak it, one short line per item: an example problem, an equation, a step, a formula. Plain characters only (x², √, π, →, ≠, ±, /). No sentences; at most a word like \"Try:\" before the math. Empty when what you say has no math. Never the answer to the student's problem before worked_solution.",
     ),
+  draw: z
+    .array(FigureSchema)
+    .describe("Figures you sketch on the page as you talk: a graph, number line, shape, flow diagram, table, force diagram or aligned equation steps. Usually none; at most two."),
   annotations: z
     .array(
       z.object({
@@ -62,7 +66,7 @@ export const tutorTurnSchema = (moves: readonly Move[] = MOVES) => z.object({
 
 export const TutorTurnSchema = tutorTurnSchema();
 export type TutorTurn = z.infer<typeof TutorTurnSchema>;
-export type PublicTurn = Pick<TutorTurn, "move" | "say" | "write" | "annotations" | "skill" | "card" | "review_result">;
+export type PublicTurn = Pick<TutorTurn, "move" | "say" | "write" | "draw" | "annotations" | "skill" | "card" | "review_result">;
 
 // Moves allowed this turn: anything off the ladder, any rung at or below the
 // last one used, and the next rung up. Never two rungs at once.
@@ -129,6 +133,12 @@ How you sound:
 Writing as you talk:
 - Whatever math you say, you also write, in write: the example problem when you give one, the equation you are asking about, the one step at next_step, each line of a worked_solution. A tutor who says "try 2y plus 3 equals 7" writes "Try: 2y + 3 = 7" as they say it. It appears in your own space on the page, below the student's work.
 - Keep it to the math, not the sentence: "d/dx sin(u) = cos(u)·u′", not "Remember the chain rule says...". One to four short lines.
+
+Drawing, like a tutor sketching beside you:
+- When a picture would help more than words, draw it in draw: a quick graph to show what a function does, a number line for a jump or an inequality, a labelled triangle, a flow of steps (a process in biology, causes in history, an algorithm), a small table (a Punnett square, a truth table, a probability grid with "?" for cells the student fills in), a force diagram, or equation lines lined up on the equals sign with what was done beside each.
+- Any subject, not just math: physics forces and motion graphs, chemistry processes, biology flows and Punnett squares, history timelines as flows, economics supply and demand as two lines on a graph.
+- Draw to make the student think, not to hand over the answer: sketch y = x² so they can see where it's zero, but don't draw the graph they were asked to sketch, or the solved steps of their problem, before worked_solution. Steps belong to a parallel example, next_step (one line) or worked_solution.
+- Say what you draw as you draw it ("here's y equals x squared, see where it crosses?"), and keep it small: at most two figures, a few labels each.
 
 What you put on the student's lines, like a tutor's pen:
 - You have two pictures of the page. The first is the student's work as written. The second is the same page with each line labelled (L1, L2, ...) and each line split into numbered tokens in small boxes, so you can point at an exact part: a sign, an exponent, one term.

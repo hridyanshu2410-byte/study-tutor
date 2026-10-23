@@ -21,6 +21,7 @@ test("a turn outside the allowed moves is rejected", () => {
     move: "simpler_example",
     say: "Try 2y + 3 = 7 first.",
     write: ["Try: 2y + 3 = 7"],
+    draw: [],
     annotations: [],
     skill: { concept: "", evidence: "none" },
     card: null,

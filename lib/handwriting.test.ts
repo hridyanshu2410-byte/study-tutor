@@ -51,3 +51,30 @@ test("written work goes below the student's lines and any earlier tutor ink, lin
   assert.ok(top > 100, `work starts below earlier ink (top ${top})`);
   for (let i = 1; i < plan.strokes.length; i++) assert.ok(plan.strokes[i].start >= plan.strokes[i - 1].end);
 });
+
+test("every kind of figure draws, below the work, one stroke after another", () => {
+  const figures = [
+    { kind: "graph" as const, x_min: -3, x_max: 3, y_min: -2, y_max: 8, x_label: "x", y_label: "y", curves: [{ formula: "x^2 - 1", label: "y = x² − 1" }, { formula: "1/x", label: null }], points: [{ x: 1, y: 0, label: "(1, 0)" }] },
+    { kind: "number_line" as const, from: -5, to: 5, marks: [{ at: 2, label: "x", open: true }], jumps: [{ from: -3, to: 2, label: "+5" }], shade_from: 2, shade_to: 5 },
+    { kind: "shape" as const, vertices: [{ x: 0, y: 0, label: "A" }, { x: 4, y: 0, label: "B" }, { x: 0, y: 3, label: "C" }], closed: true, side_labels: ["4", "5", "3"], angle_labels: ["90°", null, "θ"] },
+    { kind: "flow" as const, direction: "right" as const, nodes: [{ text: "Glucose" }, { text: "Pyruvate" }, { text: "ATP made in the mitochondria" }], arrows: [{ from: 0, to: 1, label: "glycolysis" }, { from: 1, to: 2, label: null }] },
+    { kind: "table" as const, header: true, rows: [["", "B", "b"], ["B", "BB", "?"], ["b", "?", "bb"]] },
+    { kind: "forces" as const, body: "block" as const, incline_deg: 30, forces: [{ label: "mg", angle_deg: 270, size: 1 }, { label: "N", angle_deg: 120, size: 0.8 }, { label: "f", angle_deg: 30, size: 0.4 }] },
+    { kind: "steps" as const, lines: [{ math: "5x² + 5 = 10", note: "−5" }, { math: "5x² = 5", note: "÷5" }, { math: "x² = 1", note: null }] },
+  ];
+  for (const fig of figures) {
+    const plan = planAnnotations([], lines, 5, { figures: [fig] });
+    assert.ok(plan.strokes.length > 5, `${fig.kind} drew ${plan.strokes.length} strokes`);
+    for (let i = 1; i < plan.strokes.length; i++) assert.ok(plan.strokes[i].start >= plan.strokes[i - 1].end);
+    const top = Math.min(...plan.strokes.flatMap((s) => s.points.map(([, y]) => y)));
+    assert.ok(top > lines[0].box.y + lines[0].box.h, `${fig.kind} starts below the student's line`);
+    for (const s of plan.strokes) for (const [x, y] of s.points) assert.ok(Number.isFinite(x) && Number.isFinite(y), fig.kind);
+  }
+});
+
+test("a figure with a formula it can't read still draws the rest", () => {
+  const plan = planAnnotations([], lines, 5, {
+    figures: [{ kind: "graph", x_min: 0, x_max: 1, y_min: 0, y_max: 1, x_label: null, y_label: null, curves: [{ formula: "window.close()", label: null }], points: [] }],
+  });
+  assert.ok(plan.strokes.length > 3);
+});
