@@ -8,7 +8,7 @@ import { browserClient } from "./supabase/client";
 
 export type Account = { userId: string; email: string; participantCode: string; admin: boolean };
 
-export type EventKind = "card_created" | "review_graded" | "review_started" | "deck_imported" | "feedback";
+export type EventKind = "card_created" | "review_graded" | "review_started" | "deck_imported" | "feedback" | "session_finished" | "survey" | "test";
 
 type Column = "page" | "memory";
 

@@ -166,11 +166,16 @@ export async function POST(req: Request) {
     history ? `Earlier turns this session:\n${history}` : "This is the first turn of the session.",
     `Last hint-ladder rung used: ${lastRung}`,
     body.idleSeconds != null ? `The student last wrote ${Math.round(body.idleSeconds)} seconds ago.` : "",
+    body.focus ? `The student is pointing at line ${body.focus.line_id}${body.focus.token != null ? `, token ${body.focus.token}` : ""}.` : "",
     body.trigger === "pause"
       ? "The student has paused writing."
       : body.trigger === "asked"
-        ? "The student tapped to ask for your help."
-        : `The student just said: "${body.speech ?? ""}"`,
+        ? body.focus
+          ? "The student double-tapped there to ask about it."
+          : "The student tapped to ask for your help."
+        : body.trigger === "wrap_up"
+          ? "The student is ending the session. Wrap up."
+          : `The student just said: "${body.speech ?? ""}"`,
   ]
     .filter(Boolean)
     .join("\n\n");

@@ -50,6 +50,13 @@ type TutorState = "idle" | "thinking" | "speaking";
 type TutorInk = { id: string; plan: PenPlan; born: number };
 type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string };
 
+// What happened this session, for the wrap-up summary.
+type SessionStats = { startedAt: number; turns: number; concepts: Record<string, { slips: number; solved: number }>; cards: string[] };
+const newStats = (): SessionStats => ({ startedAt: Date.now(), turns: 0, concepts: {}, cards: [] });
+// Where the student double-tapped to point, in page coordinates.
+type Focus = { world: [number, number]; at: number };
+const FOCUS_MS = 8000;
+
 const STUDENT_INK = "#1f2a44";
 const TUTOR_INK = "#c2410c";
 // The tutor glances at the page this long after the pen lifts.
@@ -78,6 +85,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const hearing = useRef(false);
   const inFlight = useRef<{ trigger: TutorRequest["trigger"]; speech: string | null; abort: AbortController } | null>(null);
   const lastPenAt = useRef(0);
+  const stats = useRef<SessionStats>(newStats());
+  const focus = useRef<Focus | null>(null);
+  const lastTap = useRef<{ x: number; y: number; at: number; strokeId: string } | null>(null);
   const sessionId = useRef("");
   const lasso = useRef<[number, number][] | null>(null);
 
@@ -97,6 +107,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const [keepDraft, setKeepDraft] = useState<KeepDraft | null>(null);
   const [run, setRun] = useState<ReviewRun | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [summary, setSummary] = useState<{ recap: string; stats: SessionStats } | null>(null);
   const { memory, memoryRef, update: updateMemory, storageFull, loaded } = useStudyMemory(account);
 
   // Re-check what's due every minute, as well as whenever cards change.
@@ -115,6 +126,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   // ---------- persistence ----------
   useEffect(() => {
     sessionId.current = crypto.randomUUID();
+    stats.current = newStats();
     setCanListen(speechInputSupported());
     ear.current = new Conversation({
       onUtterance: (text) => askTutor("spoke", text),
@@ -256,6 +268,16 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         ctx.fill(pathFor(s, drawing.current?.stroke.id === s.id ? drawing.current.simulate : false));
       }
       for (const t of tutorInk.current) drawTutorInk(ctx, t, now, tutorPaths.current);
+      if (focus.current && Date.now() - focus.current.at < FOCUS_MS) {
+        const [fx, fy] = focus.current.world;
+        ctx.save();
+        ctx.strokeStyle = "rgba(37, 99, 235, 0.7)";
+        ctx.lineWidth = 2 / cam.z;
+        ctx.beginPath();
+        ctx.arc(fx, fy, 14 / cam.z, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
       if (lasso.current && lasso.current.length > 1) {
         ctx.save();
         ctx.strokeStyle = "rgba(37, 99, 235, 0.8)";
@@ -319,6 +341,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
             trigger,
             speech,
             idleSeconds: lastPenAt.current ? (Date.now() - lastPenAt.current) / 1000 : undefined,
+            focus: trigger === "pause" ? null : focusOn(lines),
             lines: lines.map((l) => ({ id: l.id, tokens: l.tokens.length })),
             ...renderPageImages(strokes.current, lines),
           } satisfies TutorRequest),
@@ -326,13 +349,18 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         const data = await res.json();
         if (inFlight.current !== mine) return;
         inFlight.current = null;
+        stats.current.turns++;
+        if (trigger !== "pause" && focus.current) {
+          focus.current = null; // the pointing has been answered
+          dirty.current = true;
+        }
         if (!res.ok && !data.say) throw new Error(data.error ?? `Tutor error ${res.status}`);
         // Don't talk over a student who started speaking while we looked.
         if (trigger === "pause" && hearing.current) {
           setTutorState("idle");
           return;
         }
-        respond(data as PublicTurn, lines);
+        respond(data as PublicTurn, lines, trigger);
       } catch (e) {
         if (abort.signal.aborted) return; // replaced by a newer turn
         if (inFlight.current === mine) inFlight.current = null;
@@ -344,8 +372,37 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     [],
   );
 
-  const respond = (turn: PublicTurn, lines: InkLine[]) => {
+  // The line and token the student pointed at, if they did so recently.
+  const focusOn = (lines: InkLine[]): TutorRequest["focus"] => {
+    const f = focus.current;
+    if (!f || Date.now() - f.at > FOCUS_MS) return null;
+    const [x, y] = f.world;
+    let best: { line: InkLine; d: number } | null = null;
+    for (const l of lines) {
+      const d = Math.max(0, l.box.y - y, y - (l.box.y + l.box.h)) + Math.max(0, l.box.x - x, x - (l.box.x + l.box.w)) * 0.3;
+      if (!best || d < best.d) best = { line: l, d };
+    }
+    if (!best || best.d > 60) return null;
+    let token: number | null = null, td = Infinity;
+    for (const t of best.line.tokens) {
+      const d = Math.hypot(t.box.x + t.box.w / 2 - x, t.box.y + t.box.h / 2 - y);
+      if (d < td) [token, td] = [t.n, d];
+    }
+    return { line_id: best.line.id, token: td < 80 ? token : null };
+  };
+
+  const respond = (turn: PublicTurn, lines: InkLine[], trigger: TutorRequest["trigger"] = "pause") => {
     remember(turn);
+    if (trigger === "wrap_up") {
+      const s = stats.current;
+      setSummary({ recap: turn.say, stats: { ...s } });
+      logEvent(
+        account,
+        "session_finished",
+        { minutes: Math.round((Date.now() - s.startedAt) / 60000), turns: s.turns, concepts: s.concepts, cards: s.cards.length },
+        sessionId.current,
+      );
+    }
     const write = turn.write ?? [];
     const figures = turn.draw ?? [];
     if (turn.move === "wait" || (!turn.say && !turn.annotations.length && !write.length && !figures.length)) {
@@ -409,6 +466,11 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const remember = (turn: PublicTurn) => {
     const at = new Date();
     if (stateRef.current.mode === "study") {
+      if (turn.skill?.concept && (turn.skill.evidence === "slip" || turn.skill.evidence === "solved")) {
+        const c = (stats.current.concepts[turn.skill.concept.toLowerCase()] ??= { slips: 0, solved: 0 });
+        if (turn.skill.evidence === "slip") c.slips = 1;
+        else c.solved++;
+      }
       if (turn.skill?.concept) {
         updateMemory((m) => ({ ...m, skills: recordEvidence(m.skills, turn.skill.concept, turn.skill.evidence, sessionId.current, at) }));
       }
@@ -421,6 +483,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         );
         updateMemory((m) => ({ ...m, cards: [...m.cards, card] }));
         logEvent(account, "card_created", { source: "mistake", concept: card.concept, card_id: card.id }, sessionId.current);
+        stats.current.cards.push(card.concept);
         flash(`Saved a review card on ${card.concept}`);
       }
     } else if (turn.review_result) {
@@ -442,6 +505,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     tutorPaths.current.clear();
     undoStack.current = [];
     sessionId.current = crypto.randomUUID();
+    stats.current = newStats();
     changedSinceTutor.current = false;
     if (pauseTimer.current) clearTimeout(pauseTimer.current);
     dirty.current = true;
@@ -507,6 +571,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     setRun(null);
     restorePage();
     sessionId.current = crypto.randomUUID();
+    stats.current = newStats();
     const upcoming = memoryRef.current.cards.map((c) => new Date(c.fsrs.due).getTime()).filter((d) => d > Date.now());
     const next = upcoming.length ? Math.min(...upcoming) : null;
     setCaption(
@@ -733,6 +798,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     const d = drawing.current;
     if (d && d.pointerId === e.pointerId) {
       drawing.current = null;
+      if (gesture(d.stroke)) {
+        dirty.current = true;
+        return;
+      }
       paths.current.delete(d.stroke.id); // rebuild with the finished tail
       changedSinceTutor.current = true;
       lastPenAt.current = Date.now();
@@ -743,6 +812,66 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       save();
       schedulePause();
     }
+  };
+
+  // Pen gestures. A double tap points at that spot: the tutor answers about
+  // it, right away or about what the student says next. A quick back-and-forth
+  // scribble over ink erases it. Returns true when the stroke was a gesture.
+  const gesture = (stroke: Stroke): boolean => {
+    const pts = stroke.points;
+    const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+    const w = Math.max(...xs) - Math.min(...xs), h = Math.max(...ys) - Math.min(...ys);
+    const z = camera.current.z;
+    const remove = (ids: string[]) => {
+      strokes.current = strokes.current.filter((s) => !ids.includes(s.id));
+      ids.forEach((id) => paths.current.delete(id));
+    };
+
+    if (w * z < 6 && h * z < 6 && Date.now() - stroke.createdAt < 300) {
+      const prev = lastTap.current;
+      const [x, y] = pts[0];
+      if (prev && Date.now() - prev.at < 450 && Math.hypot(prev.x - x, prev.y - y) * z < 24) {
+        lastTap.current = null;
+        remove([stroke.id, prev.strokeId]);
+        undoStack.current.splice(-2);
+        save();
+        focus.current = { world: [x, y], at: Date.now() };
+        setTimeout(() => (dirty.current = true), FOCUS_MS + 50);
+        // Give them a moment to start speaking; if they don't, the tap is the question.
+        setTimeout(() => {
+          if (focus.current && Date.now() - focus.current.at < 2000 && !hearing.current && !inFlight.current) askTutor("asked");
+        }, 1400);
+        return true;
+      }
+      lastTap.current = { x, y, at: Date.now(), strokeId: stroke.id };
+      return false;
+    }
+
+    // Scribble: the pen reverses left-right many times in a short, wide-ish stroke.
+    let flips = 0, dir = 0, anchor = pts[0][0];
+    for (const [x] of pts) {
+      const dx = x - anchor;
+      if (Math.abs(dx) * z < 6) continue;
+      const nd = Math.sign(dx);
+      if (dir && nd !== dir) flips++;
+      dir = nd;
+      anchor = x;
+    }
+    if (flips >= 6 && w * z > 24) {
+      // Ink counts as scribbled out when most of it lies under the scribble.
+      const x0 = Math.min(...xs) - 8, x1 = Math.max(...xs) + 8, y0 = Math.min(...ys) - 8, y1 = Math.max(...ys) + 8;
+      const near = (s: Stroke) =>
+        s.id !== stroke.id && s.points.filter(([sx, sy]) => sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1).length >= s.points.length * 0.5;
+      const hit = strokes.current.filter(near).map((s) => s.id);
+      if (hit.length) {
+        remove([...hit, stroke.id]);
+        changedSinceTutor.current = true;
+        save();
+        schedulePause();
+        return true;
+      }
+    }
+    return false;
   };
 
   const onWheel = (e: React.WheelEvent) => {
@@ -802,6 +931,49 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     paths.current.clear();
     tutorPaths.current.clear();
     sessionId.current = crypto.randomUUID();
+    stats.current = newStats();
+    dirty.current = true;
+    save();
+  };
+
+  // A picture of the whole page, both inks, to keep or hand in.
+  const saveNotes = () => {
+    const tutorStrokes = tutorInk.current.flatMap((t) => t.plan.strokes.map((st) => st.points));
+    const all = [...strokes.current.flatMap((s) => s.points.map((p) => [p[0], p[1]])), ...tutorStrokes.flat()];
+    if (!all.length) return;
+    const m = 40;
+    const x0 = Math.min(...all.map((p) => p[0])) - m, y0 = Math.min(...all.map((p) => p[1])) - m;
+    const x1 = Math.max(...all.map((p) => p[0])) + m, y1 = Math.max(...all.map((p) => p[1])) + m;
+    const scale = Math.min(2, 2400 / (x1 - x0), 3200 / (y1 - y0));
+    const c = document.createElement("canvas");
+    c.width = Math.ceil((x1 - x0) * scale);
+    c.height = Math.ceil((y1 - y0) * scale);
+    const ctx = c.getContext("2d")!;
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.setTransform(scale, 0, 0, scale, -x0 * scale, -y0 * scale);
+    ctx.fillStyle = STUDENT_INK;
+    for (const s of strokes.current) ctx.fill(outlinePath(getStroke(s.points, { size: s.size, thinning: 0.6, smoothing: 0.55, streamline: 0.45 })));
+    ctx.fillStyle = TUTOR_INK;
+    for (const pts of tutorStrokes) ctx.fill(outlinePath(getStroke(pts, { size: 3.6, thinning: 0.55, smoothing: 0.6, streamline: 0.2, simulatePressure: true })));
+    const a = document.createElement("a");
+    a.href = c.toDataURL("image/png");
+    a.download = `study-notes-${new Date().toISOString().slice(0, 10)}.png`;
+    a.click();
+  };
+
+  const newProblem = () => {
+    hush();
+    strokes.current = [];
+    tutorInk.current = [];
+    paths.current.clear();
+    tutorPaths.current.clear();
+    undoStack.current = [];
+    sessionId.current = crypto.randomUUID();
+    stats.current = newStats();
+    setProblem("");
+    setSummary(null);
+    setCaption("Fresh page. What are we working on next?");
     dirty.current = true;
     save();
   };
@@ -948,6 +1120,46 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         </form>
       )}
 
+      {summary && (
+        <div className="summary" role="dialog" aria-label="Session summary">
+          <h2>Nice session</h2>
+          <p className="summary-recap">{summary.recap}</p>
+          <dl>
+            <div>
+              <dt>Time</dt>
+              <dd>{Math.max(1, Math.round((Date.now() - summary.stats.startedAt) / 60000))} min</dd>
+            </div>
+            <div>
+              <dt>Back-and-forths</dt>
+              <dd>{summary.stats.turns}</dd>
+            </div>
+            <div>
+              <dt>Review cards saved</dt>
+              <dd>{summary.stats.cards.length}</dd>
+            </div>
+          </dl>
+          {Object.keys(summary.stats.concepts).length > 0 && (
+            <ul className="summary-concepts">
+              {Object.entries(summary.stats.concepts).map(([c, v]) => (
+                <li key={c}>
+                  <span>{c}</span>
+                  <span className={v.solved && !v.slips ? "good" : v.solved ? "mixed" : "work"}>
+                    {v.solved && !v.slips ? "solid" : v.solved ? "got there" : "keep practising"}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="keep-actions">
+            <button onClick={saveNotes}>Save notes</button>
+            <button onClick={() => setSummary(null)}>Keep going</button>
+            <button className="primary" onClick={newProblem}>
+              New problem
+            </button>
+          </div>
+        </div>
+      )}
+
       {toast && (
         <div className="toast" role="status">
           {toast}
@@ -1009,6 +1221,11 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           <button onClick={() => askTutor("asked")} disabled={tutorState === "thinking"}>
             I&apos;m stuck
           </button>
+          {mode === "study" && (
+            <button onClick={() => askTutor("wrap_up")} disabled={tutorState === "thinking"} title="Wrap up with a recap">
+              Finish
+            </button>
+          )}
           <button
             onClick={() => {
               setMuted((m) => !m);

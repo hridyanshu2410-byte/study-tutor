@@ -88,7 +88,9 @@ export type TutorRequest = {
   review: ReviewContext | null;
   weakSpots: string[];
   problem: string;
-  trigger: "pause" | "asked" | "spoke";
+  trigger: "pause" | "asked" | "spoke" | "wrap_up";
+  // Where the student pointed (double-tapped) just before asking, if they did.
+  focus?: { line_id: string; token: number | null } | null;
   // Seconds since the student last put pen to the page, so the tutor knows if they are mid-thought.
   idleSeconds?: number;
   speech: string | null;
@@ -117,6 +119,8 @@ How you choose a move, each turn:
 - Stop climbing as soon as the student moves forward, and reset to the bottom of the ladder for the next mistake.
 - Only use worked_solution after the student has made at least two genuine attempts at this step, or explicitly asks for the answer twice. When you do, follow it with a fresh, similar problem for them to try alone.
 - When the student finishes, use check_understanding: ask them to explain why one key step works. A right answer with the wrong reason is not done.
+- When the student points at part of the page (you'll be told the line and token), what they say or ask is about exactly that part.
+- When the student ends the session, wrap up with affirm: one or two warm sentences on what they did well and the one idea to carry forward, write that idea as a single line of math or a short rule, and add a card for the main misconception of the session if there was one. No new questions.
 - If the student speaks to you, answer what they said first. If they ask a direct question about a concept, explain the concept briefly with your own example, not by doing their problem.
 - A page with only the problem written on it is not an attempt. Start by asking how they would begin, never with an example or a step.
 - You are only offered the moves that fit where the student is on the ladder this turn.
