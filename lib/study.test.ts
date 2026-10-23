@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { dailyTutorLimit, inviteOk, parseIntake, startOfUtcDay, toCsv } from "./study.ts";
+import { conditionOf, dailyTutorLimit, inviteOk, parseIntake, pickCondition, startOfUtcDay, studyConditions, testOpen, toCsv } from "./study.ts";
+import { publicItems, scoreTest, TESTS } from "./study-tests.ts";
 
 test("csv quotes commas, quotes, newlines and objects", () => {
   const csv = toCsv([{ a: 'say "hi", ok', b: { move: "wait" }, c: null }], ["a", "b", "c"]);
@@ -32,4 +33,38 @@ test("daily limit and day boundary", () => {
   process.env.DAILY_TUTOR_LIMIT = "abc";
   assert.equal(dailyTutorLimit(), 800);
   assert.equal(startOfUtcDay(new Date("2026-10-22T23:59:00-07:00")), "2026-10-23T00:00:00.000Z");
+});
+
+test("conditions come from STUDY_CONDITIONS, ignoring unknown arms", () => {
+  process.env.STUDY_CONDITIONS = "socratic, explain,bogus";
+  assert.deepEqual(studyConditions(), ["socratic", "explain"]);
+  delete process.env.STUDY_CONDITIONS;
+  assert.deepEqual(studyConditions(), []);
+  assert.equal(conditionOf("on_request"), "on_request");
+  assert.equal(conditionOf(null), "socratic");
+});
+
+test("assignment fills the smallest arm first", () => {
+  assert.equal(pickCondition(["socratic", "explain"], { socratic: 3, explain: 1 }), "explain");
+  assert.equal(pickCondition(["socratic", "explain"], {}, () => 0.99), "explain");
+  assert.equal(pickCondition(["socratic", "explain"], {}, () => 0), "socratic");
+  assert.equal(pickCondition([], {}), null);
+});
+
+test("quizzes open only when switched on", () => {
+  process.env.STUDY_PRETEST = "on";
+  assert.equal(testOpen("pre"), true);
+  assert.equal(testOpen("post"), false);
+  delete process.env.STUDY_PRETEST;
+  assert.equal(testOpen("pre"), false);
+});
+
+test("quiz forms are parallel and scored on the server", () => {
+  assert.equal(TESTS.pre.length, TESTS.post.length);
+  assert.deepEqual(TESTS.pre.map((i) => i.skill), TESTS.post.map((i) => i.skill));
+  for (const it of [...TESTS.pre, ...TESTS.post]) assert.ok(it.answer >= 0 && it.answer < it.choices.length);
+  assert.ok(!("answer" in publicItems("pre")[0]));
+  const right = Object.fromEntries(TESTS.pre.map((i) => [i.id, i.answer]));
+  assert.equal(scoreTest("pre", right).score, TESTS.pre.length);
+  assert.equal(scoreTest("pre", { ...right, a1: 3, a2: null }).score, TESTS.pre.length - 2);
 });

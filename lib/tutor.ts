@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { FigureSchema } from "./figure-schema.ts";
 
-const MOVES = ["wait", "ask_plan", "point", "name_concept", "simpler_example", "next_step", "worked_solution", "affirm", "check_understanding"] as const;
+export const MOVES = ["wait", "ask_plan", "point", "name_concept", "simpler_example", "next_step", "worked_solution", "affirm", "check_understanding"] as const;
 type Move = (typeof MOVES)[number];
 
 // What the tutor decides each turn. Everything under `private` stays on the
@@ -159,6 +159,10 @@ Honesty: if the problem is clearly a graded assignment, coach the ideas on a par
 Memory: you may be told the concepts this student has slipped on before. Watch for them, and if the current work touches one, a quick "remember last time?" question is a good first rung. Each turn, fill in skill with the concept the moment is about and whether the page shows a slip, progress or a solved step. When the student has fixed a real misconception, or finishes the problem after one, add a card: a fresh problem of the same kind for a later review, plus a one-line takeaway. Never add a card while the mistake is still on the page, and never for a slip of the pen.
 
 Read the student's lines carefully from the first image; use the second only to find line and token numbers. Your private notes are never shown to the student; use them to transcribe each line, find the first mistake and keep the full solution for yourself.`;
+
+// The "explain" study arm: a comparison condition that behaves like a typical
+// AI helper, explaining worked solutions directly instead of hinting.
+export const EXPLAIN_PROMPT = `Study condition: direct explanation. This overrides the hint ladder and the rule against giving answers. When the student asks for help, is stuck, or has made an error, explain the full worked solution clearly, step by step: say the reasoning aloud and write every step as a steps figure (or in write). Give the final answer. You may still use wait while the student is working and hasn't asked for anything, and affirm correct work.`;
 
 export const REVIEW_PROMPT = `This is a spaced-review session, not a lesson. The student is answering a review card from memory, by hand. The card's question is given as the problem. Your goal is to find out how well they remember, so help less than usual:
 - Wait while they work. If they stall, at most ask_plan, point or name_concept. Each hint you give lowers the result.

@@ -5,7 +5,7 @@ This puts the tutor online so testers can sign up, give consent, and use it on t
 ## 1. Supabase: sign-in and database
 
 1. Create a project at [supabase.com](https://supabase.com) (the free plan is fine). Pick a region near your testers and save the database password somewhere safe.
-2. Create the tables. In the project, open **SQL Editor → New query**, paste the whole of `supabase/migrations/20261022000000_research_study.sql`, and press **Run**. (If you use the Supabase CLI instead: `supabase link` then `supabase db push`.)
+2. Create the tables. In the project, open **SQL Editor → New query**, paste the whole of `supabase/migrations/20261022000000_research_study.sql`, and press **Run**. Then do the same with `supabase/migrations/20261023000000_study_tools.sql` (quizzes, surveys, study arms, photo uploads). (If you use the Supabase CLI instead: `supabase link` then `supabase db push`.)
 3. Open **Project Settings → API keys** and copy three values for step 2:
    - the **Project URL**
    - the **anon / publishable** key
@@ -27,6 +27,9 @@ This puts the tutor online so testers can sign up, give consent, and use it on t
    | `ADMIN_EMAILS` | your email (and any co-researchers), comma-separated |
    | `STUDY_INVITE_CODE` | optional: a code testers must enter to join |
    | `DAILY_TUTOR_LIMIT` | optional: tutor turns per tester per day, default 800 (the tutor glances at the page after each pause in writing, so turns add up) |
+   | `STUDY_CONDITIONS` | optional: study arms to compare, e.g. `socratic,explain`. Each tester gets one at consent, filling the smallest arm first. `socratic` is the full tutor, `on_request` only looks and speaks when asked or spoken to, `explain` gives worked solutions directly like a typical AI helper. Leave empty and everyone gets the full tutor |
+   | `STUDY_PRETEST` | optional: `on` asks each tester an 8-question quiz before their first session |
+   | `STUDY_POSTTEST` | optional: `on` offers the parallel end-of-study quiz in each tester's menu. Turn it on when the study period ends |
    | `OPENAI_API_KEY` | runs the tutor on GPT-6 Luna if no Anthropic key is set (`OPENAI_TUTOR_MODEL` changes the model); also the natural tutor voice |
 
 3. Deploy. Copy the site address Vercel gives you (for example `https://study-tutor.vercel.app`).
@@ -44,14 +47,18 @@ This puts the tutor online so testers can sign up, give consent, and use it on t
 - **Join the study**: email, password and the invite code if you set one, then a confirmation email.
 - **Consent**: the study description, a few questions about their studies, and boxes for "I am 18 or older" and "I agree". The wording in `lib/study.ts` (`CONSENT_SECTIONS`) is a placeholder: replace it with your ethics board's approved text and change `CONSENT_VERSION`, and everyone is asked to consent again.
 - **The tutor**, with their page, review cards and mastery saved to their account, so they can switch devices.
-- **The participant-code menu**: send feedback, sign out, or delete their account and all their data.
+- **Quizzes** (if switched on): an 8-question calculus quiz before they start, and a parallel one at the end. The questions are in `lib/study-tests.ts`; replace them with your own validated items. Answers are scored on the server and each quiz can be taken once.
+- **After a session**: when they press Finish, the recap comes with three 1-5 ratings (how much it helped, how much they figured out themselves, how natural it felt) and an optional note. They can skip it.
+- **The participant-code menu**: send feedback, take the final quiz when it's open, sign out, or delete their account and all their data.
 
 ## What you get
 
 `/admin` (only for `ADMIN_EMAILS`) shows testers, activity and feedback, with two downloads:
 
-- **participants.csv**: one row per tester by participant code, with intake answers, sessions, tutor turns, cards, reviews, feedback count, token use and last activity.
-- **events.csv**: every logged event. Tutor turns include the move, what it said, the concept, slip or solved, whether it proposed a card, the review result, its private diagnosis, latency and tokens. Review grades, cards made, deck imports and feedback are logged too.
+The dashboard also compares study arms: testers, mean pre and post quiz scores, and mean "helped" rating per arm.
+
+- **participants.csv**: one row per tester by participant code, with intake answers, study arm, pre and post quiz scores, survey means, sessions, tutor turns, cards, reviews, feedback count, token use and last activity.
+- **events.csv**: every logged event. Tutor turns include the move, what it said, the concept, slip or solved, whether it proposed a card, the review result, its private diagnosis, latency and tokens. Review grades, cards made, deck imports, photo uploads, finished sessions, surveys, quiz answers (per item, with the skill it tests) and feedback are logged too.
 
 Neither file contains emails. The tutor's worked solution is never stored.
 

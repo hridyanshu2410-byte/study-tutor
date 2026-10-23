@@ -70,3 +70,39 @@ export function toCsv(rows: Record<string, unknown>[], columns: string[]): strin
   };
   return [columns.join(","), ...rows.map((r) => columns.map((c) => cell(r[c])).join(","))].join("\r\n") + "\r\n";
 }
+
+// Study arms. Each tester gets one at consent, set by the server so they
+// can't change it. STUDY_CONDITIONS lists the arms in use, e.g.
+// "socratic,explain"; with none set, everyone gets the full tutor.
+export const CONDITIONS = {
+  socratic: "The full tutor: watches as you write, hints before answers.",
+  on_request: "Same tutor, but it only looks and speaks when asked or spoken to.",
+  explain: "Explains worked solutions directly, like a typical AI helper.",
+} as const;
+export type Condition = keyof typeof CONDITIONS;
+
+export function studyConditions(): Condition[] {
+  return (process.env.STUDY_CONDITIONS ?? "")
+    .split(",")
+    .map((c) => c.trim())
+    .filter((c): c is Condition => c in CONDITIONS);
+}
+
+// Balanced assignment: the arm with the fewest testers so far, ties broken at random.
+export function pickCondition(arms: Condition[], counts: Partial<Record<string, number>>, random = Math.random): Condition | null {
+  if (!arms.length) return null;
+  const fewest = Math.min(...arms.map((a) => counts[a] ?? 0));
+  const open = arms.filter((a) => (counts[a] ?? 0) === fewest);
+  return open[Math.floor(random() * open.length)] ?? open[0];
+}
+
+export function conditionOf(value: unknown): Condition {
+  return typeof value === "string" && value in CONDITIONS ? (value as Condition) : "socratic";
+}
+
+// Pre and post quizzes are switched on separately, so the post quiz can open
+// at the end of the study period.
+export type TestPhase = "pre" | "post";
+export function testOpen(phase: TestPhase): boolean {
+  return (phase === "pre" ? process.env.STUDY_PRETEST : process.env.STUDY_POSTTEST)?.trim().toLowerCase() === "on";
+}

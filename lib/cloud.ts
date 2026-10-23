@@ -6,7 +6,17 @@
 
 import { browserClient } from "./supabase/client";
 
-export type Account = { userId: string; email: string; participantCode: string; admin: boolean };
+import type { Condition } from "./study";
+
+export type Account = {
+  userId: string;
+  email: string;
+  participantCode: string;
+  admin: boolean;
+  // The tester's study arm, and whether the end-of-study quiz is waiting for them.
+  condition: Condition;
+  postQuiz: boolean;
+};
 
 export type EventKind = "card_created" | "review_graded" | "review_started" | "deck_imported" | "feedback" | "session_finished" | "survey" | "test" | "photo_added";
 

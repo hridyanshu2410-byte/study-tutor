@@ -319,7 +319,7 @@ button.primary:hover { background: #2c3a5c; }
 .auth-form label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--quiet); }
 .auth-form label.check { flex-direction: row; align-items: flex-start; gap: 8px; font-size: 14px; color: var(--ink); }
 .auth-form label.check input { margin-top: 2px; width: 18px; height: 18px; }
-.auth-form input:not([type="checkbox"]), .auth-form select, .account-menu textarea {
+.auth-form input:not([type="checkbox"]):not([type="radio"]), .auth-form select, .account-menu textarea {
   font: inherit;
   font-size: 16px;
   padding: 10px 12px;
@@ -415,3 +415,17 @@ button.danger-solid { background: #b91c1c; color: #fff; }
 .summary-concepts .good { color: #15803d; }
 .summary-concepts .mixed { color: #b45309; }
 .summary-concepts .work { color: #b91c1c; }
+
+/* pre/post quiz */
+.quiz fieldset { margin: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; display: grid; gap: 6px; }
+.quiz legend { padding: 0 4px; font-size: 15px; font-weight: 600; color: var(--ink); }
+.quiz label.check.skip { color: var(--quiet); }
+
+/* post-session survey, inside the summary */
+.survey { margin: 4px 0 14px; padding-top: 12px; border-top: 1px solid var(--line); display: grid; gap: 10px; }
+.survey p { margin: 0; font-size: 13px; color: #374151; }
+.survey .scale { display: flex; gap: 6px; align-items: center; }
+.survey .scale span { font-size: 11px; color: #6b7280; }
+.survey .scale button { width: 34px; height: 30px; padding: 0; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.survey .scale button.on { background: var(--ink); color: #fff; border-color: var(--ink); }
+.survey textarea { font: inherit; font-size: 14px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; resize: vertical; }

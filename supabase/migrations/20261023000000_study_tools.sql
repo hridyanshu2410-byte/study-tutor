@@ -7,4 +7,8 @@ alter table public.events add constraint events_kind_check check (
   kind in ('tutor_turn', 'card_created', 'review_graded', 'deck_imported', 'feedback', 'review_started', 'session_finished', 'survey', 'test', 'photo_added')
 );
 
+-- Only the server (service role) writes these: testers keep update rights on
+-- their consent and intake columns alone.
 alter table public.profiles add column condition text;
+alter table public.profiles add column pretest_at timestamptz;
+alter table public.profiles add column posttest_at timestamptz;

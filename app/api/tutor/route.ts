@@ -5,8 +5,8 @@ import { firstBreak } from "@/lib/check";
 import { zodResponseFormat } from "openai/helpers/zod";
 import { adminClient, createClient } from "@/lib/supabase/server";
 import { researchMode } from "@/lib/supabase/env";
-import { dailyTutorLimit, startOfUtcDay } from "@/lib/study";
-import { allowedMoves, LADDER, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, tutorTurnSchema, type PublicTurn, type TutorRequest, type TutorTurn } from "@/lib/tutor";
+import { conditionOf, dailyTutorLimit, startOfUtcDay, type Condition } from "@/lib/study";
+import { allowedMoves, EXPLAIN_PROMPT, LADDER, MOVES, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, tutorTurnSchema, type PublicTurn, type TutorRequest, type TutorTurn } from "@/lib/tutor";
 
 // The tutor runs on Claude when ANTHROPIC_API_KEY is set, otherwise on OpenAI
 // (OPENAI_TUTOR_MODEL, default GPT-6 Luna). TUTOR_PROVIDER forces one.
@@ -114,12 +114,15 @@ export async function POST(req: Request) {
   // diagnosis), so the server counts and writes tutor turns with the service role.
   const supabase = researchMode ? adminClient() : null;
   let userId: string | null = null;
+  let condition: Condition = "socratic";
   if (supabase) {
     const {
       data: { user },
     } = await (await createClient()).auth.getUser();
     if (!user) return Response.json({ error: "Please sign in again." }, { status: 401 });
     userId = user.id;
+    const { data: profile } = await supabase.from("profiles").select("condition").eq("id", user.id).maybeSingle();
+    condition = conditionOf(profile?.condition);
     const { count } = await supabase
       .from("events")
       .select("id", { count: "exact", head: true })
@@ -134,6 +137,8 @@ export async function POST(req: Request) {
   }
 
   const body = (await req.json()) as TutorRequest;
+  // The "on request" arm never glances unasked; the browser shouldn't send these, but don't spend a model call if it does.
+  if (condition === "on_request" && body.trigger === "pause") return Response.json({ ...fallbackTurn(""), move: "wait" });
   const png = (url: string | undefined): Pic | undefined => {
     const m = /^data:(image\/png|image\/jpeg);base64,(.+)$/.exec(url ?? "");
     return m ? { type: m[1] as Pic["type"], data: m[2] } : undefined;
@@ -145,6 +150,7 @@ export async function POST(req: Request) {
   }
 
   const reviewing = body.mode === "review" && body.review != null;
+  const explaining = condition === "explain" && !reviewing;
   const reference = reviewing ? png(body.review?.answerImage ?? undefined) : undefined;
   const weakSpots = (body.weakSpots ?? []).slice(0, 5).map((w) => String(w).slice(0, 60));
 
@@ -194,8 +200,8 @@ export async function POST(req: Request) {
     // moves, say) counts as no reply, never as a crash.
     const ask = (extra = "") =>
       askTutor({
-        schema: tutorTurnSchema(allowedMoves(lastRung)),
-        system: reviewing ? `${TUTOR_SYSTEM_PROMPT}\n\n${REVIEW_PROMPT}` : TUTOR_SYSTEM_PROMPT,
+        schema: tutorTurnSchema(explaining ? MOVES : allowedMoves(lastRung)),
+        system: [TUTOR_SYSTEM_PROMPT, reviewing ? REVIEW_PROMPT : explaining ? EXPLAIN_PROMPT : ""].filter(Boolean).join("\n\n"),
         page,
         tokens,
         reference,
@@ -252,6 +258,8 @@ export async function POST(req: Request) {
         data: {
           ...record,
           mode: reviewing ? "review" : "study",
+          condition,
+          has_photo: Boolean(body.hasPhoto),
           problem: body.problem.slice(0, 500),
           lines: body.lines.length,
           annotations: turn.annotations.map((a) => a.kind),

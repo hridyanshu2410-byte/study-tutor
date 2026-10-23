@@ -60,6 +60,11 @@ export default function AccountMenu({ account, sessionId, onSignOut }: Props) {
                 <br />
                 Participant {account.participantCode}
               </p>
+              {account.postQuiz && (
+                <a role="menuitem" className="menu-link" href="/quiz/post">
+                  Take the final quiz
+                </a>
+              )}
               <button role="menuitem" onClick={() => setView("feedback")}>
                 Send feedback
               </button>

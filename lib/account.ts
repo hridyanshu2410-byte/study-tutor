@@ -7,6 +7,9 @@ export type Profile = {
   consent_version: string | null;
   consented_at: string | null;
   intake: Record<string, unknown>;
+  condition: string | null;
+  pretest_at: string | null;
+  posttest_at: string | null;
 };
 
 // The signed-in tester and their profile, or nulls when signed out.
@@ -18,7 +21,7 @@ export async function currentAccount() {
   if (!user) return { supabase, user: null, profile: null };
   const { data: profile } = await supabase
     .from("profiles")
-    .select("id, participant_code, consent_version, consented_at, intake")
+    .select("id, participant_code, consent_version, consented_at, intake, condition, pretest_at, posttest_at")
     .eq("id", user.id)
     .maybeSingle<Profile>();
   return { supabase, user, profile };

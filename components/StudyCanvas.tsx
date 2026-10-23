@@ -34,6 +34,7 @@ import {
 import type { Grade } from "ts-fsrs";
 import ReviewPanel from "./ReviewPanel";
 import AccountMenu from "./AccountMenu";
+import SessionSurvey from "./SessionSurvey";
 import { flushCloud, loadCloud, logEvent, saveCloud, type Account } from "@/lib/cloud";
 import { picturesFrom, type PageImage } from "@/lib/photo";
 
@@ -680,6 +681,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   // the next turn sees the page anyway.
   const schedulePause = () => {
     if (pauseTimer.current) clearTimeout(pauseTimer.current);
+    // In the "on request" study arm the tutor only answers when asked or spoken to.
+    if (account?.condition === "on_request") return;
     pauseTimer.current = setTimeout(() => {
       if (!changedSinceTutor.current || drawing.current) return;
       if (stateRef.current.tutorState === "speaking" || hearing.current) return schedulePause();
@@ -1255,6 +1258,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
               ))}
             </ul>
           )}
+          {account && <SessionSurvey key={summary.stats.startedAt} account={account} sessionId={sessionId.current} />}
           <div className="keep-actions">
             <button onClick={saveNotes}>Save notes</button>
             <button onClick={() => setSummary(null)}>Keep going</button>

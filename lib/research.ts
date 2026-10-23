@@ -8,7 +8,14 @@ export async function requireAdmin() {
   return user && isAdmin(user.email) ? adminClient() : null;
 }
 
-type Profile = { id: string; participant_code: string; consented_at: string | null; intake: Record<string, unknown>; created_at: string };
+type Profile = {
+  id: string;
+  participant_code: string;
+  consented_at: string | null;
+  intake: Record<string, unknown>;
+  condition: string | null;
+  created_at: string;
+};
 type EventRow = { id: number; user_id: string; session_id: string | null; kind: string; data: Record<string, unknown>; created_at: string };
 
 // Reads every row in pages, since PostgREST caps a single response.
@@ -24,7 +31,7 @@ async function all<T>(query: (from: number, to: number) => PromiseLike<{ data: T
 
 export async function loadStudy(db: ReturnType<typeof adminClient>) {
   const profiles = await all<Profile>((a, b) =>
-    db.from("profiles").select("id, participant_code, consented_at, intake, created_at").order("created_at").range(a, b),
+    db.from("profiles").select("id, participant_code, consented_at, intake, condition, created_at").order("created_at").range(a, b),
   );
   const events = await all<EventRow>((a, b) =>
     db.from("events").select("id, user_id, session_id, kind, data, created_at").order("id").range(a, b),
@@ -34,6 +41,12 @@ export async function loadStudy(db: ReturnType<typeof adminClient>) {
   const participants = profiles.map((p) => {
     const mine = events.filter((e) => e.user_id === p.id);
     const turns = mine.filter((e) => e.kind === "tutor_turn");
+    const quiz = (phase: string) => mine.find((e) => e.kind === "test" && e.data.phase === phase)?.data.score ?? "";
+    const surveys = mine.filter((e) => e.kind === "survey");
+    const mean = (key: string) => {
+      const xs = surveys.map((e) => Number(e.data[key])).filter((n) => n >= 1 && n <= 5);
+      return xs.length ? Math.round((xs.reduce((a, b) => a + b, 0) / xs.length) * 10) / 10 : "";
+    };
     return {
       participant: p.participant_code,
       joined: p.created_at,
@@ -41,6 +54,14 @@ export async function loadStudy(db: ReturnType<typeof adminClient>) {
       level: p.intake?.level ?? "",
       course: p.intake?.course ?? "",
       ai_use: p.intake?.aiUse ?? "",
+      condition: p.condition ?? "",
+      pre_score: quiz("pre"),
+      post_score: quiz("post"),
+      surveys: surveys.length,
+      helpful_mean: mean("helpful"),
+      ownership_mean: mean("ownership"),
+      natural_mean: mean("natural"),
+      sessions_finished: mine.filter((e) => e.kind === "session_finished").length,
       sessions: new Set(turns.map((e) => e.session_id)).size,
       tutor_turns: turns.length,
       spoken_turns: turns.filter((e) => e.data.move !== "wait").length,
