@@ -388,6 +388,191 @@ function steps(pen: Pen, fig: Extract<Figure, { kind: "steps" }>, x: number, y: 
   });
 }
 
+function roundBox(pen: Pen, b: Box, rng: Rng, speed = 1.8) {
+  const r = 6;
+  pen.draw(
+    [
+      [b.x + r, b.y + jitter(rng, 1)],
+      [b.x + b.w - r, b.y + jitter(rng, 1)],
+      [b.x + b.w, b.y + r],
+      [b.x + b.w + jitter(rng, 1), b.y + b.h - r],
+      [b.x + b.w - r, b.y + b.h],
+      [b.x + r, b.y + b.h + jitter(rng, 1)],
+      [b.x, b.y + b.h - r],
+      [b.x + jitter(rng, 1), b.y + r],
+      [b.x + r + 4, b.y - 1],
+    ],
+    speed,
+  );
+}
+
+// Where a line from a box's centre toward a point leaves the box.
+function boxExit(b: Box, toward: Pt): Pt {
+  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+  const dx = toward[0] - cx, dy = toward[1] - cy;
+  const k = Math.min(Math.abs((b.w / 2 + 6) / (dx || 1e-6)), Math.abs((b.h / 2 + 6) / (dy || 1e-6)));
+  return [cx + dx * k, cy + dy * k];
+}
+
+// Columns (or rows) by how far each node is from a starting node, so a
+// method's pipeline reads left to right. Back edges don't move a node.
+export function layers(ids: string[], edges: { from: string; to: string }[]): Map<string, number> {
+  const out = new Map<string, number>(ids.map((id) => [id, 0]));
+  const index = new Map(ids.map((id, i) => [id, i]));
+  const forward = edges.filter((e) => index.has(e.from) && index.has(e.to) && e.from !== e.to);
+  // Edges that point back to an earlier-listed node can be cycles; keep only those that
+  // aren't on a path back to themselves.
+  const reaches = (from: string, to: string, seen = new Set<string>()): boolean =>
+    from === to || (!seen.has(from) && (seen.add(from), forward.some((e) => e.from === from && reaches(e.to, to, seen))));
+  const dag = forward.filter((e) => !(index.get(e.to)! < index.get(e.from)! && reaches(e.to, e.from)));
+  for (let pass = 0; pass < ids.length; pass++) {
+    let changed = false;
+    for (const e of dag) {
+      const next = out.get(e.from)! + 1;
+      if (next > out.get(e.to)!) {
+        out.set(e.to, next);
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+  return out;
+}
+
+function diagram(pen: Pen, fig: Extract<Figure, { kind: "diagram" }>, x: number, y: number, size: number, rng: Rng) {
+  const ts = Math.max(14, size * 0.55);
+  const nodes = fig.nodes.slice(0, 12).map((n) => {
+    const lines = wrap(n.text, 16);
+    const w = Math.max(...lines.map((l) => measureText(l, ts))) * 1.08 + ts * 2;
+    const h = lines.length * ts * 1.55 + ts * 1.3;
+    return { ...n, lines, w, h, box: { x: 0, y: 0, w, h } as Box };
+  });
+  if (!nodes.length) return;
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const edges = fig.edges.filter((e) => byId.has(e.from) && byId.has(e.to)).slice(0, 16);
+  const layer = layers(nodes.map((n) => n.id), edges);
+  const count = Math.max(...layer.values()) + 1;
+  const cols = Array.from({ length: count }, (_, i) => nodes.filter((n) => layer.get(n.id) === i));
+  const ls = Math.max(12, size * 0.46);
+  const longest = Math.max(0, ...edges.map((e) => (e.label ? measureText(e.label, ls) : 0)));
+  // A long pipeline won't fit across the page; stack it downward instead.
+  const across = cols.reduce((sum, c) => sum + Math.max(...c.map((n) => n.w), 0), 0) + (cols.length - 1) * Math.max(size * 2.2, longest + size);
+  const right = fig.direction === "right" && across <= size * 22;
+  const gapMain = right ? Math.max(size * 2.2, longest + size) : Math.max(size * 1.8, ls * 2.4);
+  const gapCross = size * 1.1;
+  const grouped = nodes.some((n) => n.group);
+  const pad = grouped ? ts * 1.6 : 0;
+  // place each column (or row), centred on the widest one
+  const cross = cols.map((c) => c.reduce((s, n) => s + (right ? n.h : n.w), 0) + gapCross * Math.max(0, c.length - 1));
+  const span = Math.max(...cross);
+  let main = right ? x + pad : y + pad;
+  cols.forEach((col, i) => {
+    let at = (right ? y + pad : x + pad) + (span - cross[i]) / 2;
+    const thick = Math.max(...col.map((n) => (right ? n.w : n.h)), 0);
+    for (const n of col) {
+      n.box = right ? { x: main + (thick - n.w) / 2, y: at, w: n.w, h: n.h } : { x: at, y: main + (thick - n.h) / 2, w: n.w, h: n.h };
+      at += (right ? n.h : n.w) + gapCross;
+    }
+    main += thick + gapMain;
+  });
+  // groups first, as a light frame around their members
+  const groups = [...new Set(nodes.map((n) => n.group).filter((g): g is string => !!g))].slice(0, 4);
+  for (const g of groups) {
+    const members = nodes.filter((n) => n.group === g).map((n) => n.box);
+    const gx = Math.min(...members.map((b) => b.x)) - ts * 0.7, gy = Math.min(...members.map((b) => b.y)) - ts * 1.5;
+    const gb = { x: gx, y: gy, w: Math.max(...members.map((b) => b.x + b.w)) + ts * 0.7 - gx, h: Math.max(...members.map((b) => b.y + b.h)) + ts * 0.7 - gy };
+    pen.lift(120);
+    roundBox(pen, gb, rng, 2.4);
+    write(pen, g, gb.x + ts * 0.5, gb.y + ts * 1.05, ls, rng);
+  }
+  for (const n of nodes) {
+    pen.lift(120);
+    roundBox(pen, n.box, rng);
+    n.lines.forEach((l, i) => write(pen, l, n.box.x + ts, n.box.y + ts * 1.7 + i * ts * 1.55, ts, rng));
+  }
+  for (const e of edges) {
+    const A = byId.get(e.from)!.box, B = byId.get(e.to)!.box;
+    if (A === B) continue;
+    const ca: Pt = [A.x + A.w / 2, A.y + A.h / 2], cb: Pt = [B.x + B.w / 2, B.y + B.h / 2];
+    const p0 = boxExit(A, cb), p1 = boxExit(B, ca);
+    pen.lift(120);
+    arrow(pen, p0, p1, rng);
+    if (e.label) {
+      const mx = (p0[0] + p1[0]) / 2, my = (p0[1] + p1[1]) / 2;
+      write(pen, e.label, right ? mx - measureText(e.label, ls) / 2 : mx + 10, right ? my - 14 : my + ls * 0.4, ls, rng);
+    }
+  }
+}
+
+function bars(pen: Pen, fig: Extract<Figure, { kind: "bars" }>, x: number, y: number, size: number, rng: Rng) {
+  const items = fig.bars.slice(0, 8).filter((b) => Number.isFinite(b.value));
+  if (!items.length) return;
+  const ts = Math.max(14, size * 0.55);
+  let top = y;
+  if (fig.title) {
+    write(pen, fig.title, x, top + ts, ts * 1.05, rng);
+    top += ts * 2;
+  }
+  const labelW = Math.max(...items.map((b) => measureText(b.label, ts))) + ts;
+  const full = size * 9;
+  const lo = Math.min(0, ...items.map((b) => b.value)), hi = Math.max(...items.map((b) => b.value), 1e-9);
+  const scale = full / (hi - lo || 1);
+  const zero = x + labelW + -lo * scale;
+  const rowH = ts * 1.9;
+  items.forEach((b, i) => {
+    const cy = top + i * rowH + rowH / 2;
+    pen.lift(100);
+    write(pen, b.label, x, cy + ts * 0.35, ts, rng);
+    const end = zero + b.value * scale;
+    const h = rowH * 0.55;
+    const x0 = Math.min(zero, end), x1 = Math.max(zero, end);
+    pen.draw(
+      [
+        [x0, cy - h / 2],
+        [x1 + jitter(rng, 1), cy - h / 2],
+        [x1, cy + h / 2],
+        [x0, cy + h / 2 + jitter(rng, 1)],
+        [x0, cy - h / 2],
+      ],
+      2,
+    );
+    if (b.highlight) {
+      // quick hatching, the way you'd shade a bar by hand
+      const pts: Pt[] = [];
+      for (let hx = x0 + 6; hx < x1; hx += 9) pts.push([hx, cy + h / 2 - 2], [Math.min(x1, hx + 6), cy - h / 2 + 2]);
+      if (pts.length > 1) pen.draw(pts, 3);
+    }
+    write(pen, num(Math.round(b.value * 100) / 100), x1 + ts * 0.5, cy + ts * 0.35, ts * 0.9, rng);
+  });
+  // the zero line
+  pen.lift(100);
+  line(pen, [zero, top + 2], [zero, top + items.length * rowH - 2], rng);
+  if (fig.unit) write(pen, fig.unit, zero, top + items.length * rowH + ts * 1.2, ts * 0.85, rng);
+}
+
+function sketch(pen: Pen, fig: Extract<Figure, { kind: "sketch" }>, x: number, y: number, size: number, rng: Rng) {
+  const ts = Math.max(14, size * 0.52);
+  let top = y;
+  if (fig.title) {
+    write(pen, fig.title, x, top + ts, ts * 1.05, rng);
+    top += ts * 1.8;
+  }
+  const k = (size * 8) / 100;
+  const at = (p: number[]): Pt => [x + Math.min(100, Math.max(0, p[0] ?? 0)) * k, top + Math.min(100, Math.max(0, p[1] ?? 0)) * k];
+  for (const path of fig.paths.slice(0, 20)) {
+    const pts = path.points.slice(0, 60).filter((p) => p.length >= 2 && p.every(Number.isFinite)).map(at);
+    if (pts.length < 2) continue;
+    if (path.closed) pts.push(pts[0]);
+    pen.lift(110);
+    pen.draw(pts.map(([px, py]) => [px + jitter(rng, 0.6), py + jitter(rng, 0.6)] as Pt), 1.6);
+  }
+  for (const l of fig.labels.slice(0, 10)) {
+    const [lx, ly] = at([l.x, l.y]);
+    pen.lift(100);
+    write(pen, l.text.slice(0, 24), lx, ly, ts, rng);
+  }
+}
+
 export function drawFigure(pen: Pen, fig: Figure, x: number, y: number, size: number, rng: Rng) {
   if (fig.kind === "graph") graph(pen, fig, x, y, size, rng);
   else if (fig.kind === "number_line") numberLine(pen, fig, x, y, size, rng);
@@ -396,4 +581,7 @@ export function drawFigure(pen: Pen, fig: Figure, x: number, y: number, size: nu
   else if (fig.kind === "table") table(pen, fig, x, y, size, rng);
   else if (fig.kind === "forces") forces(pen, fig, x, y, size, rng);
   else if (fig.kind === "steps") steps(pen, fig, x, y, size, rng);
+  else if (fig.kind === "diagram") diagram(pen, fig, x, y, size, rng);
+  else if (fig.kind === "bars") bars(pen, fig, x, y, size, rng);
+  else if (fig.kind === "sketch") sketch(pen, fig, x, y, size, rng);
 }

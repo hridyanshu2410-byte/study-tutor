@@ -7,7 +7,7 @@ import { zodResponseFormat } from "openai/helpers/zod";
 import { adminClient, createClient } from "@/lib/supabase/server";
 import { researchMode } from "@/lib/supabase/env";
 import { conditionOf, dailyTutorLimit, startOfUtcDay, type Condition } from "@/lib/study";
-import { allowedMoves, EXPLAIN_PROMPT, LADDER, MOVES, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, tutorTurnSchema, type PublicTurn, type TutorRequest, type TutorTurn } from "@/lib/tutor";
+import { allowedMoves, EXPLAIN_PROMPT, LADDER, MOVES, PAPER_PROMPT, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, tutorTurnSchema, type PublicTurn, type TutorRequest, type TutorTurn } from "@/lib/tutor";
 
 // The tutor runs on Claude when ANTHROPIC_API_KEY is set, otherwise on OpenAI
 // (OPENAI_TUTOR_MODEL, default GPT-6 Luna). TUTOR_PROVIDER forces one.
@@ -23,7 +23,17 @@ const openai = provider === "openai" && process.env.OPENAI_API_KEY ? new OpenAI(
 
 // A page picture: PNG for plain ink, JPEG when a photo or PDF is under the ink.
 type Pic = { data: string; type: "image/png" | "image/jpeg" };
-type Ask = { schema: ReturnType<typeof tutorTurnSchema>; system: string; page: Pic; tokens: Pic; reference?: Pic; situation: string };
+type Ask = {
+  schema: ReturnType<typeof tutorTurnSchema>;
+  system: string;
+  page: Pic;
+  tokens: Pic;
+  reference?: Pic;
+  situation: string;
+  // A paper being read together. It goes first, after the system prompt, so the
+  // provider can cache it across turns.
+  paperText?: string;
+};
 type Answer = { turn: TutorTurn | null; usage: { input: number; output: number } };
 
 async function askTutor(a: Ask): Promise<Answer> {
@@ -37,7 +47,8 @@ async function askTutor(a: Ask): Promise<Answer> {
         {
           role: "user",
           content: [
-            { type: "text", text: "The student's page:" },
+            ...(a.paperText ? [{ type: "text" as const, text: `The paper:\n${a.paperText}` }] : []),
+            { type: "text", text: a.paperText ? "What is on the student's screen:" : "The student's page:" },
             png(a.page),
             { type: "text", text: "The same page with line ids and numbered tokens:" },
             png(a.tokens),
@@ -62,7 +73,8 @@ async function askTutor(a: Ask): Promise<Answer> {
       {
         role: "user",
         content: [
-          { type: "text", text: "The student's page:" },
+          ...(a.paperText ? [{ type: "text" as const, text: `The paper:\n${a.paperText}`, cache_control: { type: "ephemeral" as const } }] : []),
+          { type: "text", text: a.paperText ? "What is on the student's screen:" : "The student's page:" },
           { type: "image", source: { type: "base64", media_type: a.page.type, data: a.page.data } },
           { type: "text", text: "The same page with line ids and numbered tokens:" },
           { type: "image", source: { type: "base64", media_type: a.tokens.type, data: a.tokens.data } },
@@ -152,6 +164,16 @@ export async function POST(req: Request) {
 
   const reviewing = body.mode === "review" && body.review != null;
   const explaining = condition === "explain" && !reviewing;
+  const paper =
+    !reviewing && body.paper && typeof body.paper.text === "string" && body.paper.text.trim()
+      ? {
+          title: String(body.paper.title ?? "").slice(0, 300),
+          text: body.paper.text.slice(0, 160_000),
+          truncated: Boolean(body.paper.truncated) || body.paper.text.length > 160_000,
+          visible: (Array.isArray(body.paper.visiblePages) ? body.paper.visiblePages : []).filter(Number.isInteger).slice(0, 6),
+          pointedAt: typeof body.paper.pointedAt === "string" && /^p\d+\.s\d+$/.test(body.paper.pointedAt) ? body.paper.pointedAt : null,
+        }
+      : null;
   const reference = reviewing ? png(body.review?.answerImage ?? undefined) : undefined;
   const weakSpots = (body.weakSpots ?? []).slice(0, 5).map((w) => String(w).slice(0, 60));
 
@@ -174,6 +196,11 @@ export async function POST(req: Request) {
         (reference ? "\nThe reference answer is the ink in the last image." : "")
       : `Problem the student is working on: ${body.problem.trim() || "not stated; infer it from the page"}`,
     weakSpots.length ? `Concepts this student has slipped on before: ${weakSpots.join(", ")}` : "",
+    paper
+      ? `Reading the paper "${paper.title}". Pages on screen: ${paper.visible.join(", ") || "none (they are looking at the workspace)"}.` +
+        (paper.truncated ? " Parts of the paper were left out of the text for length; if asked about them, say so and ask the student to scroll there." : "") +
+        (paper.pointedAt ? ` The student is pointing at sentence ${paper.pointedAt} in the paper.` : "")
+      : "",
     `Lines on the page: ${body.lines.map((l) => `${l.id} (${l.tokens} tokens)`).join(", ") || "none yet"}`,
     body.hasPhoto
       ? "The page has a photo or PDF of printed material (a worksheet, textbook page or notes) under the student's ink. Line ids and token boxes cover only the student's handwriting. Read the printed problems from the image; if several are printed and the student hasn't said or shown which one, ask which they're on."
@@ -190,6 +217,8 @@ export async function POST(req: Request) {
           : "The student tapped to ask for your help."
         : body.trigger === "wrap_up"
           ? "The student is ending the session. Wrap up."
+          : body.trigger === "paper_opened"
+            ? "The student just opened this paper. In one or two sentences, say what it is about and why it matters. Draw a diagram of the big picture (what goes in, what the method does, what comes out; or how the argument is built), highlight the sentence that states the main contribution, and ask what they already know or where they'd like to start."
           : body.trigger === "watched"
             ? `The student just played the simulation and watched it. What happened: ${String(body.watched ?? "").slice(0, 600)}. Compare it with any prediction they marked or said, and ask them to explain the difference or why it happened.`
             : `The student just said: "${body.speech ?? ""}"`,
@@ -203,8 +232,9 @@ export async function POST(req: Request) {
     // moves, say) counts as no reply, never as a crash.
     const ask = (extra = "") =>
       askTutor({
-        schema: tutorTurnSchema(explaining ? MOVES : allowedMoves(lastRung)),
-        system: [TUTOR_SYSTEM_PROMPT, reviewing ? REVIEW_PROMPT : explaining ? EXPLAIN_PROMPT : ""].filter(Boolean).join("\n\n"),
+        schema: tutorTurnSchema(explaining || paper ? MOVES : allowedMoves(lastRung)),
+        system: [TUTOR_SYSTEM_PROMPT, reviewing ? REVIEW_PROMPT : paper ? PAPER_PROMPT : explaining ? EXPLAIN_PROMPT : ""].filter(Boolean).join("\n\n"),
+        paperText: paper?.text,
         page,
         tokens,
         reference,
@@ -241,7 +271,15 @@ export async function POST(req: Request) {
     else turn.review_result = null;
     turn.skill.concept = turn.skill.concept.slice(0, 60);
     turn.draw = turn.move === "wait" ? [] : turn.draw.slice(0, 2);
-    turn.write = turn.move === "wait" ? [] : turn.write.map((w) => w.trim().slice(0, 48)).filter(Boolean).slice(0, 4);
+    turn.write = turn.move === "wait" ? [] : turn.write.map((w) => w.trim().slice(0, paper ? 60 : 48)).filter(Boolean).slice(0, paper ? 6 : 4);
+    // Only passages that exist in the paper can be pointed at.
+    turn.highlights =
+      turn.move === "wait" || !paper
+        ? []
+        : (turn.highlights ?? [])
+            .filter((h) => /^p\d+\.s\d+$/.test(h.ref) && paper.text.includes(`[${h.ref}]`))
+            .slice(0, 3)
+            .map((h) => ({ ...h, note: h.note?.trim().slice(0, 40) || null }));
     turn.simulate = turn.move === "wait" || !turn.simulate ? null : sanitizeSim(turn.simulate);
     const record: PastTurn = {
       trigger: body.trigger,
@@ -264,6 +302,7 @@ export async function POST(req: Request) {
           mode: reviewing ? "review" : "study",
           condition,
           has_photo: Boolean(body.hasPhoto),
+          paper: paper?.title ?? null,
           problem: body.problem.slice(0, 500),
           lines: body.lines.length,
           annotations: turn.annotations.map((a) => a.kind),
@@ -288,6 +327,7 @@ export async function POST(req: Request) {
       say: turn.say,
       write: turn.write,
       draw: turn.draw,
+      highlights: turn.highlights,
       simulate: turn.simulate,
       annotations: turn.annotations,
       skill: turn.skill,
@@ -320,12 +360,16 @@ export async function POST(req: Request) {
 }
 
 function fallbackTurn(say: string): PublicTurn {
-  return { move: "ask_plan", say, write: [], draw: [], simulate: null, annotations: [], skill: { concept: "", evidence: "none" }, card: null, review_result: null };
+  return { move: "ask_plan", say, write: [], draw: [], highlights: [], simulate: null, annotations: [], skill: { concept: "", evidence: "none" }, card: null, review_result: null };
 }
 
 function describeInk(turn: TutorTurn): string {
   const wrote = turn.write.length ? `wrote below the work: ${turn.write.map((w) => `"${w}"`).join(", ")}` : "";
-  const drew = [...turn.draw.map(describeFigure), ...(turn.simulate ? [`set up a ${describeSim(turn.simulate)}`] : [])].join(", ");
+  const drew = [
+    ...turn.draw.map(describeFigure),
+    ...(turn.simulate ? [`set up a ${describeSim(turn.simulate)}`] : []),
+    ...(turn.highlights ?? []).map((h) => `${h.kind}ed ${h.ref}${h.note ? ` with margin note "${h.note}"` : ""}`),
+  ].join(", ");
   if (!turn.annotations.length) return [wrote, drew].filter(Boolean).join(", ") || "none";
   return [wrote, drew, ...turn.annotations
     .map((a) => {
@@ -343,6 +387,10 @@ function describeFigure(f: TutorTurn["draw"][number]): string {
   if (f.kind === "flow") return `drew a flow: ${f.nodes.map((n) => n.text).join(" → ")}`;
   if (f.kind === "table") return `drew a table: ${f.rows.map((r) => r.join(" | ")).join(" / ")}`;
   if (f.kind === "forces") return `drew a force diagram: ${f.forces.map((x) => x.label).join(", ")}`;
+  if (f.kind === "diagram")
+    return `drew a diagram: ${f.nodes.map((n) => n.text).join(", ")}; arrows ${f.edges.map((e) => `${e.from}→${e.to}`).join(", ")}`;
+  if (f.kind === "bars") return `drew a bar chart${f.title ? ` "${f.title}"` : ""}: ${f.bars.map((b) => `${b.label} ${b.value}`).join(", ")}`;
+  if (f.kind === "sketch") return `sketched ${f.title ?? "a drawing"}${f.labels.length ? ` labelled ${f.labels.map((l) => l.text).join(", ")}` : ""}`;
   return `wrote steps: ${f.lines.map((l) => l.math).join(" ; ")}`;
 }
 

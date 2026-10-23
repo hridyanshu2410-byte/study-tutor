@@ -71,5 +71,37 @@ const Steps = z.object({
     .describe("Equation lines, written one under another and lined up on the equals sign."),
 });
 
-export const FigureSchema = z.union([Graph, NumberLine, Shape, Flow, Table, Forces, Steps]);
+const Diagram = z.object({
+  kind: z.literal("diagram"),
+  direction: z.enum(["right", "down"]).describe("Which way the main flow runs."),
+  nodes: z
+    .array(z.object({ id: z.string(), text: z.string().describe("A few words."), group: label.describe("Nodes with the same group are boxed together under that name, such as \"Encoder\".") }))
+    .describe("Up to twelve parts: the components of a method, model, system or argument."),
+  edges: z.array(z.object({ from: z.string(), to: z.string(), label })).describe("Arrows between node ids, such as data flowing or one idea leading to another."),
+});
+
+const Bars = z.object({
+  kind: z.literal("bars"),
+  title: label,
+  unit: label.describe("Such as \"% accuracy\" or \"BLEU\"."),
+  bars: z
+    .array(z.object({ label: z.string(), value: z.number(), highlight: z.boolean().describe("Shade this bar, such as the paper's own method.") }))
+    .describe("Up to eight numbers to compare, such as results from a table in the paper."),
+});
+
+const Sketch = z.object({
+  kind: z.literal("sketch"),
+  title: label,
+  paths: z
+    .array(
+      z.object({
+        points: z.array(z.array(z.number())).describe("[x, y] pairs on a 100 by 100 grid, y down. Five to forty points per path."),
+        closed: z.boolean(),
+      }),
+    )
+    .describe("A simple line drawing, the kind a person doodles to explain: a cell, a neuron, a robot arm, a molecule, a setup. Up to twenty paths."),
+  labels: z.array(z.object({ x: z.number(), y: z.number(), text: z.string() })).describe("Short labels on the same grid."),
+});
+
+export const FigureSchema = z.union([Graph, NumberLine, Shape, Flow, Table, Forces, Steps, Diagram, Bars, Sketch]);
 export type Figure = z.infer<typeof FigureSchema>;

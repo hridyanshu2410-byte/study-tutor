@@ -30,6 +30,15 @@ export const tutorTurnSchema = (moves: readonly Move[] = MOVES) => z.object({
   draw: z
     .array(FigureSchema)
     .describe("Figures you sketch on the page as you talk: a graph, number line, shape, flow diagram, table, force diagram or aligned equation steps. Usually none; at most two."),
+  highlights: z
+    .array(
+      z.object({
+        ref: z.string().describe("A sentence id from the paper, such as p3.s12."),
+        kind: z.enum(["highlight", "underline"]),
+        note: z.string().nullable().describe("A few words you write in the margin beside it, joined to it by an arrow. Null for none."),
+      }),
+    )
+    .describe("Paper mode only: passages you point at in the paper as you talk about them, at most three. Empty otherwise."),
   simulate: SimSchema.nullable().describe(
     "A physics simulation to set up on the page for predict, then watch: a projectile or a pendulum. The student marks a prediction, then taps play. Null on almost every turn.",
   ),
@@ -70,7 +79,7 @@ export const tutorTurnSchema = (moves: readonly Move[] = MOVES) => z.object({
 
 export const TutorTurnSchema = tutorTurnSchema();
 export type TutorTurn = z.infer<typeof TutorTurnSchema>;
-export type PublicTurn = Pick<TutorTurn, "move" | "say" | "write" | "draw" | "simulate" | "annotations" | "skill" | "card" | "review_result">;
+export type PublicTurn = Pick<TutorTurn, "move" | "say" | "write" | "draw" | "highlights" | "simulate" | "annotations" | "skill" | "card" | "review_result">;
 
 // Moves allowed this turn: anything off the ladder, any rung at or below the
 // last one used, and the next rung up. Never two rungs at once.
@@ -92,7 +101,10 @@ export type TutorRequest = {
   review: ReviewContext | null;
   weakSpots: string[];
   problem: string;
-  trigger: "pause" | "asked" | "spoke" | "wrap_up" | "watched";
+  trigger: "pause" | "asked" | "spoke" | "wrap_up" | "watched" | "paper_opened";
+  // Reading a research paper together: its text with sentence ids, and which pages are on screen.
+  // `pointedAt` is a sentence they double-tapped in the paper.
+  paper?: { title: string; text: string; truncated: boolean; visiblePages: number[]; pointedAt?: string | null } | null;
   // After the student plays a simulation: what happened, in words.
   watched?: string | null;
   // Where the student pointed (double-tapped) just before asking, if they did.
@@ -175,6 +187,27 @@ Read the student's lines carefully from the first image; use the second only to 
 // The "explain" study arm: a comparison condition that behaves like a typical
 // AI helper, explaining worked solutions directly instead of hinting.
 export const EXPLAIN_PROMPT = `Study condition: direct explanation. This overrides the hint ladder and the rule against giving answers. When the student asks for help, is stuck, or has made an error, explain the full worked solution clearly, step by step: say the reasoning aloud and write every step as a steps figure (or in write). Give the final answer. You may still use wait while the student is working and hasn't asked for anything, and affirm correct work.`;
+
+// Reading a research paper together. It replaces the homework rules: the
+// goal is understanding someone else's work, so explaining is fine, but the
+// student should still do much of the thinking.
+export const PAPER_PROMPT = `Paper mode. The student has opened a research paper to understand it with you. This replaces the problem-solving rules above (the hint ladder, holding back answers, "a page with only the problem is not an attempt"); keep the voice, the brevity and the drawing.
+
+What you have:
+- The paper's text, every sentence tagged with an id like [p3.s12]. Treat it as the source of truth. If the paper doesn't say something, say so; never invent results, numbers or claims.
+- A picture of what is on the student's screen right now: the paper pages on the left, and a shared workspace to the right where you both write. Their ink is dark blue; your earlier ink is orange. You are told which pages are visible, and they are usually reading those.
+
+How you study together, like two people with one copy of a paper and a big sheet of paper beside it:
+- Talk about what is on screen unless they ask about something else. If they point at a sentence (double-tap), what they say or ask is about that sentence; highlight it as you answer. When you mention a passage, point at it with highlights (its sentence id), and add a short margin note when it helps, such as "the key idea" or "= the loss they minimise".
+- Explain by drawing, nearly every time you explain something. Pick the picture that fits: a diagram for the method, model architecture, pipeline or how the parts of an argument connect (group parts into boxes like "Encoder"); bars for the results they report; a table to compare methods or conditions; a graph for a relationship or a trend; steps to unpack an equation one term at a time; a sketch for a physical setup, a biological structure or an intuition. One figure per turn, kept small and labelled with the paper's own terms.
+- Write the key equations and definitions you mention in write, so the workspace builds into notes you made together.
+- Make them think, not just listen: before explaining a section, ask what they think it's doing or why the authors did it; ask them to predict a result before showing it; invite them to sketch their own version ("draw how you think the data flows, and I'll add to it"), then build on their drawing rather than replacing it. Once they get something, ask them to say it back in their own words.
+- When they write or draw in the workspace, look at it: affirm what's right, gently correct what isn't (point at it), and extend it.
+- Bridge to what they know: an analogy or a tiny example, then back to the paper.
+- If they're quietly reading or writing and haven't asked anything, choose wait.
+- Moves in this mode: wait; ask_plan (ask their read or a prediction); point; name_concept (name the idea or technique, briefly); simpler_example (an analogy or toy example); next_step (explain one piece); worked_solution (a full explanation of a part they asked about); check_understanding (they explain it back); affirm.
+- Keep what you say under 40 words; let the drawing carry the detail.
+- Cards: when they've understood a key idea, add a card that asks them to explain or sketch it from memory.`;
 
 export const REVIEW_PROMPT = `This is a spaced-review session, not a lesson. The student is answering a review card from memory, by hand. The card's question is given as the problem. Your goal is to find out how well they remember, so help less than usual:
 - Wait while they work. If they stall, at most ask_plan, point or name_concept. Each hint you give lowers the result.

@@ -22,6 +22,7 @@ test("a turn outside the allowed moves is rejected", () => {
     say: "Try 2y + 3 = 7 first.",
     write: ["Try: 2y + 3 = 7"],
     draw: [],
+    highlights: [],
     simulate: null,
     annotations: [],
     skill: { concept: "", evidence: "none" },
@@ -39,6 +40,7 @@ test("a simulation is part of a turn", () => {
     say: "Before you play it, where do you think it lands?",
     write: [],
     draw: [],
+    highlights: [],
     simulate: { kind: "projectile", height_m: 0, launches: [{ speed_ms: 15, angle_deg: 30, label: null }, { speed_ms: 15, angle_deg: 60, label: null }], g: null },
     annotations: [],
     skill: { concept: "projectile range", evidence: "none" },
@@ -47,4 +49,21 @@ test("a simulation is part of a turn", () => {
   };
   assert.equal(tutorTurnSchema().safeParse(turn).success, true);
   assert.equal(tutorTurnSchema().safeParse({ ...turn, simulate: { kind: "rocket" } }).success, false);
+});
+
+test("paper turns can point at sentences and draw diagrams", () => {
+  const turn = {
+    private: { reading: [], first_error_line: null, diagnosis: "", solution_sketch: "" },
+    move: "name_concept",
+    say: "Here's the big picture.",
+    write: [],
+    draw: [{ kind: "diagram", direction: "right", nodes: [{ id: "a", text: "tokens", group: null }, { id: "b", text: "clusters", group: "routing" }], edges: [{ from: "a", to: "b", label: null }] }],
+    highlights: [{ ref: "p1.s3", kind: "highlight", note: "the key idea" }],
+    simulate: null,
+    annotations: [],
+    skill: { concept: "sparse attention", evidence: "none" },
+    card: null,
+    review_result: null,
+  };
+  assert.equal(tutorTurnSchema().safeParse(turn).success, true);
 });

@@ -65,5 +65,6 @@ Neither file contains emails. The tutor's worked solution is never stored.
 ## Costs and limits
 
 - Each tutor turn sends two page images to Claude. The daily cap per tester (`DAILY_TUTOR_LIMIT`) bounds your Anthropic bill; the token columns in participants.csv show actual use.
+- In paper mode each turn also sends the paper's text (up to about 120k characters, roughly 30k tokens). It goes first in the request so the provider caches it: Claude via `cache_control`, OpenAI automatically. Cached input is billed at a fraction of the normal rate, but a long reading session still costs several times a homework session, so watch the token columns if testers use it a lot.
 - Supabase and Vercel free tiers comfortably cover a pilot of a few dozen testers.
 - Testers must be 18 or older for now. Studying with under-18s needs parental consent (and COPPA compliance for under-13s), which this version doesn't handle.

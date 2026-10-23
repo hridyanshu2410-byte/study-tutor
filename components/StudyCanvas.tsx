@@ -7,6 +7,7 @@ import {
   groupLines,
   screenToWorld,
   strokesInLasso,
+  unionBox,
   zoomAt,
   type Camera,
   type InkLine,
@@ -38,6 +39,9 @@ import SessionSurvey from "./SessionSurvey";
 import { flushCloud, loadCloud, logEvent, saveCloud, type Account } from "@/lib/cloud";
 import { picturesFrom, type PageImage } from "@/lib/photo";
 import { drawSim, playButton, runSeconds, SIM_H, SIM_W, simResult, type PageSim } from "@/lib/sims";
+import { findSentence, paperDigest, type Paper } from "@/lib/paper";
+import { openPaper } from "@/lib/paper-pdf";
+import { deletePaper, loadPaper, savePaper } from "@/lib/paper-store";
 
 type Tool = "pen" | "eraser" | "hand" | "keep";
 type Mode = "study" | "review";
@@ -50,8 +54,17 @@ type TutorState = "idle" | "thinking" | "speaking";
 // One turn's worth of tutor pen strokes. `born` is when the pen started, in
 // performance.now() time; 0 means already fully written (e.g. restored), and
 // Infinity means waiting to start with the voice.
-type TutorInk = { id: string; plan: PenPlan; born: number };
-type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string; images?: PageImage[]; sims?: PageSim[] };
+// `marks` are passages it highlighted in a paper, shown as the pen starts.
+type TutorInk = { id: string; plan: PenPlan; born: number; marks?: Box[]; rules?: Box[] };
+// Which paper is open and where its pages start; the paper itself lives in IndexedDB.
+type PaperRef = { id: string; title: string; x: number; y: number; w: number };
+type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string; images?: PageImage[]; sims?: PageSim[]; paper?: PaperRef | null };
+// An open paper: its pages laid out in a column on the page.
+type OpenPaper = { ref: PaperRef; data: Paper; pages: PageImage[]; digest: { text: string; truncated: boolean } };
+const PAPER_W = 700;
+const PAPER_GAP = 28;
+// Reading a paper, the tutor waits longer before glancing at new writing.
+const PAPER_WATCH_MS = 3500;
 
 // What happened this session, for the wrap-up summary.
 type SessionStats = { startedAt: number; turns: number; concepts: Record<string, { slips: number; solved: number }>; cards: string[] };
@@ -80,6 +93,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const sims = useRef<PageSim[]>([]);
   const simRuns = useRef(new Map<string, number>());
   const tutorFont = useRef("cursive");
+  const paper = useRef<OpenPaper | null>(null);
   const camera = useRef<Camera>({ x: -40, y: -40, z: 1 });
   const glide = useRef<{ from: Camera; to: Camera; start: number } | null>(null);
   const drawing = useRef<{ stroke: Stroke; pointerId: number; simulate: boolean } | null>(null);
@@ -119,6 +133,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const [toast, setToast] = useState<string | null>(null);
   const [summary, setSummary] = useState<{ recap: string; stats: SessionStats } | null>(null);
   const [hasPhoto, setHasPhoto] = useState(false);
+  const [paperTitle, setPaperTitle] = useState<string | null>(null);
+  const [opening, setOpening] = useState<string | null>(null);
+  const paperInput = useRef<HTMLInputElement>(null);
   const [importing, setImporting] = useState(false);
   const photoInput = useRef<HTMLInputElement>(null);
   const { memory, memoryRef, update: updateMemory, storageFull, loaded } = useStudyMemory(account);
@@ -183,6 +200,13 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     setImages(saved?.images ?? []);
     sims.current = saved?.sims ?? [];
     simRuns.current.clear();
+    setPaper(null);
+    const ref = saved?.paper;
+    if (ref)
+      loadPaper(ref.id).then((data) => {
+        if (data) setPaper(layoutPaper(data, ref));
+        else setCaption(`Open "${ref.title}" again with Study a paper to keep reading it here.`);
+      });
     paths.current.clear();
     tutorPaths.current.clear();
     setProblem(saved?.problem ?? "");
@@ -213,7 +237,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   const save = useCallback(() => {
     if (stateRef.current.mode === "review") return;
-    const page: SavedPage = { strokes: strokes.current, tutorInk: tutorInk.current, problem: stateRef.current.problem, images: images.current, sims: sims.current };
+    const page: SavedPage = { strokes: strokes.current, tutorInk: tutorInk.current, problem: stateRef.current.problem, images: images.current, sims: sims.current, paper: paper.current?.ref ?? null };
     if (account) saveCloud(account.userId, "page", page);
     try {
       localStorage.setItem(pageKey, JSON.stringify(page));
@@ -221,6 +245,43 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       // Storage is a convenience; the page keeps working without it.
     }
   }, [account, pageKey]);
+
+  const layoutPaper = (data: Paper, ref: PaperRef): OpenPaper => {
+    let y = ref.y;
+    const pages = data.pages.map((p) => {
+      const h = (ref.w * p.h) / p.w;
+      const img: PageImage = { id: `paper:${data.id}:${p.n}`, src: p.src, x: ref.x, y, w: ref.w, h };
+      y += h + PAPER_GAP;
+      return img;
+    });
+    return { ref, data, pages, digest: paperDigest(data) };
+  };
+  const setPaper = (next: OpenPaper | null) => {
+    paper.current = next;
+    setPaperTitle(next?.ref.title ?? null);
+    dirty.current = true;
+  };
+  // The paper's page boxes on the page, by page number.
+  const paperPage = (n: number) => {
+    const p = paper.current;
+    const i = p ? p.data.pages.findIndex((pg) => pg.n === n) : -1;
+    return p && i >= 0 ? p.pages[i] : null;
+  };
+  // What part of the page is on screen, in page coordinates.
+  const viewBox = (): Box => {
+    const c = canvasRef.current, cam = camera.current;
+    return { x: cam.x, y: cam.y, w: (c?.clientWidth ?? 1200) / cam.z, h: (c?.clientHeight ?? 800) / cam.z };
+  };
+  const visiblePages = (): number[] => {
+    const p = paper.current, v = viewBox();
+    if (!p) return [];
+    return p.data.pages
+      .filter((_, i) => {
+        const b = p.pages[i];
+        return b.y < v.y + v.h - 80 / camera.current.z && b.y + b.h > v.y + 60 / camera.current.z && b.x < v.x + v.w && b.x + b.w > v.x;
+      })
+      .map((pg) => pg.n);
+  };
 
   const setImages = (next: PageImage[]) => {
     images.current = next;
@@ -304,6 +365,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       drawPaper(ctx, cam, w, h);
 
       ctx.setTransform(dpr * cam.z, 0, 0, dpr * cam.z, -cam.x * cam.z * dpr, -cam.y * cam.z * dpr);
+      for (const img of paper.current?.pages ?? []) drawPicture(ctx, img, pictureFor(img), cam.z);
       for (const img of images.current) drawPicture(ctx, img, pictureFor(img), cam.z);
       for (const sim of sims.current) {
         const start = simRuns.current.get(sim.id);
@@ -362,7 +424,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       }
       if (pauseTimer.current) clearTimeout(pauseTimer.current);
       const lines = groupLines(strokes.current);
-      if (!lines.length && !speech && !watched && !stateRef.current.problem.trim() && !images.current.length) return;
+      if (!lines.length && !speech && !watched && !stateRef.current.problem.trim() && !images.current.length && !paper.current) return;
       if (trigger !== "pause") stopSpeaking();
 
       const abort = new AbortController();
@@ -395,8 +457,22 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
             idleSeconds: lastPenAt.current ? (Date.now() - lastPenAt.current) / 1000 : undefined,
             focus: trigger === "pause" ? null : focusOn(lines),
             hasPhoto: images.current.length > 0,
+            paper: paper.current
+              ? {
+                  title: paper.current.ref.title,
+                  text: paper.current.digest.text,
+                  truncated: paper.current.digest.truncated,
+                  visiblePages: visiblePages(),
+                  pointedAt: trigger === "pause" ? null : sentenceAt(),
+                }
+              : null,
             lines: lines.map((l) => ({ id: l.id, tokens: l.tokens.length })),
-            ...renderPageImages(strokes.current, lines, loadedPictures()),
+            ...(paper.current
+              ? {
+                  pageImage: renderViewImage(viewBox(), [...(paper.current.pages ?? []), ...images.current], pictureFor, strokes.current, tutorInk.current),
+                  tokenImage: renderPageImages(strokes.current, lines).tokenImage,
+                }
+              : renderPageImages(strokes.current, lines, loadedPictures())),
           } satisfies TutorRequest),
         });
         const data = await res.json();
@@ -424,6 +500,26 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
+
+  // The paper sentence the student double-tapped, if they did so recently.
+  const sentenceAt = (): string | null => {
+    const f = focus.current, p = paper.current;
+    if (!f || !p || Date.now() - f.at > FOCUS_MS) return null;
+    const [x, y] = f.world;
+    let best: { id: string; d: number } | null = null;
+    p.data.pages.forEach((pg, i) => {
+      const at = p.pages[i];
+      if (x < at.x || x > at.x + at.w || y < at.y || y > at.y + at.h) return;
+      const u = (x - at.x) / at.w, v = (y - at.y) / at.h;
+      for (const sn of pg.sentences)
+        for (const b of sn.boxes) {
+          const d = Math.max(0, b.x - u, u - (b.x + b.w)) + Math.max(0, b.y - v, v - (b.y + b.h)) * 2;
+          if (!best || d < best.d) best = { id: sn.id, d };
+        }
+    });
+    const found = best as { id: string; d: number } | null;
+    return found && found.d < 0.02 ? found.id : null;
+  };
 
   // The line and token the student pointed at, if they did so recently.
   const focusOn = (lines: InkLine[]): TutorRequest["focus"] => {
@@ -458,24 +554,44 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     }
     const write = turn.write ?? [];
     const figures = turn.draw ?? [];
-    if (turn.move === "wait" || (!turn.say && !turn.annotations.length && !write.length && !figures.length && !turn.simulate)) {
+    // Passages it points at in the paper, in page coordinates.
+    const marks = (turn.highlights ?? []).flatMap((h) => {
+      const found = paper.current ? findSentence(paper.current.data, h.ref) : null;
+      const at = found ? paperPage(found.page.n) : null;
+      if (!found || !at) return [];
+      const boxes = found.sentence.boxes.map((b) => ({ x: at.x + b.x * at.w - 2, y: at.y + b.y * at.h - 1, w: b.w * at.w + 4, h: b.h * at.h + 2 }));
+      return boxes.length ? [{ boxes, kind: h.kind, note: h.note, edge: at.x + at.w }] : [];
+    });
+    if (turn.move === "wait" || (!turn.say && !turn.annotations.length && !write.length && !figures.length && !turn.simulate && !marks.length)) {
       settle();
       return;
     }
     // The pen starts when the voice does, so the math appears as it is said.
     let ink: TutorInk | null = null;
-    if (turn.annotations.length || write.length || figures.length) {
+    if (turn.annotations.length || write.length || figures.length || marks.length) {
       const cam = camera.current;
+      const p = paper.current;
       const plan = planAnnotations(turn.annotations, lines, Math.floor(Math.random() * 2 ** 31), {
         write,
         figures,
         avoid: tutorInk.current.map((t) => t.plan.box).filter((b): b is Box => b != null),
         origin: { x: cam.x, y: cam.y + 60 / cam.z },
+        column: p ? { x: p.ref.x + p.ref.w + 70, top: Math.max(p.ref.y, cam.y + 80 / cam.z) } : undefined,
+        marks,
+        size: p ? 19 : undefined,
       });
-      if (plan.strokes.length) {
-        ink = { id: crypto.randomUUID(), plan, born: Infinity };
+      const rects = marks.filter((m) => m.kind === "highlight").flatMap((m) => m.boxes);
+      // Paper lines sit close together, so an underline is a neat rule just under the baseline (boxes run to 1.2× the font height).
+      const rules = marks.filter((m) => m.kind === "underline").flatMap((m) => m.boxes.map((b) => ({ x: b.x, y: b.y + (b.h - 2) / 1.2 + 2, w: b.w, h: 1.6 })));
+      if (plan.strokes.length || rects.length || rules.length) {
+        ink = { id: crypto.randomUUID(), plan, born: Infinity, marks: rects, rules };
         tutorInk.current.push(ink);
-        if (plan.box) reveal(plan.box);
+        // Keep the passage it points at and what it writes on screen together.
+        const passage = marks[0]?.boxes.reduce(unionBox);
+        const both = passage && plan.box ? unionBox(passage, plan.box) : (passage ?? plan.box);
+        const roomy = both && both.h < viewBox().h - 200 / camera.current.z;
+        const target = roomy ? both : (passage ?? plan.box);
+        if (target) reveal(target);
       }
     }
     if (turn.simulate) placeSim(turn.simulate, lines);
@@ -556,6 +672,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     strokes.current = [];
     tutorInk.current = [];
     setImages([]);
+    setPaper(null);
     sims.current = [];
     simRuns.current.clear();
     paths.current.clear();
@@ -737,7 +854,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       if (!changedSinceTutor.current || drawing.current) return;
       if (stateRef.current.tutorState === "speaking" || hearing.current) return schedulePause();
       askTutor("pause");
-    }, WATCH_MS);
+    }, paper.current ? PAPER_WATCH_MS : WATCH_MS);
   };
 
   // ---------- input ----------
@@ -1081,6 +1198,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     strokes.current = [];
     tutorInk.current = [];
     setImages([]);
+    setPaper(null);
     sims.current = [];
     simRuns.current.clear();
     paths.current.clear();
@@ -1133,6 +1251,62 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const removePhotos = () => {
     if (!images.current.length || !confirm("Take the photo off the page? Your writing stays.")) return;
     setImages([]);
+    save();
+  };
+
+  // Study a paper: its pages go down the left, the workspace is to the right,
+  // and the tutor opens with the big picture.
+  const studyPaper = async (file: File) => {
+    const busyPage = strokes.current.length || tutorInk.current.length || images.current.length || paper.current;
+    if (busyPage && !confirm("Start a fresh page for this paper? Your current page will be cleared.")) return;
+    setError(null);
+    setOpening("Reading the paper…");
+    try {
+      const data = await openPaper(file, (done, total) => setOpening(`Reading page ${Math.min(done + 1, total)} of ${total}…`));
+      if (!data.pages.some((p) => p.sentences.length))
+        throw new Error("That PDF has no text layer (it may be a scan), so I can't read it. Try the publisher's or arXiv's PDF.");
+      await savePaper(data).catch(() => flash("This paper is too big to keep on this device; it'll need reopening next time."));
+      if (paper.current) deletePaper(paper.current.ref.id);
+      hush();
+      strokes.current = [];
+      tutorInk.current = [];
+      paths.current.clear();
+      tutorPaths.current.clear();
+      undoStack.current = [];
+      sims.current = [];
+      simRuns.current.clear();
+      setImages([]);
+      sessionId.current = crypto.randomUUID();
+      stats.current = newStats();
+      setPaper(layoutPaper(data, { id: data.id, title: data.title, x: 0, y: 0, w: PAPER_W }));
+      setProblem(data.title);
+      stateRef.current.problem = data.title;
+      const c = canvasRef.current;
+      const z = c ? Math.min(1, Math.max(0.45, c.clientWidth / (PAPER_W + 70 + 620 + 60))) : 1;
+      camera.current = { x: -30 / z, y: -70 / z, z };
+      dirty.current = true;
+      save();
+      logEvent(account, "paper_opened", { pages: data.pages.length, page_count: data.pageCount, sentences: data.pages.reduce((n, p) => n + p.sentences.length, 0) }, sessionId.current);
+      setCaption(`Got "${data.title}". Give me a second to read it…`);
+      // The tutor's first look should see the pages, not blank paper.
+      await Promise.all(
+        (paper.current?.pages ?? []).slice(0, 2).map((img) => {
+          pictureFor(img);
+          return imageEls.current.get(img.id)?.decode().catch(() => undefined);
+        }),
+      );
+      askTutor("paper_opened");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "That paper couldn't be opened.");
+    } finally {
+      setOpening(null);
+    }
+  };
+
+  const closePaper = () => {
+    if (!paper.current || !confirm("Close the paper? Your notes and the tutor's drawings stay on the page.")) return;
+    deletePaper(paper.current.ref.id);
+    setPaper(null);
     save();
   };
 
@@ -1223,6 +1397,26 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
                 {importing ? "Opening…" : "Add photo"}
               </button>
               {hasPhoto && <button onClick={removePhotos}>Remove photo</button>}
+              {paperTitle ? (
+                <button onClick={closePaper} title={paperTitle}>
+                  Close paper
+                </button>
+              ) : (
+                <button onClick={() => paperInput.current?.click()} disabled={!!opening} title="Open a research paper (PDF) to read and discuss together">
+                  {opening ?? "Study a paper"}
+                </button>
+              )}
+              <input
+                ref={paperInput}
+                type="file"
+                accept="application/pdf"
+                hidden
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  e.target.value = "";
+                  if (f) studyPaper(f);
+                }}
+              />
               <input
                 ref={photoInput}
                 type="file"
@@ -1453,6 +1647,16 @@ function drawPicture(ctx: CanvasRenderingContext2D, img: PageImage, el: HTMLImag
 
 function drawTutorInk(ctx: CanvasRenderingContext2D, ink: TutorInk, now: number, cache: Map<string, Path2D>) {
   const t = ink.born === 0 ? Infinity : now - ink.born;
+  if ((ink.marks?.length || ink.rules?.length) && t > 0) {
+    // a highlighter pass over the passage, sweeping in as the voice starts
+    ctx.save();
+    const sweep = Math.min(1, t / 500);
+    ctx.fillStyle = "rgba(250, 204, 21, 0.38)";
+    for (const b of ink.marks ?? []) ctx.fillRect(b.x, b.y, b.w * sweep, b.h);
+    ctx.fillStyle = TUTOR_INK;
+    for (const b of ink.rules ?? []) ctx.fillRect(b.x, b.y, b.w * sweep, b.h);
+    ctx.restore();
+  }
   ctx.save();
   ctx.fillStyle = TUTOR_INK;
   ink.plan.strokes.forEach((s, i) => {
@@ -1462,6 +1666,9 @@ function drawTutorInk(ctx: CanvasRenderingContext2D, ink: TutorInk, now: number,
       const pts = strokeAt(s, t);
       if (!pts) return;
       const done = t >= s.end;
+      // Short marks (a full stop, a dot) would taper away to nothing.
+      let len = 0;
+      for (let k = 1; k < s.points.length; k++) len += Math.hypot(s.points[k][0] - s.points[k - 1][0], s.points[k][1] - s.points[k - 1][1]);
       path = outlinePath(
         getStroke(pts, {
           size: 3.6,
@@ -1469,8 +1676,8 @@ function drawTutorInk(ctx: CanvasRenderingContext2D, ink: TutorInk, now: number,
           smoothing: 0.6,
           streamline: 0.2,
           simulatePressure: true,
-          start: { taper: 10 },
-          end: { taper: done ? 8 : 0 },
+          start: { taper: Math.min(10, len * 0.25) },
+          end: { taper: done ? Math.min(8, len * 0.2) : 0 },
           last: done,
         }),
       );
@@ -1558,6 +1765,47 @@ function renderPageImages(strokes: Stroke[], lines: InkLine[], pictures: LoadedP
     return pictures.length ? canvas.toDataURL("image/jpeg", 0.85) : canvas.toDataURL("image/png");
   };
   return { pageImage: draw(false), tokenImage: draw(true) };
+}
+
+// Paper mode: a picture of what is on screen (paper, photos, both inks and
+// highlights), since the tutor and student are talking about what they see.
+function renderViewImage(
+  view: Box,
+  pictures: PageImage[],
+  pictureFor: (img: PageImage) => HTMLImageElement | null,
+  strokes: Stroke[],
+  inks: TutorInk[],
+): string {
+  const scale = Math.min(2, 1400 / view.w);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.ceil(view.w * scale);
+  canvas.height = Math.ceil(view.h * scale);
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(scale, 0, 0, scale, -view.x * scale, -view.y * scale);
+  for (const img of pictures) {
+    const el = pictureFor(img);
+    if (el) ctx.drawImage(el, img.x, img.y, img.w, img.h);
+  }
+  ctx.fillStyle = "rgba(250, 204, 21, 0.38)";
+  for (const t of inks) for (const b of t.marks ?? []) if (t.born !== Infinity) ctx.fillRect(b.x, b.y, b.w, b.h);
+  ctx.fillStyle = TUTOR_INK;
+  for (const t of inks) for (const b of t.rules ?? []) if (t.born !== Infinity) ctx.fillRect(b.x, b.y, b.w, b.h);
+  ctx.fillStyle = STUDENT_INK;
+  for (const s of strokes) {
+    const outline = getStroke(s.points, { size: s.size, thinning: 0.6, smoothing: 0.55, streamline: 0.45 });
+    if (outline.length) ctx.fill(outlinePath(outline));
+  }
+  ctx.fillStyle = TUTOR_INK;
+  for (const t of inks) {
+    if (t.born === Infinity) continue;
+    for (const st of t.plan.strokes) {
+      const outline = getStroke(st.points, { size: 3.6, thinning: 0.55, smoothing: 0.6, streamline: 0.2, simulatePressure: true });
+      if (outline.length) ctx.fill(outlinePath(outline));
+    }
+  }
+  return canvas.toDataURL("image/jpeg", 0.82);
 }
 
 // A small picture of some of the student's ink, for a kept review card.

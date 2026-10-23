@@ -78,3 +78,18 @@ test("a figure with a formula it can't read still draws the rest", () => {
   });
   assert.ok(plan.strokes.length > 3);
 });
+
+test("diagram layers follow the arrows and ignore cycles", async () => {
+  const { layers } = await import("./figures.ts");
+  const l = layers(["a", "b", "c", "d"], [{ from: "a", to: "b" }, { from: "b", to: "c" }, { from: "a", to: "c" }, { from: "c", to: "b" }, { from: "d", to: "c" }]);
+  assert.deepEqual([...l.entries()], [["a", 0], ["b", 1], ["c", 2], ["d", 0]]);
+});
+
+test("paper margin notes go in the workspace column beside the passage", () => {
+  const plan = planAnnotations([], [], 7, {
+    column: { x: 770, top: 0 },
+    marks: [{ boxes: [{ x: 60, y: 400, w: 300, h: 14 }], kind: "underline", note: "the key idea", edge: 700 }],
+  });
+  assert.ok(plan.box && plan.box.x + plan.box.w > 770, "note is in the column");
+  assert.ok(plan.box && plan.box.y < 420 && plan.box.y + plan.box.h > 390, "note sits level with the passage");
+});

@@ -23,6 +23,7 @@ To use it on an iPad, run `npm run dev -- -H 0.0.0.0` and open your computer's l
 - **Double-tap** part of your work to point at it ("what about this?"). **Scribble** over a stroke to erase it.
 - **I'm stuck** asks for help now. **Finish** wraps up with a recap, your stats, and Save notes.
 - **Add photo** puts a photo, screenshot or PDF of a worksheet under your ink, so you can write on it and the tutor reads it too.
+- **Study a paper** opens a research paper (a PDF with a text layer, up to 30 pages) beside a blank work area, and the tutor reads it with you. It opens with the gist and a big-picture diagram, then talks it through: it highlights and underlines the passages it means, writes margin notes with arrows to them, and explains by drawing flowcharts, bar charts of the results, tables, graphs and labelled sketches in the space beside the paper. It asks for your read first and invites you to sketch your own picture. Double-tap a sentence to ask about it. The paper stays on this device and comes back when you reload.
 - **Simulations**: for projectile and pendulum questions the tutor can set one up on the page. Mark your prediction, tap play, and it runs at real speed with the real physics; then the tutor asks you to explain what you saw.
 - **Keep** (`k`): draw a loop around some of your writing to save it as a review card. You type the question it should ask you later; the circled ink is the answer side.
 - **Review** shows how many cards are due and a mastery map of the concepts the tutor has seen you work on. Start review clears to a fresh page and asks each card by hand, from memory. The tutor helps less than usual, grades the attempt and suggests Again, Hard, Good or Easy; you can change it, or use Show answer to grade yourself.
@@ -43,6 +44,7 @@ To use it on an iPad, run `npm run dev -- -H 0.0.0.0` and open your computer's l
 | Math checker that catches slips in the tutor's and student's steps | `lib/check.ts` |
 | Projectile and pendulum simulations | `lib/sims.ts` |
 | Photo and PDF pages under the ink | `lib/photo.ts` |
+| Paper mode: sentences with ids and boxes, the text the tutor reads, PDF opening, saving on this device | `lib/paper.ts`, `lib/paper-pdf.ts`, `lib/paper-store.ts` |
 | Study arms, quizzes and their items | `lib/study.ts`, `lib/study-tests.ts`, `app/quiz/` |
 | Tutor API route (Claude or OpenAI, structured output) | `app/api/tutor/route.ts` |
 | Browser voice in and out | `lib/voice.ts` |
