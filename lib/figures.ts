@@ -557,20 +557,62 @@ function sketch(pen: Pen, fig: Extract<Figure, { kind: "sketch" }>, x: number, y
     write(pen, fig.title, x, top + ts, ts * 1.05, rng);
     top += ts * 1.8;
   }
-  const k = (size * 8) / 100;
-  const at = (p: number[]): Pt => [x + Math.min(100, Math.max(0, p[0] ?? 0)) * k, top + Math.min(100, Math.max(0, p[1] ?? 0)) * k];
+  const k = (size * 11) / 100;
+  const clamp = (v: number | undefined) => Math.min(100, Math.max(0, Number.isFinite(v) ? (v as number) : 0));
+  const at = (p: number[] | null | undefined): Pt => [x + clamp(p?.[0]) * k, top + clamp(p?.[1]) * k];
+  const wobble = (pts: Pt[]) => pts.map(([px, py]) => [px + jitter(rng, 0.6), py + jitter(rng, 0.6)] as Pt);
   for (const path of fig.paths.slice(0, 20)) {
-    const pts = path.points.slice(0, 60).filter((p) => p.length >= 2 && p.every(Number.isFinite)).map(at);
+    let pts = path.points.slice(0, 60).filter((p) => p.length >= 2 && p.every(Number.isFinite)).map(at);
     if (pts.length < 2) continue;
     if (path.closed) pts.push(pts[0]);
+    if (path.smooth && pts.length > 2) pts = curveThrough(pts, path.closed);
     pen.lift(110);
-    pen.draw(pts.map(([px, py]) => [px + jitter(rng, 0.6), py + jitter(rng, 0.6)] as Pt), 1.6);
+    pen.draw(wobble(pts), 1.6);
   }
-  for (const l of fig.labels.slice(0, 10)) {
+  for (const c of (fig.circles ?? []).slice(0, 30)) {
+    const centre = at([c.cx, c.cy]);
+    const r = Math.max(1.5, Math.min(50, Number.isFinite(c.r) ? c.r : 3) * k);
+    pen.lift(90);
+    if (c.filled && r < 10) dot(pen, centre, r);
+    else ring(pen, centre, r, rng);
+  }
+  for (const a of (fig.arrows ?? []).slice(0, 8)) {
+    pen.lift(110);
+    arrow(pen, at(a.from), at(a.to), rng);
+  }
+  for (const l of fig.labels.slice(0, 12)) {
     const [lx, ly] = at([l.x, l.y]);
+    const text = l.text.slice(0, 24);
     pen.lift(100);
-    write(pen, l.text.slice(0, 24), lx, ly, ts, rng);
+    write(pen, text, lx, ly, ts, rng);
+    if (l.point_to) {
+      // a leader line from the nearer end of the label to the part it names
+      const [tx, ty] = at(l.point_to);
+      const w = measureText(text, ts);
+      const sx = Math.abs(tx - lx) < Math.abs(tx - (lx + w)) ? lx - 4 : lx + w + 4;
+      pen.lift(80);
+      line(pen, [sx, ly - ts * 0.35], [tx, ty], rng);
+    }
   }
+}
+
+// A smooth curve through the points (Catmull-Rom), the way a hand rounds an outline.
+function curveThrough(pts: Pt[], closed: boolean): Pt[] {
+  const out: Pt[] = [];
+  const n = pts.length;
+  const get = (i: number) => (closed ? pts[(i + n - 1) % (n - 1)] : pts[Math.max(0, Math.min(n - 1, i))]);
+  for (let i = 0; i < n - 1; i++) {
+    const p0 = get(i - 1), p1 = pts[i], p2 = pts[i + 1], p3 = get(i + 2);
+    for (let s = 0; s < 8; s++) {
+      const t = s / 8, t2 = t * t, t3 = t2 * t;
+      out.push([
+        0.5 * (2 * p1[0] + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3),
+        0.5 * (2 * p1[1] + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3),
+      ]);
+    }
+  }
+  out.push(pts[n - 1]);
+  return out;
 }
 
 export function drawFigure(pen: Pen, fig: Figure, x: number, y: number, size: number, rng: Rng) {

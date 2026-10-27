@@ -9,7 +9,22 @@ import { drawFigure } from "./figures.ts";
 import type { Figure } from "./figure-schema.ts";
 
 export type PenStroke = { points: [number, number][]; start: number; end: number };
-export type PenPlan = { strokes: PenStroke[]; duration: number; box: Box | null };
+// `parts` are the boxes of what was written or drawn (not the arrows between),
+// so later turns can tuck their own work into the gaps.
+export type PenPlan = { strokes: PenStroke[]; duration: number; box: Box | null; parts?: Box[] };
+
+// Roughly how long a line takes to say aloud.
+export function speechMs(text: string): number {
+  return 600 + text.trim().split(/\s+/).filter(Boolean).length * 400;
+}
+
+// The same plan played faster (factor below 1), so the pen keeps pace with the
+// voice; never more than about three times hand speed.
+export function retime(plan: PenPlan, factor: number): PenPlan {
+  const f = Math.max(0.35, Math.min(1, factor));
+  if (f === 1) return plan;
+  return { ...plan, strokes: plan.strokes.map((s) => ({ ...s, start: s.start * f, end: s.end * f })), duration: plan.duration * f };
+}
 
 export type Annotation = {
   kind: "circle" | "underline" | "strike" | "check" | "question" | "note";
@@ -235,8 +250,10 @@ export type PlanOptions = {
   // Where to write on an empty page (top left of the visible area).
   origin?: { x: number; y: number };
   // Paper mode: the tutor writes in the workspace beside the paper, starting
-  // near the top of what's on screen rather than below everything.
-  column?: { x: number; top: number };
+  // near the top of what's on screen rather than below everything. Margin
+  // notes keep to a lane next to the paper; drawings go beyond it, in a new
+  // lane further right when the current one is full down to `bottom`.
+  column?: { x: number; top: number; bottom?: number };
   // Passages in the paper the tutor points at (the app highlights or rules
   // them), each with an optional margin note in the workspace joined by an
   // arrow from the page edge.
@@ -288,39 +305,95 @@ export function planAnnotations(annotations: Annotation[], lines: InkLine[], see
   }
 
   const col = opts.column;
-  // In the workspace column, the first gap at least `room` tall at or below `from`.
-  const freeY = (from: number, room: number, width: number) => {
-    const inCol = [...occupied, ...(opts.avoid ?? [])].filter((b) => col && b.x < col.x + width && b.x + b.w > col.x - 10);
+  const parts: Box[] = [];
+  const taken = () => [...occupied, ...(opts.avoid ?? [])];
+  // The first free spot at least `h` tall at or below `from`, for something `w` wide at `x`.
+  const below = (x: number, from: number, w: number, h: number) => {
     let y = from;
-    for (let pass = 0; pass < 40; pass++) {
-      const hit = inCol.find((b) => b.y < y + room && b.y + b.h > y);
+    for (let pass = 0; pass < 60; pass++) {
+      const hit = taken().find((o) => o.x < x + w + 12 && o.x + o.w + 12 > x && o.y < y + h + 12 && o.y + o.h + 12 > y);
       if (!hit) break;
       y = hit.y + hit.h + 16;
     }
     return y;
   };
+  // The free spot nearest `want`, looking both down and up.
+  const nearest = (x: number, want: number, w: number, h: number) => {
+    const down = below(x, want, w, h);
+    let up = want;
+    for (let pass = 0; pass < 60; pass++) {
+      const hit = taken().find((o) => o.x < x + w + 12 && o.x + o.w + 12 > x && o.y < up + h + 12 && o.y + o.h + 12 > up);
+      if (!hit) break;
+      up = hit.y - h - 16;
+    }
+    return want - up < down - want ? up : down;
+  };
+
+  // Margin notes, in a lane beside the paper, as close as they can get to their passage.
+  const lane = size * 21;
   for (const m of opts.marks ?? []) {
     if (!m.boxes.length) continue;
     pen.lift(pen.t ? 200 : 0);
     if (!m.note?.trim() || !col) continue;
     const u = m.boxes.reduce(unionBox);
-    const width = measureText(m.note, size);
-    const top = freeY(u.y + u.h / 2 - size * 0.8, size * 1.5, width + 20);
+    const rows = wrapWords(m.note.trim(), size, lane);
+    const width = Math.max(...rows.map((r) => measureText(r, size)));
+    const h = size * 1.5 * rows.length;
+    const top = nearest(col.x, u.y + u.h / 2 - size * 0.8, width, h);
     const baseline = top + size * 1.05;
     pen.lift(160);
     arrow(pen, [m.edge + 6, u.y + u.h / 2], [col.x - 12, baseline - size * 0.4], rng);
     pen.lift(120);
-    write(pen, m.note.trim(), col.x, baseline, size, rng);
-    occupied.push({ x: col.x, y: top, w: width, h: size * 1.5 });
+    rows.forEach((r, i) => write(pen, r, col.x, baseline + i * size * 1.5, size, rng));
+    const box = { x: col.x, y: top, w: width, h };
+    occupied.push(box);
+    parts.push(box);
   }
 
   const work = (opts.write ?? []).map((w) => w.trim()).filter(Boolean);
   const figures = opts.figures ?? [];
-  if (work.length || figures.length) {
-    const workSize = size * 0.95;
-    const below = [...occupied, ...(opts.avoid ?? [])];
-    const left = col ? col.x : lines.length ? Math.min(...lines.map((l) => l.box.x)) : (opts.origin?.x ?? 0) + 60;
-    const bottom = col ? freeY(col.top, 320, 640) : below.length ? Math.max(...below.map((b) => b.y + b.h)) : (opts.origin?.y ?? 0) + 80;
+  const workSize = size * 0.95;
+  const figSize = Math.max(workSize, 28);
+  // What each written line or figure will cover, measured with a practice pen first.
+  const sizeOf = (draw: (p: Pen) => void): Box => {
+    const p = new Pen(1);
+    draw(p);
+    return p.box ?? { x: 0, y: 0, w: 0, h: 0 };
+  };
+  const put = (b: Box, draw: (x: number, y: number) => void, x: number, y: number) => {
+    draw(x - b.x, y - b.y);
+    const box = { x, y, w: b.w, h: b.h };
+    occupied.push(box);
+    parts.push(box);
+  };
+  if (col && (work.length || figures.length)) {
+    // Each piece in the first spot that fits on screen, lane by lane away from the paper.
+    const items = [
+      ...work.map((text) => ({ draw: (p: Pen, x: number, y: number, r: Rng) => write(p, text, x, y, workSize, r), gap: 180 })),
+      ...figures.map((fig) => ({ draw: (p: Pen, x: number, y: number, r: Rng) => drawFigure(p, fig, x, y, figSize, r), gap: 300 })),
+    ];
+    const lanes = [0, 1, 2, 3].map((k) => col.x + lane + 40 + k * 720);
+    pen.lift(pen.t ? 300 : 0);
+    for (const it of items) {
+      // the practice run uses the same random wobble as the real one, so it measures exactly
+      const wobble = Math.floor(rng() * 2 ** 31);
+      const b = sizeOf((p) => it.draw(p, 0, 0, seeded(wobble)));
+      let spot = { x: lanes[0], y: below(lanes[0], col.top, b.w, b.h) };
+      for (const x of lanes) {
+        const y = below(x, col.top, b.w, b.h);
+        if (col.bottom == null || y + b.h <= col.bottom) {
+          spot = { x, y };
+          break;
+        }
+        if (y < spot.y) spot = { x, y };
+      }
+      pen.lift(it.gap);
+      put(b, (dx, dy) => it.draw(pen, dx, dy, seeded(wobble)), spot.x, spot.y);
+    }
+  } else if (work.length || figures.length) {
+    const under = taken();
+    const left = lines.length ? Math.min(...lines.map((l) => l.box.x)) : (opts.origin?.x ?? 0) + 60;
+    const bottom = under.length ? Math.max(...under.map((b) => b.y + b.h)) : (opts.origin?.y ?? 0) + 80;
     let baseline = bottom + workSize * 1.9;
     pen.lift(pen.t ? 300 : 0);
     for (const text of work) {
@@ -332,12 +405,22 @@ export function planAnnotations(annotations: Annotation[], lines: InkLine[], see
     for (const fig of figures) {
       pen.lift(300);
       // Figures need room to be read, however small the student writes.
-      drawFigure(pen, fig, left, figTop, Math.max(workSize, 28), rng);
+      drawFigure(pen, fig, left, figTop, figSize, rng);
       figTop = Math.max(figTop, pen.box ? pen.box.y + pen.box.h : figTop) + workSize * 1.2;
     }
   }
+  return { strokes: pen.strokes, duration: pen.t, box: pen.box, parts };
+}
 
-  return { strokes: pen.strokes, duration: pen.t, box: pen.box };
+// Words broken into rows no wider than `max`.
+function wrapWords(text: string, size: number, max: number): string[] {
+  const rows: string[] = [];
+  for (const word of text.split(/\s+/)) {
+    const last = rows.at(-1);
+    if (last && measureText(`${last} ${word}`, size) <= max) rows[rows.length - 1] = `${last} ${word}`;
+    else rows.push(word);
+  }
+  return rows;
 }
 
 function placeNote(

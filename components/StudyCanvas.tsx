@@ -15,7 +15,7 @@ import {
   type Stroke,
 } from "@/lib/ink";
 import type { PublicTurn, TutorRequest } from "@/lib/tutor";
-import { planAnnotations, strokeAt, type PenPlan } from "@/lib/handwriting";
+import { planAnnotations, retime, speechMs, strokeAt, type PenPlan } from "@/lib/handwriting";
 import type { Box } from "@/lib/ink";
 import { Conversation, speak, speechInputSupported, stopSpeaking } from "@/lib/voice";
 import { useStudyMemory } from "@/lib/memory-store";
@@ -95,6 +95,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const tutorFont = useRef("cursive");
   const paper = useRef<OpenPaper | null>(null);
   const camera = useRef<Camera>({ x: -40, y: -40, z: 1 });
+  // A turn waiting for its voice: shows its words and ink, and when nothing is heard in time, the fallback does.
+  const pendingTurn = useRef<{ start: () => void; fallback: ReturnType<typeof setTimeout> } | null>(null);
   const glide = useRef<{ from: Camera; to: Camera; start: number } | null>(null);
   const drawing = useRef<{ stroke: Stroke; pointerId: number; simulate: boolean } | null>(null);
   const pointers = useRef(new Map<number, { x: number; y: number; type: string }>());
@@ -342,9 +344,12 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       if (!canvas) return;
       if (glide.current) {
         const g = glide.current;
-        const f = Math.min(1, (now - g.start) / 450);
+        const f = Math.min(1, (now - g.start) / (g.to.z === g.from.z ? 450 : 800));
         const e = f * f * (3 - 2 * f);
-        camera.current = { x: g.from.x + (g.to.x - g.from.x) * e, y: g.from.y + (g.to.y - g.from.y) * e, z: g.from.z };
+        // zoom about the point that ends up fixed, so the move reads as one smooth motion
+        const z = g.from.z * Math.pow(g.to.z / g.from.z, e);
+        const k = g.to.z === g.from.z ? e : (1 / g.from.z - 1 / z) / (1 / g.from.z - 1 / g.to.z);
+        camera.current = { x: g.from.x + (g.to.x - g.from.x) * k, y: g.from.y + (g.to.y - g.from.y) * k, z };
         if (f === 1) glide.current = null;
         dirty.current = true;
       }
@@ -574,9 +579,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       const plan = planAnnotations(turn.annotations, lines, Math.floor(Math.random() * 2 ** 31), {
         write,
         figures,
-        avoid: tutorInk.current.map((t) => t.plan.box).filter((b): b is Box => b != null),
+        avoid: tutorInk.current.flatMap((t) => (p && t.plan.parts ? t.plan.parts : t.plan.box ? [t.plan.box] : [])),
         origin: { x: cam.x, y: cam.y + 60 / cam.z },
-        column: p ? { x: p.ref.x + p.ref.w + 70, top: Math.max(p.ref.y, cam.y + 80 / cam.z) } : undefined,
+        // the caption panel covers the bottom of the screen
+        column: p ? { x: p.ref.x + p.ref.w + 70, top: Math.max(p.ref.y, cam.y + 80 / cam.z), bottom: cam.y + viewBox().h - 180 / cam.z } : undefined,
         marks,
         size: p ? 19 : undefined,
       });
@@ -586,22 +592,27 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       if (plan.strokes.length || rects.length || rules.length) {
         ink = { id: crypto.randomUUID(), plan, born: Infinity, marks: rects, rules };
         tutorInk.current.push(ink);
-        // Keep the passage it points at and what it writes on screen together.
-        const passage = marks[0]?.boxes.reduce(unionBox);
-        const both = passage && plan.box ? unionBox(passage, plan.box) : (passage ?? plan.box);
-        const roomy = both && both.h < viewBox().h - 200 / camera.current.z;
-        const target = roomy ? both : (passage ?? plan.box);
-        if (target) reveal(target);
+        // Keep the passages it points at and what it writes on screen together,
+        // zooming out to fit them or back in when they're small.
+        const target = [...marks.flatMap((m) => m.boxes), ...(plan.box ? [plan.box] : [])].reduce<Box | null>((a, b) => (a ? unionBox(a, b) : b), null);
+        if (target) reveal(target, Boolean(p));
       }
     }
     if (turn.simulate) placeSim(turn.simulate, lines);
+    // The words, the caption and the pen all start the moment the voice is heard,
+    // and the pen keeps pace so the drawing is done about when the sentence is.
+    if (ink && turn.say && !stateRef.current.muted) ink.plan = retime(ink.plan, Math.min(1, speechMs(turn.say) / Math.max(1, ink.plan.duration)));
     const startPen = () => {
+      if (pendingTurn.current?.start === startPen) {
+        clearTimeout(pendingTurn.current.fallback);
+        pendingTurn.current = null;
+      }
+      if (turn.say) setCaption(turn.say);
       if (ink && ink.born === Infinity) ink.born = performance.now();
       dirty.current = true;
     };
     dirty.current = true;
     save();
-    if (turn.say) setCaption(turn.say);
     if (!turn.say || stateRef.current.muted) {
       startPen();
       settle();
@@ -609,13 +620,16 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     }
     setTutorState("speaking");
     ear.current?.pause();
-    setTimeout(startPen, 2500); // if the voice is slow to start, write anyway
+    pendingTurn.current?.start();
+    pendingTurn.current = { start: startPen, fallback: setTimeout(startPen, 8000) }; // the voice never came: show it anyway
     speak(turn.say, settle, startPen);
   };
 
   // Stop talking now (a new page, a new card) and go back to listening.
   const hush = () => {
     stopSpeaking();
+    pendingTurn.current?.start();
+    tutorInk.current.forEach((t) => t.born === Infinity && (t.born = performance.now()));
     inFlight.current?.abort.abort();
     inFlight.current = null;
     setTutorState("idle");
@@ -829,10 +843,24 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     });
 
   // If the tutor writes somewhere off screen, glide the page so it is visible.
-  const reveal = (b: Box) => {
+  // With `fit`, it also zooms: out until the whole thing fits, or in when it would look small.
+  const reveal = (b: Box, fit = false) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const cam = camera.current;
+    const top = 80, bottom = 180; // the toolbar and the caption panel
+    if (fit) {
+      const sw = canvas.clientWidth - 80, sh = canvas.clientHeight - top - bottom;
+      const best = Math.max(0.3, Math.min(1.1, sw / Math.max(1, b.w), sh / Math.max(1, b.h)));
+      const inView = b.x >= cam.x && b.y >= cam.y + top / cam.z && b.x + b.w <= cam.x + canvas.clientWidth / cam.z && b.y + b.h <= cam.y + (canvas.clientHeight - bottom) / cam.z;
+      // leave the view alone when it already shows everything at a comfortable size
+      if (inView && cam.z <= best && cam.z >= best * 0.6) return;
+      const z = best;
+      const to = { z, x: b.x + b.w / 2 - canvas.clientWidth / 2 / z, y: b.y + b.h / 2 - (top + sh / 2) / z };
+      glide.current = { from: cam, to, start: performance.now() };
+      dirty.current = true;
+      return;
+    }
     const w = canvas.clientWidth / cam.z;
     const h = (canvas.clientHeight - 160) / cam.z;
     const dx = b.x + b.w > cam.x + w - 40 ? b.x + b.w - (cam.x + w - 40) : b.x < cam.x + 20 ? b.x - (cam.x + 20) : 0;
@@ -1328,6 +1356,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const interrupt = () => {
     if (stateRef.current.tutorState !== "speaking") return;
     stopSpeaking();
+    pendingTurn.current?.start();
     tutorInk.current.forEach((t) => t.born === Infinity && (t.born = performance.now()));
     settle();
   };

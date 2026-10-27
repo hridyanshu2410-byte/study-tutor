@@ -89,18 +89,26 @@ const Bars = z.object({
     .describe("Up to eight numbers to compare, such as results from a table in the paper."),
 });
 
+const gridPt = z.array(z.number()).describe("[x, y] on the 100 by 100 grid, y down.");
 const Sketch = z.object({
   kind: z.literal("sketch"),
   title: label,
   paths: z
     .array(
       z.object({
-        points: z.array(z.array(z.number())).describe("[x, y] pairs on a 100 by 100 grid, y down. Five to forty points per path."),
+        points: z.array(z.array(z.number())).describe("[x, y] pairs on a 100 by 100 grid, y down. Three to forty points per path."),
         closed: z.boolean(),
+        smooth: z.boolean().describe("true draws a flowing curve through the points (outlines, bodies, waves, organic shapes); false draws straight segments (objects, screens, axes)."),
       }),
     )
-    .describe("A simple line drawing, the kind a person doodles to explain: a cell, a neuron, a robot arm, a molecule, a setup. Up to twenty paths."),
-  labels: z.array(z.object({ x: z.number(), y: z.number(), text: z.string() })).describe("Short labels on the same grid."),
+    .describe("A hand drawing of the thing itself, the kind a person doodles to explain: people talking, a cell, a neuron, a robot arm, a molecule, an experiment setup, points clustering in a space, a landscape with a ball rolling downhill. Up to twenty paths."),
+  circles: z
+    .array(z.object({ cx: z.number(), cy: z.number(), r: z.number(), filled: z.boolean() }))
+    .describe("Circles on the same grid: heads, cells, nodes, data points (filled for small dots). Up to thirty."),
+  arrows: z.array(z.object({ from: gridPt, to: gridPt })).describe("Arrows for motion, flow or influence inside the drawing. Up to eight."),
+  labels: z
+    .array(z.object({ x: z.number(), y: z.number(), text: z.string(), point_to: gridPt.nullable().describe("A part this label names; a short line is drawn from the label to it.") }))
+    .describe("Short labels on the same grid, placed in clear space."),
 });
 
 export const FigureSchema = z.union([Graph, NumberLine, Shape, Flow, Table, Forces, Steps, Diagram, Bars, Sketch]);

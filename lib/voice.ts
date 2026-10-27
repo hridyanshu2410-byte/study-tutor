@@ -22,21 +22,64 @@ export function speak(text: string, onEnd?: () => void, onStart?: () => void) {
       if (res.status === 404) serverVoice = false;
       if (!res.ok) throw new Error(`voice ${res.status}`);
       serverVoice = true;
-      const url = URL.createObjectURL(await res.blob());
-      if (mine !== generation) return URL.revokeObjectURL(url); // interrupted while loading
-      audio = new Audio(url);
+      if (mine !== generation) return void res.body?.cancel(); // interrupted while loading
+      // Play the voice as it arrives rather than after the whole clip has downloaded.
+      const { el, url } = streamable(res, mine) ?? (await whole(res));
+      if (mine !== generation) return URL.revokeObjectURL(url);
+      audio = el;
+      let heard = false;
       const done = () => {
         URL.revokeObjectURL(url);
-        if (mine === generation) onEnd?.();
+        if (mine !== generation) return;
+        if (!heard) speakInBrowser(text, onEnd, onStart);
+        else onEnd?.();
       };
-      audio.onended = done;
-      audio.onerror = done;
-      audio.onplaying = () => mine === generation && onStart?.();
-      await audio.play();
+      el.onended = done;
+      el.onerror = done;
+      el.onplaying = () => {
+        if (mine !== generation || heard) return;
+        heard = true;
+        onStart?.();
+      };
+      await el.play();
     })
     .catch(() => {
       if (mine === generation) speakInBrowser(text, onEnd, onStart);
     });
+}
+
+// Streams the MP3 into the audio element through MediaSource, where the browser supports it.
+function streamable(res: Response, mine: number): { el: HTMLAudioElement; url: string } | null {
+  if (!res.body || typeof MediaSource === "undefined" || !MediaSource.isTypeSupported("audio/mpeg")) return null;
+  const source = new MediaSource();
+  const url = URL.createObjectURL(source);
+  const reader = res.body.getReader();
+  source.addEventListener(
+    "sourceopen",
+    async () => {
+      const buf = source.addSourceBuffer("audio/mpeg");
+      const settled = () => new Promise((r) => buf.addEventListener("updateend", r, { once: true }));
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (mine !== generation) return void reader.cancel();
+          buf.appendBuffer(value);
+          await settled();
+        }
+        if (source.readyState === "open") source.endOfStream();
+      } catch {
+        if (source.readyState === "open") source.endOfStream("network");
+      }
+    },
+    { once: true },
+  );
+  return { el: new Audio(url), url };
+}
+
+async function whole(res: Response): Promise<{ el: HTMLAudioElement; url: string }> {
+  const url = URL.createObjectURL(await res.blob());
+  return { el: new Audio(url), url };
 }
 
 function speakInBrowser(text: string, onEnd?: () => void, onStart?: () => void) {

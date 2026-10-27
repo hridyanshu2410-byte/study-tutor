@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { groupLines, type Stroke } from "./ink.ts";
-import { planAnnotations, strokeAt } from "./handwriting.ts";
+import { planAnnotations, retime, speechMs, strokeAt } from "./handwriting.ts";
+import type { Box } from "./ink.ts";
 
 const stroke = (id: string, x: number, y: number): Stroke => ({
   id,
@@ -92,4 +93,59 @@ test("paper margin notes go in the workspace column beside the passage", () => {
   });
   assert.ok(plan.box && plan.box.x + plan.box.w > 770, "note is in the column");
   assert.ok(plan.box && plan.box.y < 420 && plan.box.y + plan.box.h > 390, "note sits level with the passage");
+});
+
+const overlaps = (a: Box, b: Box) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+const flowchart = {
+  kind: "diagram" as const,
+  direction: "down" as const,
+  nodes: ["a", "b", "c", "d"].map((id) => ({ id, text: `Stage ${id} of the method`, group: null })),
+  edges: [{ from: "a", to: "b", label: null }, { from: "b", to: "c", label: null }, { from: "c", to: "d", label: null }],
+};
+
+test("in paper mode nothing the tutor writes lands on earlier writing", () => {
+  const column = { x: 770, top: 0, bottom: 900 };
+  const first = planAnnotations([], [], 3, {
+    column,
+    figures: [flowchart],
+    marks: [{ boxes: [{ x: 60, y: 200, w: 300, h: 14 }], kind: "highlight", note: "what goes in and comes out of the system", edge: 700 }],
+  });
+  const second = planAnnotations([], [], 4, {
+    column,
+    avoid: first.parts,
+    figures: [flowchart],
+    marks: [{ boxes: [{ x: 60, y: 210, w: 300, h: 14 }], kind: "underline", note: "the scale gap", edge: 700 }],
+  });
+  const all = [...(first.parts ?? []), ...(second.parts ?? [])];
+  assert.equal(all.length, 4);
+  for (let i = 0; i < all.length; i++) for (let j = i + 1; j < all.length; j++) assert.ok(!overlaps(all[i], all[j]), `parts ${i} and ${j} overlap`);
+  // the second note stays near its passage rather than far down the page
+  const note = second.parts![0];
+  assert.ok(Math.abs(note.y - 210) < 120, `note at ${note.y}`);
+});
+
+test("the pen keeps pace with the voice", () => {
+  const plan = planAnnotations([], [], 5, { column: { x: 770, top: 0 }, figures: [flowchart] });
+  const fast = retime(plan, speechMs("Here is the method in four stages.") / plan.duration);
+  assert.ok(fast.duration < plan.duration && fast.duration >= plan.duration * 0.35);
+  assert.equal(fast.strokes.at(-1)!.end, fast.duration);
+  assert.equal(retime(plan, 5), plan, "never slowed down");
+});
+
+test("a sketch draws smooth curves, circles, arrows and pointing labels", () => {
+  const plan = planAnnotations([], [], 6, {
+    column: { x: 770, top: 0 },
+    figures: [
+      {
+        kind: "sketch",
+        title: "A simulated community",
+        paths: [{ points: [[20, 40], [15, 60], [25, 80]], closed: false, smooth: true }],
+        circles: [{ cx: 20, cy: 30, r: 6, filled: false }, { cx: 70, cy: 50, r: 1, filled: true }],
+        arrows: [{ from: [30, 50], to: [60, 50] }],
+        labels: [{ x: 60, y: 90, text: "persona", point_to: [20, 30] }],
+      },
+    ],
+  });
+  assert.ok(plan.strokes.length > 8);
+  assert.ok(plan.box && plan.box.w > 150 && plan.box.h > 150, "big enough to read");
 });
