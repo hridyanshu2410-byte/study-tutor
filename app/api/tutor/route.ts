@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import OpenAI from "openai";
@@ -18,11 +19,15 @@ const provider: "anthropic" | "openai" =
       ? "anthropic"
       : "openai";
 const openaiModel = process.env.OPENAI_TUTOR_MODEL || "gpt-6-luna";
-// GPT-6 Luna reasons before it answers. A little is enough for one turn of
-// tutoring, and the student is waiting for the first words.
-// OPENAI_REASONING_EFFORT changes it; a model that doesn't take the setting is
-// asked again without it.
-let reasoningEffort = (process.env.OPENAI_REASONING_EFFORT || "low") as OpenAI.ReasoningEffort | "";
+// GPT-6 models can reason before they answer. Timed on real turns, even low
+// thinking put the first words one to two seconds later, so by default the
+// tutor answers straight away. OPENAI_REASONING_EFFORT changes it; a model that
+// doesn't take the setting is asked again with the lightest one it does.
+let reasoningEffort = (process.env.OPENAI_REASONING_EFFORT || "none") as OpenAI.ReasoningEffort | "";
+// The instructions and the paper are the same every turn: marking where they
+// end, and keying a paper's turns together, keeps them cached between questions
+// so the model starts sooner. Dropped for a model that doesn't take the hints.
+let cacheHints = true;
 const client = provider === "anthropic" ? new Anthropic() : null;
 const openai = provider === "openai" && process.env.OPENAI_API_KEY ? new OpenAI() : null;
 
@@ -38,6 +43,8 @@ type Ask = {
   // A paper being read together. It goes first, after the system prompt, so the
   // provider can cache it across turns.
   paperText?: string;
+  // Names the cached instructions and paper, so turns that share them share the cache.
+  cacheKey: string;
 };
 type Usage = { input: number; output: number; cached: number; thinking: number };
 type Answer = { text: string; refused: boolean; usage: Usage };
@@ -48,18 +55,20 @@ async function streamTutor(a: Ask, signal: AbortSignal, onText: (delta: string) 
   let text = "";
   if (provider === "openai") {
     const png = (p: Pic) => ({ type: "image_url" as const, image_url: { url: `data:${p.type};base64,${p.data}` } });
+    const cut = cacheHints ? { prompt_cache_breakpoint: { mode: "explicit" as const } } : {};
     const stream = openai!.chat.completions.stream(
       {
         model: openaiModel,
         ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+        ...(cacheHints ? { prompt_cache_key: a.cacheKey } : {}),
         response_format: zodResponseFormat(a.schema, "tutor_turn"),
         stream_options: { include_usage: true },
         messages: [
-          { role: "system", content: a.system },
+          { role: "system", content: [{ type: "text", text: a.system, ...cut }] },
           {
             role: "user",
             content: [
-              ...(a.paperText ? [{ type: "text" as const, text: `The paper:\n${a.paperText}` }] : []),
+              ...(a.paperText ? [{ type: "text" as const, text: `The paper:\n${a.paperText}`, ...cut }] : []),
               { type: "text", text: a.paperText ? "What is on the student's screen:" : "The student's page:" },
               png(a.page),
               { type: "text", text: "The same page with line ids and numbered tokens:" },
@@ -91,6 +100,11 @@ async function streamTutor(a: Ask, signal: AbortSignal, onText: (delta: string) 
         const was = reasoningEffort;
         reasoningEffort = lighterEffort(was, err.message);
         console.warn(`${openaiModel} doesn't take reasoning_effort ${was}; asking with ${reasoningEffort || "the model's default"}`);
+        return streamTutor(a, signal, onText);
+      }
+      if (err instanceof OpenAI.BadRequestError && cacheHints && !text && /prompt_cache/i.test(err.message)) {
+        console.warn(`${openaiModel} doesn't take prompt cache hints; asking without them`);
+        cacheHints = false;
         return streamTutor(a, signal, onText);
       }
       // A reply that doesn't fit the schema is read from its text, not a crash.
@@ -289,6 +303,7 @@ export async function POST(req: Request) {
   const started = Date.now();
   const schema = tutorTurnSchema(explaining || paper ? MOVES : allowedMoves(lastRung));
   const system = [TUTOR_SYSTEM_PROMPT, reviewing ? REVIEW_PROMPT : paper ? PAPER_PROMPT : explaining ? EXPLAIN_PROMPT : ""].filter(Boolean).join("\n\n");
+  const cacheKey = `tutor-${createHash("sha256").update(system).update(paper?.text ?? "").digest("hex").slice(0, 32)}`;
   const known = new Set(body.lines.map((l) => l.id));
   // The student closed the page or cut the tutor off: stop writing the turn.
   const gone = new AbortController();
@@ -368,7 +383,7 @@ export async function POST(req: Request) {
       };
       try {
         const answer = await streamTutor(
-          { schema, system, paperText: paper?.text, page: page!, tokens: tokens!, reference, situation: situation + extra },
+          { schema, system, paperText: paper?.text, cacheKey, page: page!, tokens: tokens!, reference, situation: situation + extra },
           ctrl.signal,
           (delta) => {
             firstText ||= Date.now() - started;
