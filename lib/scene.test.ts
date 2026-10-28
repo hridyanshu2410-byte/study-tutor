@@ -64,6 +64,22 @@ test("a circle goes round the thing it names, bubble and caption too, and nothin
   assert.ok(arrow.x >= ai.x + ai.w * 0.5 && arrow.x + arrow.w <= boxes.get("thing:crowd")!.x + boxes.get("thing:crowd")!.w);
 });
 
+test("a circle stays close round what it circles and clear of the arrow's label", () => {
+  const fig = scene([thing("ai", "robot", 0, 0, { caption: "GPT-3" }), thing("crowd", "people", 0, 1, { count: 12, caption: "simulated members", says: "this is dumb" })], {
+    arrows: [{ from: "ai", to: "crowd", label: "generates" }],
+    marks: [{ on: "crowd", kind: "circle", note: null }],
+  });
+  const { boxes, pen } = parts(fig);
+  const ring = boxes.get("mark:crowd:circle")!, crowd = boxes.get("thing:crowd")!;
+  assert.ok(ring.x > crowd.x - 28 && ring.x + ring.w < crowd.x + crowd.w + 28, "no wider than the crowd and a margin");
+  // apart from where the arrow's head meets it, the circle touches nothing of the arrow or its label
+  const loop = pen.strokes.filter((s) => s.tag === "mark:crowd:circle").flatMap((s) => s.points);
+  const arrowPts = pen.strokes.filter((s) => s.tag === "arrow:ai>crowd").flatMap((s) => s.points);
+  const tip = Math.max(...arrowPts.map(([x]) => x));
+  const near = arrowPts.filter(([x]) => x < tip - 20).filter(([x, y]) => loop.some(([lx, ly]) => Math.hypot(lx - x, ly - y) < 4));
+  assert.equal(near.length, 0);
+});
+
 test("marks and arrows on things that aren't there are left out", () => {
   const { boxes } = parts(scene([thing("a", "person", 0, 0)], { arrows: [{ from: "a", to: "ghost", label: null }], marks: [{ on: "ghost", kind: "circle", note: "?" }] }));
   assert.deepEqual([...boxes.keys()], ["thing:a"]);

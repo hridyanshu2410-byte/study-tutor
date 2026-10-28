@@ -48,6 +48,82 @@ function oval(pen: Pen, c: Pt, rx: number, ry: number, rng: Rng, speed = 1.6) {
   stroke(pen, arc(c, rx * (1 + jitter(rng, 0.03)), ry * (1 + jitter(rng, 0.03)), start, start + Math.PI * 2.08, 28), rng, speed, 0.6);
 }
 
+// The outline of a loop round some boxes: their convex hull, kept `pad` clear
+// all round and bowed out a little along its sides, the way a hand circles
+// a few things on a board. Its points run in order, about every 6 px.
+export function loopAround(boxes: Box[], pad: number): Pt[] {
+  const corners: Pt[] = boxes.flatMap((b) => [[b.x, b.y], [b.x + b.w, b.y], [b.x + b.w, b.y + b.h], [b.x, b.y + b.h]] as Pt[]);
+  const cross = (o: Pt, a: Pt, b: Pt) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const sorted = [...corners].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const half = (pts: Pt[]) => {
+    const h: Pt[] = [];
+    for (const q of pts) {
+      while (h.length >= 2 && cross(h[h.length - 2], h[h.length - 1], q) <= 0) h.pop();
+      h.push(q);
+    }
+    return h.slice(0, -1);
+  };
+  const hull = [...half(sorted), ...half([...sorted].reverse())];
+  const n = hull.length;
+  let area = 0;
+  for (let i = 0; i < n; i++) area += hull[i][0] * hull[(i + 1) % n][1] - hull[(i + 1) % n][0] * hull[i][1];
+  const sign = area > 0 ? 1 : -1;
+  const normal = (a: Pt, b: Pt) => Math.atan2(-(b[0] - a[0]) * sign, (b[1] - a[1]) * sign);
+  const out: Pt[] = [];
+  for (let i = 0; i < n; i++) {
+    const prev = hull[(i + n - 1) % n], cur = hull[i], next = hull[(i + 1) % n];
+    // round the corner
+    const a0 = normal(prev, cur);
+    let turn = normal(cur, next) - a0;
+    while (turn * sign < 0) turn += 2 * Math.PI * sign;
+    const steps = Math.max(1, Math.ceil(Math.abs(turn) * pad / 6));
+    for (let k = 0; k <= steps; k++) {
+      const a = a0 + (turn * k) / steps;
+      out.push([cur[0] + Math.cos(a) * pad, cur[1] + Math.sin(a) * pad]);
+    }
+    // then along the side to the next corner, bowed out a little
+    const a1 = a0 + turn, len = Math.hypot(next[0] - cur[0], next[1] - cur[1]);
+    const bow = Math.min(len * 0.1, pad * 1.4);
+    const steps2 = Math.ceil(len / 6);
+    for (let k = 1; k < steps2; k++) {
+      const t = k / steps2, b = Math.sin(Math.PI * t) * bow;
+      out.push([cur[0] + (next[0] - cur[0]) * t + Math.cos(a1) * (pad + b), cur[1] + (next[1] - cur[1]) * t + Math.sin(a1) * (pad + b)]);
+    }
+  }
+  return out;
+}
+
+// Whether a point is inside a convex outline.
+function within(outline: Pt[], [x, y]: Pt): boolean {
+  let side = 0;
+  for (let i = 0; i < outline.length; i++) {
+    const a = outline[i], b = outline[(i + 1) % outline.length];
+    const c = Math.sign((b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]));
+    if (c && side && c !== side) return false;
+    side ||= c;
+  }
+  return true;
+}
+
+// A loop drawn in one go from near the top, its end running on a little past
+// its start and drifting out, the way a hand closes a circle.
+function lasso(pen: Pen, outline: Pt[], rng: Rng) {
+  const n = outline.length;
+  const cx = outline.reduce((t, p) => t + p[0], 0) / n, cy = outline.reduce((t, p) => t + p[1], 0) / n;
+  let start = 0;
+  outline.forEach((p, i) => p[1] - (p[0] - cx) * 0.3 < outline[start][1] - (outline[start][0] - cx) * 0.3 && (start = i));
+  const over = Math.max(3, Math.round(n * 0.1)), phase = rng() * Math.PI * 2;
+  const pts: Pt[] = [];
+  for (let k = 0; k <= n + over; k++) {
+    const [x, y] = outline[(start + k) % n];
+    const dx = x - cx, dy = y - cy, d = Math.hypot(dx, dy) || 1;
+    // a slow swell, never inward, and the overshoot drifting out
+    const out = 1.5 * (1 + Math.sin((k / n) * Math.PI * 4 + phase)) + (k > n ? ((k - n) / over) * 4 : 0);
+    pts.push([x + (dx / d) * out, y + (dy / d) * out]);
+  }
+  stroke(pen, pts, rng, 1.5, 0.6);
+}
+
 // What a picture covers, and where a speech bubble's tail should point.
 type Drawn = { body: Box; speaker: Pt };
 
@@ -382,7 +458,7 @@ export function scene(pen: Pen, fig: Scene, x: number, y: number, size: number, 
     write(pen, fig.title, x, top + ts * 1.1, ts * 1.1, rng);
     top += ts * 1.9;
   }
-  type Placed = { t: Thing; row: number; col: number; cell: Box; pic: Box; body: Box; all: Box; caption: Box | null };
+  type Placed = { t: Thing; row: number; col: number; cell: Box; pic: Box; body: Box; all: Box; bubble: Box | null; caption: Box | null };
   const placed = new Map<string, Placed>();
   const taken = new Set<string>();
   for (const t of fig.things.slice(0, 12)) {
@@ -409,25 +485,30 @@ export function scene(pen: Pen, fig: Scene, x: number, y: number, size: number, 
       const w = Math.max(...rows.map((r) => measureText(r, ts)));
       caption = { x: cell.x + (cw - w) / 2, y: picTop + S + ts * 0.3, w, h: rows.length * ts * 1.25 };
     }
+    let said: Box | null = null;
     if (t.says?.trim()) {
       pen.lift(150);
-      all = unite(all, bubble(pen, t.says.trim().slice(0, 28), drawn.speaker, cell, Math.min(drawn.body.y, drawn.speaker[1]), ts, rng));
+      said = bubble(pen, t.says.trim().slice(0, 28), drawn.speaker, cell, Math.min(drawn.body.y, drawn.speaker[1]), ts, rng);
+      all = unite(all, said);
     }
-    placed.set(t.id, { t, row, col, cell, pic, body: drawn.body, all, caption });
+    placed.set(t.id, { t, row, col, cell, pic, body: drawn.body, all, bubble: said, caption });
   }
+  // What a circle round a thing would go round: its picture, bubble and caption.
+  const pad = ts * 0.45;
+  const parts = (q: Placed) => [q.body, ...(q.bubble ? [q.bubble] : []), ...(q.caption ? [q.caption] : [])];
 
   for (const m of fig.marks.slice(0, 4)) {
     const p = placed.get(m.on);
     if (!p) continue;
     const rng = part(`mark:${m.on}:${m.kind}`);
-    // a circle goes round the whole thing, its bubble and its caption too
     const b = p.caption ? unite(p.all, p.caption) : p.all;
     pen.lift(160);
     let below = b.y + b.h;
     if (m.kind === "circle") {
-      const ry = (b.h / 2) * 1.28 + ts * 0.2;
-      oval(pen, [b.x + b.w / 2, b.y + b.h / 2], (b.w / 2) * 1.3 + ts * 0.2, ry, rng, 1.4);
-      below = b.y + b.h / 2 + ry;
+      // a loop close round the whole thing, its bubble and its caption too
+      const outline = loopAround(parts(p), pad);
+      lasso(pen, outline, rng);
+      below = Math.max(...outline.map(([, y]) => y)) + 4;
     } else if (m.kind === "cross") {
       stroke(pen, [[p.body.x, p.body.y], [p.body.x + p.body.w, p.body.y + p.body.h]], rng, 1.6);
       stroke(pen, [[p.body.x + p.body.w, p.body.y], [p.body.x, p.body.y + p.body.h]], rng, 1.6);
@@ -474,7 +555,20 @@ export function scene(pen: Pen, fig: Scene, x: number, y: number, size: number, 
       const mx = (p0[0] + p1[0]) / 2, my = (p0[1] + p1[1]) / 2;
       const across = Math.abs(p1[0] - p0[0]) > Math.abs(p1[1] - p0[1]);
       const lift = Math.abs(bend) > 0.1 ? Math.hypot(p1[0] - p0[0], p1[1] - p0[1]) * 0.18 : 0;
-      write(pen, text, across ? mx - w / 2 : mx + 10, across ? my - ls * 0.7 - lift : my + ls * 0.4, ls, rng);
+      // Above the middle of the arrow, unless a circle round either end would
+      // cross it: then a little toward the start, higher, or below.
+      const toward = Math.sign(p0[0] - p1[0]) || 1;
+      const spots: Pt[] = across
+        ? [[mx - w / 2, my - ls * 0.7 - lift], [mx - w / 2 + toward * w * 0.25, my - ls * 0.7 - lift], [mx - w / 2, my - ls * 1.8 - lift], [mx - w / 2 + toward * w * 0.3, my - ls * 1.8 - lift], [mx - w / 2, my + ls * 1.5]]
+        : [[mx + 10, my + ls * 0.4], [mx - 10 - w, my + ls * 0.4]];
+      const zones = [a, b].map((q) => loopAround(parts(q), pad + 3));
+      const hits = ([lx, ly]: Pt) => {
+        const box = { x: lx - 2, y: ly - ls * 0.9, w: w + 4, h: ls * 1.15 };
+        const probes: Pt[] = [0, 0.25, 0.5, 0.75, 1].flatMap((fx) => [0, 0.5, 1].map((fy) => [box.x + box.w * fx, box.y + box.h * fy] as Pt));
+        return zones.reduce((n, z) => n + probes.filter((q) => within(z, q)).length + z.filter(([x, y]) => x > box.x && x < box.x + box.w && y > box.y && y < box.y + box.h).length, 0);
+      };
+      const [lx, ly] = spots.find((q) => !hits(q)) ?? spots.reduce((best, q) => (hits(q) < hits(best) ? q : best));
+      write(pen, text, lx, ly, ls, rng);
     }
   }
 }
