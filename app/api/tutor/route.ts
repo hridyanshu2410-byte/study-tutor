@@ -39,7 +39,7 @@ type Ask = {
   // provider can cache it across turns.
   paperText?: string;
 };
-type Usage = { input: number; output: number };
+type Usage = { input: number; output: number; cached: number; thinking: number };
 type Answer = { text: string; refused: boolean; usage: Usage };
 
 // Asks for a turn and hands over its text as it is written, so the first
@@ -80,7 +80,12 @@ async function streamTutor(a: Ask, signal: AbortSignal, onText: (delta: string) 
     stream.on("refusal.delta", () => (refused = true));
     try {
       const res = await stream.finalChatCompletion();
-      return { text, refused, usage: { input: res.usage?.prompt_tokens ?? 0, output: res.usage?.completion_tokens ?? 0 } };
+      const u = res.usage;
+      return {
+        text,
+        refused,
+        usage: { input: u?.prompt_tokens ?? 0, output: u?.completion_tokens ?? 0, cached: u?.prompt_tokens_details?.cached_tokens ?? 0, thinking: u?.completion_tokens_details?.reasoning_tokens ?? 0 },
+      };
     } catch (err) {
       if (err instanceof OpenAI.BadRequestError && reasoningEffort && !text && /reasoning/i.test(err.message)) {
         console.warn(`${openaiModel} doesn't take reasoning_effort ${reasoningEffort}; asking without it`);
@@ -89,7 +94,7 @@ async function streamTutor(a: Ask, signal: AbortSignal, onText: (delta: string) 
       }
       // A reply that doesn't fit the schema is read from its text, not a crash.
       if (signal.aborted || err instanceof OpenAI.APIError) throw err;
-      return { text, refused, usage: { input: 0, output: 0 } };
+      return { text, refused, usage: { input: 0, output: 0, cached: 0, thinking: 0 } };
     }
   }
   const stream = client!.messages.stream(
@@ -126,11 +131,16 @@ async function streamTutor(a: Ask, signal: AbortSignal, onText: (delta: string) 
   });
   try {
     const msg = await stream.finalMessage();
-    return { text, refused: msg.stop_reason === "refusal", usage: { input: msg.usage.input_tokens, output: msg.usage.output_tokens } };
+    const u = msg.usage;
+    return {
+      text,
+      refused: msg.stop_reason === "refusal",
+      usage: { input: u.input_tokens + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0), output: u.output_tokens, cached: u.cache_read_input_tokens ?? 0, thinking: 0 },
+    };
   } catch (err) {
     if (signal.aborted || err instanceof Anthropic.APIError) throw err;
     const u = stream.currentMessage?.usage;
-    return { text, refused: false, usage: { input: u?.input_tokens ?? 0, output: u?.output_tokens ?? 0 } };
+    return { text, refused: false, usage: { input: u?.input_tokens ?? 0, output: u?.output_tokens ?? 0, cached: u?.cache_read_input_tokens ?? 0, thinking: 0 } };
   }
 }
 
@@ -278,7 +288,10 @@ export async function POST(req: Request) {
     const checker = new BeatChecker({ paperText: paper?.text ?? null, lines: known });
     const sent: Beat[] = [];
     const flags: string[] = [];
-    let usage: Usage = { input: 0, output: 0 };
+    let usage: Usage = { input: 0, output: 0, cached: 0, thinking: 0 };
+    // when the model's first words and the first beat came, for the timing line below
+    let firstText = 0;
+    let firstBeat = 0;
     let turn: TutorTurn | null = null;
     let move: TutorTurn["move"] | null = null;
     let diagnosis = "";
@@ -332,6 +345,7 @@ export async function POST(req: Request) {
           }
           checker.commit(beat);
           sent.push(beat);
+          firstBeat ||= Date.now() - started;
           send({ beat });
         }
         // The next phrase's words come before its ink, so its voice can be made meanwhile.
@@ -346,11 +360,17 @@ export async function POST(req: Request) {
           { schema, system, paperText: paper?.text, page: page!, tokens: tokens!, reference, situation: situation + extra },
           ctrl.signal,
           (delta) => {
+            firstText ||= Date.now() - started;
             scan.push(delta);
             pump();
           },
         );
-        usage = { input: usage.input + answer.usage.input, output: usage.output + answer.usage.output };
+        usage = {
+          input: usage.input + answer.usage.input,
+          output: usage.output + answer.usage.output,
+          cached: usage.cached + answer.usage.cached,
+          thinking: usage.thinking + answer.usage.thinking,
+        };
         pump();
         if (!restart) {
           const parsed = answer.refused ? null : schema.safeParse(safeJson(answer.text));
@@ -397,6 +417,12 @@ export async function POST(req: Request) {
       review_result: reviewing ? (turn?.review_result ?? null) : null,
     };
     if (!gone.signal.aborted) send({ turn: end });
+    const sec = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
+    console.log(
+      `tutor ${body.trigger}: ${provider === "openai" ? `${openaiModel} (reasoning ${reasoningEffort || "default"})` : "claude-opus-5-5"}, ` +
+        `first text ${sec(firstText)}, first beat ${sec(firstBeat)}, done ${sec(Date.now() - started)}; ` +
+        `${usage.input} tokens in (${usage.cached} cached), ${usage.output} out (${usage.thinking} thinking); ${sent.length} beats, ${move}${retried ? ", retried" : ""}${gone.signal.aborted ? ", cut off" : ""}`,
+    );
 
     const record: PastTurn = {
       trigger: body.trigger,
