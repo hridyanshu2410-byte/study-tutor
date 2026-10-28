@@ -88,8 +88,9 @@ async function streamTutor(a: Ask, signal: AbortSignal, onText: (delta: string) 
       };
     } catch (err) {
       if (err instanceof OpenAI.BadRequestError && reasoningEffort && !text && /reasoning/i.test(err.message)) {
-        console.warn(`${openaiModel} doesn't take reasoning_effort ${reasoningEffort}; asking without it`);
-        reasoningEffort = "";
+        const was = reasoningEffort;
+        reasoningEffort = lighterEffort(was, err.message);
+        console.warn(`${openaiModel} doesn't take reasoning_effort ${was}; asking with ${reasoningEffort || "the model's default"}`);
         return streamTutor(a, signal, onText);
       }
       // A reply that doesn't fit the schema is read from its text, not a crash.
@@ -142,6 +143,16 @@ async function streamTutor(a: Ask, signal: AbortSignal, onText: (delta: string) 
     const u = stream.currentMessage?.usage;
     return { text, refused: false, usage: { input: u?.input_tokens ?? 0, output: u?.output_tokens ?? 0, cached: u?.cache_read_input_tokens ?? 0, thinking: 0 } };
   }
+}
+
+// The least thinking a model takes when it turned down `was`: the lightest
+// of the values its error lists, or the next one up, or none at all.
+const EFFORTS = ["none", "minimal", "low", "medium", "high"] as const;
+function lighterEffort(was: string, message: string): OpenAI.ReasoningEffort | "" {
+  const listed = EFFORTS.filter((e) => e !== was && new RegExp(`['"\`]${e}['"\`]`).test(message.split(/supported values/i)[1] ?? ""));
+  if (listed.length) return listed[0];
+  const next = EFFORTS[EFFORTS.indexOf(was as (typeof EFFORTS)[number]) + 1];
+  return next && next !== "medium" ? next : "";
 }
 
 // What the tutor remembers of earlier turns in a session.

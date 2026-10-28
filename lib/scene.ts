@@ -479,10 +479,10 @@ export function scene(pen: Pen, fig: Scene, x: number, y: number, size: number, 
   }
 }
 
-// The space a scene may grow into: its whole grid, beside and below what is drawn.
+// The space a scene may grow into: the rest of its rows, and one more row below.
 export function sceneRoom(fig: Scene, size: number): { w: number; h: number } {
   const ts = Math.max(14, size * 0.52);
-  const rows = Math.min(SCENE_ROWS, Math.max(0, ...fig.things.map((t) => t.row)) + 1);
+  const rows = Math.min(SCENE_ROWS, Math.max(0, ...fig.things.map((t) => t.row)) + 2);
   const head = fig.title ? ts * 1.9 : 0;
   return { w: SCENE_COLS * size * (SCENE_CELL.w + SCENE_CELL.gapX), h: head + rows * size * (CELL_H + SCENE_CELL.gapY) };
 }
