@@ -1,5 +1,5 @@
 // Draws the tutor's figures (graphs, number lines, shapes, flow diagrams,
-// tables, force diagrams, equation steps, diagrams, bars, sketches) with the
+// tables, force diagrams, equation steps, diagrams, bars, sketches, scenes) with the
 // same hand-drawn pen as its writing: stroke by stroke, a little uneven, at
 // hand speed.
 //
@@ -13,67 +13,12 @@ import type { Box } from "./ink.ts";
 import { arrow, jitter, measureText, seeded, write, type Pen, type Rng } from "./handwriting.ts";
 import { compile } from "./expr.ts";
 import type { Figure } from "./figure-schema.ts";
-
-type Pt = [number, number];
+import { boxExit, curveThrough, dot, head, line, ring, roundBox, wrapTo, type Pt } from "./pen-shapes.ts";
+import { scene, sceneRoom } from "./scene.ts";
 // Starts a part of the figure: tags the strokes that follow and gives the part its own randomness.
 type Part = (tag: string) => Rng;
 // Measurements taken from a figure's first part, so later parts line up with it.
 export type FigureLayout = { eqX?: number; restW?: number; widths?: number[] };
-
-// A ruler-free straight line: a slight bow and wobble, like a confident hand.
-function line(pen: Pen, a: Pt, b: Pt, rng: Rng, speed = 1.6) {
-  const d = Math.hypot(b[0] - a[0], b[1] - a[1]);
-  if (d < 1) return;
-  const bow = jitter(rng, Math.min(4, d * 0.012));
-  const nx = -(b[1] - a[1]) / d;
-  const ny = (b[0] - a[0]) / d;
-  const pts: Pt[] = [];
-  const n = Math.max(2, Math.ceil(d / 24));
-  for (let i = 0; i <= n; i++) {
-    const f = i / n;
-    const s = Math.sin(f * Math.PI) * bow;
-    pts.push([a[0] + (b[0] - a[0]) * f + nx * s + jitter(rng, 0.4), a[1] + (b[1] - a[1]) * f + ny * s + jitter(rng, 0.4)]);
-  }
-  pen.draw(pts, speed);
-}
-
-function head(pen: Pen, tip: Pt, ang: number, wing: number, rng: Rng) {
-  const spread = 0.5 + jitter(rng, 0.05);
-  pen.lift(60);
-  pen.draw(
-    [
-      [tip[0] - wing * Math.cos(ang - spread), tip[1] - wing * Math.sin(ang - spread)],
-      tip,
-      [tip[0] - wing * Math.cos(ang + spread), tip[1] - wing * Math.sin(ang + spread)],
-    ],
-    1.4,
-  );
-}
-
-function ring(pen: Pen, c: Pt, r: number, rng: Rng) {
-  const pts: Pt[] = [];
-  const start = rng() * Math.PI * 2;
-  for (let i = 0; i <= 18; i++) {
-    const a = start + (i / 18) * Math.PI * 2.1;
-    pts.push([c[0] + Math.cos(a) * r, c[1] + Math.sin(a) * r]);
-  }
-  pen.draw(pts, 1.2);
-}
-
-// A filled dot: a tight spiral, the way a pen fills one in, with the pen
-// pressed a little wider so no paper shows between the turns.
-function dot(pen: Pen, c: Pt, r: number) {
-  const pts: Pt[] = [];
-  for (let i = 0; i <= 30; i++) {
-    const a = (i / 30) * Math.PI * 5;
-    const rr = r * (1 - i / 32);
-    pts.push([c[0] + Math.cos(a) * rr, c[1] + Math.sin(a) * rr]);
-  }
-  const width = pen.width;
-  pen.width = Math.max(width, r * 0.75);
-  pen.draw(pts, 1.2);
-  pen.width = width;
-}
 
 function niceStep(span: number, target: number): number {
   const raw = span / target;
@@ -266,43 +211,6 @@ function wrap(text: string, max: number): string[] {
   }
   if (cur) lines.push(cur);
   return lines.slice(0, 3);
-}
-
-// Words broken into at most three rows no wider than `max` at text size `ts`.
-function wrapTo(text: string, ts: number, max: number): string[] {
-  const rows: string[] = [];
-  for (const word of text.trim().split(/\s+/).filter(Boolean)) {
-    const last = rows.at(-1);
-    if (last && measureText(`${last} ${word}`, ts) <= max) rows[rows.length - 1] = `${last} ${word}`;
-    else rows.push(word);
-  }
-  return rows.slice(0, 3);
-}
-
-function roundBox(pen: Pen, b: Box, rng: Rng, speed = 1.8) {
-  const r = 6;
-  pen.draw(
-    [
-      [b.x + r, b.y + jitter(rng, 1)],
-      [b.x + b.w - r, b.y + jitter(rng, 1)],
-      [b.x + b.w, b.y + r],
-      [b.x + b.w + jitter(rng, 1), b.y + b.h - r],
-      [b.x + b.w - r, b.y + b.h],
-      [b.x + r, b.y + b.h + jitter(rng, 1)],
-      [b.x, b.y + b.h - r],
-      [b.x + jitter(rng, 1), b.y + r],
-      [b.x + r + 4, b.y - 1],
-    ],
-    speed,
-  );
-}
-
-// Where a line from a box's centre toward a point leaves the box.
-function boxExit(b: Box, toward: Pt): Pt {
-  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
-  const dx = toward[0] - cx, dy = toward[1] - cy;
-  const k = Math.min(Math.abs((b.w / 2 + 6) / (dx || 1e-6)), Math.abs((b.h / 2 + 6) / (dy || 1e-6)));
-  return [cx + dx * k, cy + dy * k];
 }
 
 function flow(pen: Pen, fig: Extract<Figure, { kind: "flow" }>, x: number, y: number, size: number, part: Part) {
@@ -573,6 +481,7 @@ function sketch(pen: Pen, fig: Extract<Figure, { kind: "sketch" }>, x: number, y
   const k = (size * SKETCH_SPAN) / 100;
   const clamp = (v: number | undefined) => Math.min(100, Math.max(0, Number.isFinite(v) ? (v as number) : 0));
   const at = (p: number[] | null | undefined): Pt => [x + clamp(p?.[0]) * k, top + clamp(p?.[1]) * k];
+  const first = pen.strokes.length;
   fig.paths.slice(0, 30).forEach((path, i) => {
     let pts = path.points.slice(0, 60).filter((p) => p.length >= 2 && p.every(Number.isFinite)).map(at);
     if (pts.length < 2) return;
@@ -597,38 +506,28 @@ function sketch(pen: Pen, fig: Extract<Figure, { kind: "sketch" }>, x: number, y
   });
   fig.labels.slice(0, 16).forEach((l, i) => {
     const rng = part(`label:${i}`);
-    const [lx, ly] = at([l.x, l.y]);
     const text = l.text.slice(0, 24);
+    const w = measureText(text, ts);
+    // a label that would sit on the drawing moves to the nearest clear space
+    const clear = (lx: number, ly: number) => {
+      const b = { x: lx - 3, y: ly - ts * 0.85, w: w + 6, h: ts * 1.15 };
+      return !pen.strokes.slice(first).some((st) => st.points.some(([px, py]) => px > b.x && px < b.x + b.w && py > b.y && py < b.y + b.h));
+    };
+    const [x0, y0] = at([l.x, l.y]);
+    const tries: Pt[] = [[0, 0]];
+    for (const d of [1, 2, 3]) tries.push([0, -ts * 1.2 * d], [0, ts * 1.2 * d], [w * 0.6 * d, 0], [-w * 0.6 * d, 0], [w * 0.5 * d, -ts * 1.2 * d], [-w * 0.5 * d, ts * 1.2 * d]);
+    const [dx, dy] = tries.find(([ddx, ddy]) => clear(x0 + ddx, y0 + ddy)) ?? [0, 0];
+    const lx = x0 + dx, ly = y0 + dy;
     pen.lift(100);
     write(pen, text, lx, ly, ts, rng);
     if (l.point_to) {
       // a leader line from the nearer end of the label to the part it names
       const [tx, ty] = at(l.point_to);
-      const w = measureText(text, ts);
       const sx = Math.abs(tx - lx) < Math.abs(tx - (lx + w)) ? lx - 4 : lx + w + 4;
       pen.lift(80);
       line(pen, [sx, ly - ts * 0.35], [tx, ty], rng);
     }
   });
-}
-
-// A smooth curve through the points (Catmull-Rom), the way a hand rounds an outline.
-function curveThrough(pts: Pt[], closed: boolean): Pt[] {
-  const out: Pt[] = [];
-  const n = pts.length;
-  const get = (i: number) => (closed ? pts[(i + n - 1) % (n - 1)] : pts[Math.max(0, Math.min(n - 1, i))]);
-  for (let i = 0; i < n - 1; i++) {
-    const p0 = get(i - 1), p1 = pts[i], p2 = pts[i + 1], p3 = get(i + 2);
-    for (let s = 0; s < 8; s++) {
-      const t = s / 8, t2 = t * t, t3 = t2 * t;
-      out.push([
-        0.5 * (2 * p1[0] + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3),
-        0.5 * (2 * p1[1] + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3),
-      ]);
-    }
-  }
-  out.push(pts[n - 1]);
-  return out;
 }
 
 function hash(s: string): number {
@@ -656,6 +555,7 @@ export function drawFigure(pen: Pen, fig: Figure, x: number, y: number, size: nu
   else if (fig.kind === "diagram") diagram(pen, fig, x, y, size, part);
   else if (fig.kind === "bars") bars(pen, fig, x, y, size, part);
   else if (fig.kind === "sketch") sketch(pen, fig, x, y, size, part);
+  else if (fig.kind === "scene") scene(pen, fig, x, y, size, part);
   pen.tag = undefined;
   return out;
 }
@@ -690,6 +590,13 @@ export function extendFigure(base: Figure, more: Figure): Figure | null {
       edges: added(base.edges, more.edges, (e) => `${e.from}>${e.to}`),
       frames: added(base.frames, more.frames, (f) => f.label),
     };
+  if (base.kind === "scene" && more.kind === "scene")
+    return {
+      ...base,
+      things: added(base.things, more.things, (t) => t.id),
+      arrows: added(base.arrows, more.arrows, (a) => `${a.from}>${a.to}`),
+      marks: added(base.marks, more.marks, (m) => `${m.on}:${m.kind}`),
+    };
   if (base.kind === "sketch" && more.kind === "sketch")
     return {
       ...base,
@@ -712,6 +619,10 @@ export function figureRoom(fig: Figure, size: number, drawn: Box, x: number, y: 
     const rows = Math.min(4, Math.max(0, ...fig.nodes.map((n) => n.row)) + 2);
     const head = fig.title ? ts * 3.2 : ts * 1.8;
     return grow(cols * size * (DIAGRAM_CELL.w + DIAGRAM_CELL.gapX), head + rows * size * (DIAGRAM_CELL.h + DIAGRAM_CELL.gapY));
+  }
+  if (fig.kind === "scene") {
+    const room = sceneRoom(fig, size);
+    return grow(room.w, room.h);
   }
   if (fig.kind === "sketch") {
     const ts = Math.max(14, size * 0.52);

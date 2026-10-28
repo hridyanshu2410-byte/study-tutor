@@ -137,3 +137,36 @@ test("steps grown over beats are checked as one figure", () => {
   const fresh = check.sanitize(beat("Another one.", { draw: { kind: "steps", lines: [{ math: "y = 1", note: null }] } }))!;
   assert.equal(check.slip(fresh), null);
 });
+
+test("beside a paper the tutor writes only math or a key term, and never the same thing twice", () => {
+  const check = new BeatChecker({ paperText: "[p1.s1] We simulate members. [p1.s2] Testing is limited to small groups.", lines: new Set() });
+  const first = check.sanitize(
+    beat("Here's their idea.", {
+      write: ["small test group → larger community"],
+      draw: { kind: "scene", title: "From testing to a populated community", things: [], arrows: [], marks: [] },
+      highlights: [{ ref: "p1.s2", kind: "highlight", note: "the bottleneck" }],
+    }),
+  )!;
+  assert.deepEqual(first.write, [], "a summary line with arrows is left for the drawing");
+  check.commit(first);
+  const next = check.sanitize(
+    beat("They call it this.", {
+      write: ["social simulacra = members made up by GPT-3", "a populated community from testing"],
+      highlights: [{ ref: "p1.s1", kind: "underline", note: "a populated community" }],
+    }),
+  )!;
+  assert.deepEqual(next.write, ["social simulacra = members made up by GPT-3"], "a key term is kept, one line a phrase");
+  assert.equal(next.highlights[0].note, null, "a note that repeats the drawing's title is dropped");
+});
+
+test("beside a paper, one picture a turn and two highlights at most", () => {
+  const check = new BeatChecker({ paperText: "[p1.s1] A. [p1.s2] B. [p1.s3] C.", lines: new Set() });
+  const scene = { kind: "scene" as const, title: null, things: [], arrows: [], marks: [] };
+  const a = check.sanitize(beat("One.", { draw: scene, highlights: [{ ref: "p1.s1", kind: "highlight", note: null }, { ref: "p1.s2", kind: "highlight", note: null }] }))!;
+  check.commit(a);
+  const b = check.sanitize(beat("Two.", { draw: scene, highlights: [{ ref: "p1.s3", kind: "highlight", note: null }] }))!;
+  assert.equal(b.draw, null, "a second picture is left out");
+  assert.deepEqual(b.highlights, [], "and a third highlight");
+  const c = check.sanitize(beat("More of it.", { draw: scene, continue_figure: true }))!;
+  assert.ok(c.draw, "adding to the picture is fine");
+});

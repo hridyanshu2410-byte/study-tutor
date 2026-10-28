@@ -115,11 +115,42 @@ export type BeatRules = {
   lines: Set<string>;
 };
 
+const COMMON = new Set("a an the to of and or in on for is are was it its with by from at as be this that these those their they them we our you your how what why who not no but so than then into".split(" "));
+const wordsOf = (text: string) => new Set(text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 2 && !COMMON.has(w)));
+
+// Mostly the same words as something already on the page this turn.
+function repeats(text: string, before: string[]): boolean {
+  const mine = wordsOf(text);
+  if (mine.size < 2) return false;
+  return before.some((b) => {
+    const theirs = wordsOf(b);
+    let same = 0;
+    for (const w of mine) if (theirs.has(w)) same++;
+    return same / mine.size >= 0.6;
+  });
+}
+
+// Beside a paper the tutor writes only math or a key term, never a summary
+// sentence or a chain of phrases with arrows: that is what the drawing is for.
+const mathOrTerm = (line: string) => /[=≈≠<>≤≥∝:²³√∑∫πθλσμ^_]|\d/.test(line) || line.split(/\s+/).filter(Boolean).length <= 3;
+
+// The words a figure puts on the page, to catch the same idea written twice.
+function figureWords(f: NonNullable<Beat["draw"]>): string[] {
+  if (f.kind === "scene") return [f.title ?? "", ...f.things.flatMap((t) => [t.caption ?? "", t.says ?? ""]), ...f.marks.map((m) => m.note ?? "")];
+  if (f.kind === "diagram") return [f.title ?? "", ...f.nodes.map((n) => n.text), ...f.frames.map((x) => x.label)];
+  if (f.kind === "sketch") return [f.title ?? "", ...f.labels.map((l) => l.text)];
+  if (f.kind === "flow") return f.nodes.map((n) => n.text);
+  if (f.kind === "bars") return [f.title ?? ""];
+  return [];
+}
+
 // Holds a turn's beats to its limits as they arrive (marks, lines and
 // figures per turn), and checks the tutor's own math across beats: a slip in
 // what it writes must never reach the page.
 export class BeatChecker {
   private writes: string[] = [];
+  // everything the turn has put in words on the page, to keep it from saying the same thing twice
+  private inked: string[] = [];
   private steps: string[] | null = null;
   private figures = 0;
   private highlights = 0;
@@ -139,14 +170,23 @@ export class BeatChecker {
     const b = parsed.data;
     const paper = this.rules.paperText;
     b.say = b.say.trim().slice(0, 240);
-    b.write = b.write.map((w) => w.trim().slice(0, paper ? 60 : 48)).filter(Boolean).slice(0, 2).slice(0, Math.max(0, 6 - this.writes.length));
-    if (b.draw && !b.continue_figure && this.figures >= 2) b.draw = null;
+    const seen = [...this.inked, ...(b.draw ? figureWords(b.draw) : [])];
+    b.write = b.write
+      .map((w) => w.trim().slice(0, paper ? 60 : 48))
+      .filter((w) => w && (!paper || (mathOrTerm(w) && !repeats(w, seen))))
+      .slice(0, paper ? 1 : 2)
+      .slice(0, Math.max(0, (paper ? 2 : 6) - this.writes.length));
+    // beside a paper, one picture a turn; otherwise two at most
+    if (b.draw && !b.continue_figure && this.figures >= (paper ? 1 : 2)) b.draw = null;
     b.highlights = !paper
       ? []
       : b.highlights
           .filter((h) => /^p\d+\.s\d+$/.test(h.ref) && paper.includes(`[${h.ref}]`))
-          .slice(0, Math.max(0, 3 - this.highlights))
-          .map((h) => ({ ...h, note: h.note?.trim().slice(0, 40) || null }));
+          .slice(0, Math.max(0, 2 - this.highlights))
+          .map((h) => {
+            const note = h.note?.trim().slice(0, 40) || null;
+            return { ...h, note: note && !repeats(note, [...seen, ...b.write]) ? note : null };
+          });
     b.annotations = b.annotations.filter((a) => this.rules.lines.has(a.line_id) || a.kind === "note").slice(0, Math.max(0, 4 - this.annotations));
     if (!b.say && !b.write.length && !b.draw && !b.highlights.length && !b.annotations.length) return null;
     return b;
@@ -182,6 +222,7 @@ export class BeatChecker {
   commit(b: Beat) {
     this.count++;
     this.writes.push(...b.write);
+    this.inked.push(...b.write, ...b.highlights.flatMap((h) => (h.note ? [h.note] : [])), ...(b.draw ? figureWords(b.draw) : []));
     this.highlights += b.highlights.length;
     this.annotations += b.annotations.length;
     if (b.draw) {

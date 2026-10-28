@@ -16,11 +16,33 @@ export type Clip = {
 
 const clips = new Set<Clip>();
 
-export function prepareClip(text: string): Clip {
+// Voices of short lines fetched once ahead of time, so they can be said at once.
+const kept = new Map<string, Blob>();
+const keeping = new Set<string>();
+
+export function keepClips(texts: string[]) {
+  if (typeof window === "undefined" || serverVoice === false) return;
+  for (const text of texts) {
+    if (kept.has(text) || keeping.has(text)) continue;
+    keeping.add(text);
+    fetch("/api/voice", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }) })
+      .then(async (res) => {
+        if (res.status === 404) serverVoice = false;
+        if (res.ok) kept.set(text, await res.blob());
+      })
+      .catch(() => {})
+      .finally(() => keeping.delete(text));
+  }
+}
+
+// A line's voice: at once if it was kept, otherwise fetched now.
+export const keptClip = (text: string): Clip => prepareClip(text, kept.get(text));
+
+export function prepareClip(text: string, audio?: Blob): Clip {
   let stopped = false;
   let el: HTMLAudioElement | null = null;
   let url: string | null = null;
-  let failed = typeof window === "undefined" || !text.trim() || serverVoice === false;
+  let failed = typeof window === "undefined" || !text.trim() || (serverVoice === false && !audio);
   let asked: { onStart: (ms: number | null) => void; onEnd: () => void } | null = null;
   let heard = false;
   let inBrowser = false;
@@ -66,7 +88,11 @@ export function prepareClip(text: string): Clip {
     audio.play().catch(() => !heard && fallback());
   };
 
-  if (!failed) {
+  if (!failed && audio) {
+    url = URL.createObjectURL(audio);
+    el = new Audio(url);
+    el.preload = "auto";
+  } else if (!failed) {
     fetch("/api/voice", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }), signal: fetching.signal })
       .then(async (res) => {
         if (res.status === 404) serverVoice = false;
@@ -202,7 +228,7 @@ export function speechInputSupported(): boolean {
 }
 
 // How long the student can go quiet mid-thought before we treat it as their turn ending.
-const END_OF_TURN_MS = 1100;
+const END_OF_TURN_MS = 900;
 
 export type ConversationEvents = {
   // A finished thought, ready for the tutor.

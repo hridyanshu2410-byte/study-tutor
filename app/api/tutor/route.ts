@@ -267,7 +267,7 @@ export async function POST(req: Request) {
         : body.trigger === "wrap_up"
           ? "The student is ending the session. Wrap up."
           : body.trigger === "paper_opened"
-            ? "The student just opened this paper. In a few short beats, say what it is about and why it matters, building a diagram of the big picture as you say it, one part per beat (what goes in, what the method does, what comes out; or how the argument is built). Highlight the sentence that states the main contribution as you mention it, and end by asking what they already know or where they'd like to start."
+            ? "The student just opened this paper. In three to five short beats: the problem it tackles, as a situation they can picture; the paper's key idea and how it works, in its own terms, building one picture of it as you go, one part per beat (usually a scene of who and what is involved, or a diagram if it is a pipeline); then one question that gets them thinking about the idea. Highlight the sentence that states the main contribution as you name it."
           : body.trigger === "watched"
             ? `The student just played the simulation and watched it. What happened: ${String(body.watched ?? "").slice(0, 600)}. Compare it with any prediction they marked or said, and ask them to explain the difference or why it happened.`
             : `The student just said: "${body.speech ?? ""}"`,
@@ -576,5 +576,9 @@ function describeFigure(f: NonNullable<Beat["draw"]>): string {
     return `drew a diagram${f.title ? ` "${f.title}"` : ""}: ${f.nodes.map((n) => `${n.text} (row ${n.row}, col ${n.col})`).join(", ")}; arrows ${f.edges.map((e) => `${e.from}→${e.to}`).join(", ")}`;
   if (f.kind === "bars") return `drew a bar chart${f.title ? ` "${f.title}"` : ""}: ${f.bars.map((b) => `${b.label} ${b.value}`).join(", ")}`;
   if (f.kind === "sketch") return `sketched ${f.title ?? "a drawing"}${f.labels.length ? ` labelled ${f.labels.map((l) => l.text).join(", ")}` : ""}`;
+  if (f.kind === "scene")
+    return `drew a scene${f.title ? ` "${f.title}"` : ""}: ${f.things
+      .map((t) => `${t.what}${t.count ? ` ×${t.count}` : ""}${t.caption ? ` "${t.caption}"` : ""}${t.says ? ` saying "${t.says}"` : ""} (row ${t.row}, col ${t.col})`)
+      .join(", ")}${f.arrows.length ? `; arrows ${f.arrows.map((a) => `${a.from}→${a.to}`).join(", ")}` : ""}${f.marks.length ? `; marked ${f.marks.map((m) => `${m.kind} on ${m.on}${m.note ? ` "${m.note}"` : ""}`).join(", ")}` : ""}`;
   return `wrote steps: ${f.lines.map((l) => l.math).join(" ; ")}`;
 }

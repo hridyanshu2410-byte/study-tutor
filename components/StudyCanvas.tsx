@@ -17,7 +17,8 @@ import {
 import type { Beat, PublicTurn, TurnEnd, TutorRequest } from "@/lib/tutor";
 import { retime, speechMs, strokeAt, TurnPlanner, type Mark, type PenPlan } from "@/lib/handwriting";
 import type { Box } from "@/lib/ink";
-import { Conversation, prepareClip, speechInputSupported, stopSpeaking, type Clip } from "@/lib/voice";
+import { Conversation, keepClips, keptClip, prepareClip, speechInputSupported, stopSpeaking, type Clip } from "@/lib/voice";
+import { ALL_LINES, thinkingAloud } from "@/lib/thinking-aloud";
 import { useStudyMemory } from "@/lib/memory-store";
 import type { AnkiNote } from "@/lib/anki";
 import {
@@ -123,6 +124,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const camera = useRef<Camera>({ x: -40, y: -40, z: 1 });
   // The turn the tutor is saying and drawing right now.
   const show = useRef<Show | null>(null);
+  // A short line said while the tutor thinks ("let's see"), until its answer starts.
+  const aside = useRef<{ clip: Clip; speaking: boolean } | null>(null);
   const glide = useRef<{ from: Camera; to: Camera; start: number } | null>(null);
   const drawing = useRef<{ stroke: Stroke; pointerId: number; simulate: boolean } | null>(null);
   const pointers = useRef(new Map<number, { x: number; y: number; type: string }>());
@@ -201,6 +204,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     document.fonts?.ready.then(() => (dirty.current = true));
     tutorFont.current = `${getComputedStyle(document.documentElement).getPropertyValue("--font-tutor").trim() || "cursive"}, cursive`;
     restorePage();
+    // the voices of the things said while thinking, fetched once so they come out at once
+    const warm = setTimeout(() => !stateRef.current.muted && keepClips(ALL_LINES), 2500);
     // In research mode the account copy of the page wins, unless the tester
     // has already started writing before it arrived.
     if (account) {
@@ -219,6 +224,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           // Offline: the local copy is shown and syncs on the next save.
         });
     }
+    return () => clearTimeout(warm);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -461,6 +467,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       if (trigger !== "pause") {
         stopShow();
         stopSpeaking();
+        quietAside();
       } else if (show.current) return; // never glance while still talking
 
       const abort = new AbortController();
@@ -469,6 +476,15 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       changedSinceTutor.current = false;
       setTutorState("thinking");
       setError(null);
+      // Something natural, said at once while the answer is worked out, unless the answer starts first.
+      const line = trigger === "pause" || stateRef.current.muted ? null : thinkingAloud(trigger, speech, paper.current?.ref.title ?? null);
+      if (line) {
+        const clip = keptClip(line.text);
+        setTimeout(() => {
+          if (inFlight.current !== mine || show.current?.acts.some((a) => a.started)) return clip.stop();
+          sayAside(clip, line.text);
+        }, line.after);
+      }
       try {
         const res = await fetch("/api/tutor", {
           method: "POST",
@@ -623,6 +639,47 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   };
 
   // ---------- performing a turn ----------
+  // The short line said while thinking. The answer's first phrase waits for it to end.
+  const sayAside = (clip: Clip, text: string) => {
+    quietAside();
+    const mine = { clip, speaking: false };
+    aside.current = mine;
+    clip.play(
+      () => {
+        if (aside.current !== mine) return;
+        mine.speaking = true;
+        setTutorState("speaking");
+        stateRef.current.tutorState = "speaking";
+        ear.current?.pause();
+        setCaption(text);
+      },
+      () => {
+        if (aside.current !== mine) return;
+        aside.current = null;
+        const s = show.current;
+        if (s && !s.playing && !s.breathing) {
+          // a breath, then the answer
+          s.breathing = true;
+          later(s, () => playNext(s), 160);
+        } else if (!s && inFlight.current) {
+          setTutorState("thinking");
+          stateRef.current.tutorState = "thinking";
+        } else if (!s) settle();
+      },
+    );
+    // a line that can't be said right away isn't worth waiting for
+    setTimeout(() => {
+      if (aside.current !== mine || mine.speaking) return;
+      quietAside();
+      const s = show.current;
+      if (s && !s.playing && !s.breathing) playNext(s);
+    }, 1200);
+  };
+  const quietAside = () => {
+    aside.current?.clip.stop();
+    aside.current = null;
+  };
+
   const beginShow = (trigger: TutorRequest["trigger"], lines: InkLine[]): Show => {
     stopShow();
     const cam = camera.current;
@@ -675,7 +732,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     ahead?.delete(beat.say);
     if (!clip && beat.say && !stateRef.current.muted) clip = prepareClip(beat.say);
     s.acts.push({ beat, ink, clip, region, figure: plan.figure ?? null, started: false, voiceDone: false, inkDone: !ink });
-    if (!s.playing && !s.breathing) playNext(s);
+    // the answer came before the line said while thinking could start: skip that line
+    if (aside.current && !aside.current.speaking) quietAside();
+    if (!s.playing && !s.breathing && !aside.current) playNext(s);
   };
 
   // The rest of the turn is known: what it teaches about the student, and any simulation.
@@ -818,6 +877,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   // Voice off in the middle of a turn: the rest of it plays on in silence.
   const silenceShow = () => {
+    quietAside();
     const s = show.current;
     if (!s) return;
     for (const a of s.acts) {
@@ -834,6 +894,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         }
       } else a.voiceDone = false;
     }
+    // phrases waiting for the line said while thinking go on without it
+    if (!s.playing && !s.breathing) playNext(s);
   };
   // The phrase now playing loses its voice before it was heard: time it by its words instead.
   const playNextSilently = (s: Show, a: Act) => {
@@ -846,6 +908,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const hush = () => {
     stopShow();
     stopSpeaking();
+    quietAside();
     inFlight.current?.abort.abort();
     inFlight.current = null;
     setTutorState("idle");
@@ -855,6 +918,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   // Back to listening and watching after a turn.
   const settle = () => {
+    // never listen while still saying the line said while thinking; it settles when done
+    if (aside.current?.speaking) return;
     setTutorState("idle");
     stateRef.current.tutorState = "idle";
     ear.current?.resume();

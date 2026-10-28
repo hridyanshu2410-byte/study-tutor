@@ -121,5 +121,63 @@ const Sketch = z.object({
     .describe("Short labels on the same grid, placed in clear space."),
 });
 
-export const FigureSchema = z.union([Graph, NumberLine, Shape, Flow, Table, Forces, Steps, Diagram, Bars, Sketch]);
+// The things a scene can show. Each is drawn as a little picture by the app.
+export const THINGS = [
+  "person",
+  "people",
+  "robot",
+  "document",
+  "screen",
+  "chat",
+  "database",
+  "gear",
+  "idea",
+  "magnifier",
+  "warning",
+  "check",
+  "cross",
+  "cloud",
+  "globe",
+  "chart",
+  "clock",
+  "brain",
+  "network",
+  "dots",
+  "book",
+  "money",
+  "flask",
+  "lock",
+  "heart",
+  "cycle",
+  "eye",
+  "target",
+] as const;
+
+const Scene = z.object({
+  kind: z.literal("scene"),
+  title: label,
+  things: z
+    .array(
+      z.object({
+        id: z.string(),
+        what: z
+          .enum(THINGS)
+          .describe(
+            "The picture: person; people (a group, drawn as `count` people: a few side by side, many as a crowd); robot (an AI, a model, an agent, a bot); document (a paper, a page, a prompt, a description, a post); screen (an app, a website, an interface, a prototype); chat (messages, posts and replies); database (data, a dataset); gear (a process, a method, an algorithm); idea; magnifier (search, inspection, analysis); warning (a risk, a harm, a failure); check; cross; cloud; globe (the world, society); chart (results, metrics); clock (time, speed); brain; network (connections, a social network, a graph); dots (data points, samples); book; money (cost); flask (an experiment); lock (security, privacy); heart; cycle (iterate, repeat); eye (looking, attention); target (a goal).",
+          ),
+        row: z.number().int().describe("Grid row, 0 at the top, up to 2."),
+        col: z.number().int().describe("Grid column, 0 at the left, up to 3. One thing per cell."),
+        count: z.number().int().nullable().describe("For people and dots: how many to draw, from 2 to 24, so a few look like a few and many like many. For document: 1 to 3 pages. Null otherwise."),
+        caption: label.describe("What it is, in two to four words of the subject's own terms, written under it."),
+        says: label.describe("A speech bubble from it: the few words it says or posts, or a symbol like \"!\" or \"?\". Null for none."),
+      }),
+    )
+    .describe("Who and what is involved, each as a picture in its own cell of a grid of up to 4 columns and 3 rows. Things that act on each other go side by side along a row, left to right."),
+  arrows: z.array(z.object({ from: z.string(), to: z.string(), label: label.describe("One or two words, such as \"writes\" or \"generates\".") })).describe("Arrows between thing ids: who makes, sends, becomes or causes what."),
+  marks: z
+    .array(z.object({ on: z.string().describe("The id of the thing to point out."), kind: z.enum(["circle", "cross", "check"]), note: label.describe("Two or three words written beside it, such as \"the problem\".") }))
+    .describe("Pointing out a thing you are talking about: a circle around it, a cross over it, a tick beside it. Usually none or one."),
+});
+
+export const FigureSchema = z.union([Graph, NumberLine, Shape, Flow, Table, Forces, Steps, Diagram, Bars, Sketch, Scene]);
 export type Figure = z.infer<typeof FigureSchema>;
