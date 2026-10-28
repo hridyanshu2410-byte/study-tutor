@@ -26,8 +26,9 @@ const openaiModel = process.env.OPENAI_TUTOR_MODEL || "gpt-6-luna";
 let reasoningEffort = (process.env.OPENAI_REASONING_EFFORT || "none") as OpenAI.ReasoningEffort | "";
 // The instructions and the paper are the same every turn: marking where they
 // end, and keying a paper's turns together, keeps them cached between questions
-// so the model starts sooner. Dropped for a model that doesn't take the hints.
-let cacheHints = true;
+// so the model starts sooner. Dropped for a model that doesn't take the hints,
+// or with OPENAI_CACHE_HINTS=off.
+let cacheHints = process.env.OPENAI_CACHE_HINTS !== "off";
 const client = provider === "anthropic" ? new Anthropic() : null;
 const openai = provider === "openai" && process.env.OPENAI_API_KEY ? new OpenAI() : null;
 
@@ -47,71 +48,43 @@ type Ask = {
   cacheKey: string;
 };
 type Usage = { input: number; output: number; cached: number; thinking: number };
-type Answer = { text: string; refused: boolean; usage: Usage };
+// `backup`: a second request was made because the first sat silent ("asked"),
+// and it was the one that answered ("used").
+type Answer = { text: string; refused: boolean; usage: Usage; backup?: "asked" | "used" };
+const NO_USAGE: Usage = { input: 0, output: 0, cached: 0, thinking: 0 };
+
+// Now and then the model sits on a request for fifteen seconds before saying
+// anything. A turn still silent after about twice the usual wait is asked
+// again, and whichever request starts talking first is the one used.
+const starts: number[] = [];
+function backupAfter(): number {
+  const sorted = [...starts].sort((x, y) => x - y);
+  const usual = sorted.length ? sorted[Math.floor((sorted.length - 1) / 2)] : 2000;
+  return Math.min(15000, Math.max(3500, usual * 2.2));
+}
 
 // Asks for a turn and hands over its text as it is written, so the first
 // phrase can be spoken while the rest is still coming.
 async function streamTutor(a: Ask, signal: AbortSignal, onText: (delta: string) => void): Promise<Answer> {
-  let text = "";
   if (provider === "openai") {
-    const png = (p: Pic) => ({ type: "image_url" as const, image_url: { url: `data:${p.type};base64,${p.data}` } });
-    const cut = cacheHints ? { prompt_cache_breakpoint: { mode: "explicit" as const } } : {};
-    const stream = openai!.chat.completions.stream(
-      {
-        model: openaiModel,
-        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-        ...(cacheHints ? { prompt_cache_key: a.cacheKey } : {}),
-        response_format: zodResponseFormat(a.schema, "tutor_turn"),
-        stream_options: { include_usage: true },
-        messages: [
-          { role: "system", content: [{ type: "text", text: a.system, ...cut }] },
-          {
-            role: "user",
-            content: [
-              ...(a.paperText ? [{ type: "text" as const, text: `The paper:\n${a.paperText}`, ...cut }] : []),
-              { type: "text", text: a.paperText ? "What is on the student's screen:" : "The student's page:" },
-              png(a.page),
-              { type: "text", text: "The same page with line ids and numbered tokens:" },
-              png(a.tokens),
-              ...(a.reference ? [{ type: "text" as const, text: "The reference answer the student kept on their card:" }, png(a.reference)] : []),
-              { type: "text", text: a.situation },
-            ],
-          },
-        ],
-      },
-      { signal },
-    );
-    let refused = false;
-    stream.on("content", (delta) => {
-      text += delta;
-      onText(delta);
-    });
-    stream.on("refusal.delta", () => (refused = true));
     try {
-      const res = await stream.finalChatCompletion();
-      const u = res.usage;
-      return {
-        text,
-        refused,
-        usage: { input: u?.prompt_tokens ?? 0, output: u?.completion_tokens ?? 0, cached: u?.prompt_tokens_details?.cached_tokens ?? 0, thinking: u?.completion_tokens_details?.reasoning_tokens ?? 0 },
-      };
+      return await raceOpenAI(a, signal, onText);
     } catch (err) {
-      if (err instanceof OpenAI.BadRequestError && reasoningEffort && !text && /reasoning/i.test(err.message)) {
+      if (err instanceof OpenAI.BadRequestError && reasoningEffort && /reasoning/i.test(err.message)) {
         const was = reasoningEffort;
         reasoningEffort = lighterEffort(was, err.message);
         console.warn(`${openaiModel} doesn't take reasoning_effort ${was}; asking with ${reasoningEffort || "the model's default"}`);
         return streamTutor(a, signal, onText);
       }
-      if (err instanceof OpenAI.BadRequestError && cacheHints && !text && /prompt_cache/i.test(err.message)) {
+      if (err instanceof OpenAI.BadRequestError && cacheHints && /prompt_cache/i.test(err.message)) {
         console.warn(`${openaiModel} doesn't take prompt cache hints; asking without them`);
         cacheHints = false;
         return streamTutor(a, signal, onText);
       }
-      // A reply that doesn't fit the schema is read from its text, not a crash.
-      if (signal.aborted || err instanceof OpenAI.APIError) throw err;
-      return { text, refused, usage: { input: 0, output: 0, cached: 0, thinking: 0 } };
+      throw err;
     }
   }
+  let text = "";
   const stream = client!.messages.stream(
     {
       model: "claude-opus-5-5",
@@ -157,6 +130,106 @@ async function streamTutor(a: Ask, signal: AbortSignal, onText: (delta: string) 
     const u = stream.currentMessage?.usage;
     return { text, refused: false, usage: { input: u?.input_tokens ?? 0, output: u?.output_tokens ?? 0, cached: u?.cache_read_input_tokens ?? 0, thinking: 0 } };
   }
+}
+
+// One request for the turn, and a backup if it sits silent. Only the text of
+// the one that starts talking first is handed over; the other is stopped.
+function raceOpenAI(a: Ask, signal: AbortSignal, onText: (delta: string) => void): Promise<Answer> {
+  const png = (p: Pic) => ({ type: "image_url" as const, image_url: { url: `data:${p.type};base64,${p.data}` } });
+  const cut = cacheHints ? { prompt_cache_breakpoint: { mode: "explicit" as const } } : {};
+  const request = (stop: AbortSignal) =>
+    openai!.chat.completions.stream(
+      {
+        model: openaiModel,
+        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+        ...(cacheHints ? { prompt_cache_key: a.cacheKey } : {}),
+        response_format: zodResponseFormat(a.schema, "tutor_turn"),
+        stream_options: { include_usage: true },
+        messages: [
+          { role: "system", content: [{ type: "text", text: a.system, ...cut }] },
+          {
+            role: "user",
+            content: [
+              ...(a.paperText ? [{ type: "text" as const, text: `The paper:\n${a.paperText}`, ...cut }] : []),
+              { type: "text", text: a.paperText ? "What is on the student's screen:" : "The student's page:" },
+              png(a.page),
+              { type: "text", text: "The same page with line ids and numbered tokens:" },
+              png(a.tokens),
+              ...(a.reference ? [{ type: "text" as const, text: "The reference answer the student kept on their card:" }, png(a.reference)] : []),
+              { type: "text", text: a.situation },
+            ],
+          },
+        ],
+      },
+      { signal: stop },
+    );
+  type Try = { stop: AbortController; at: number; text: string; refused: boolean };
+  const tries: Try[] = [];
+  let winner: Try | null = null;
+  return new Promise<Answer>((resolve, reject) => {
+    let open = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const stopAll = () => tries.forEach((t) => t.stop.abort());
+    signal.addEventListener("abort", stopAll, { once: true });
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", stopAll);
+    };
+    const choose = (t: Try) => {
+      if (winner) return;
+      winner = t;
+      for (const o of tries) if (o !== t) o.stop.abort();
+    };
+    const backup = (t: Try) => (tries.length < 2 ? undefined : t === tries[0] ? "asked" : "used");
+    const launch = () => {
+      const t: Try = { stop: new AbortController(), at: Date.now(), text: "", refused: false };
+      tries.push(t);
+      open++;
+      const stream = request(t.stop.signal);
+      stream.on("content", (delta) => {
+        if (!winner) {
+          // how long the model usually takes to start, from the request that answered
+          starts.push(Date.now() - t.at);
+          if (starts.length > 15) starts.shift();
+          choose(t);
+        }
+        if (winner !== t) return;
+        t.text += delta;
+        onText(delta);
+      });
+      stream.on("refusal.delta", () => (t.refused = true));
+      stream.finalChatCompletion().then(
+        (res) => {
+          if (winner && winner !== t) return;
+          choose(t);
+          done();
+          const u = res.usage;
+          resolve({
+            text: t.text,
+            refused: t.refused,
+            usage: { input: u?.prompt_tokens ?? 0, output: u?.completion_tokens ?? 0, cached: u?.prompt_tokens_details?.cached_tokens ?? 0, thinking: u?.completion_tokens_details?.reasoning_tokens ?? 0 },
+            backup: backup(t),
+          });
+        },
+        (err) => {
+          open--;
+          // a request that lost the race, or one that failed while the other may still answer
+          if ((winner && winner !== t) || (!winner && open > 0 && !signal.aborted)) return;
+          done();
+          // A reply that doesn't fit the schema is read from its text, not a crash.
+          if (winner === t && !signal.aborted && !(err instanceof OpenAI.APIError)) resolve({ text: t.text, refused: t.refused, usage: NO_USAGE, backup: backup(t) });
+          else reject(err);
+        },
+      );
+    };
+    launch();
+    const wait = backupAfter();
+    timer = setTimeout(() => {
+      if (winner || signal.aborted) return;
+      console.warn(`${openaiModel} said nothing for ${(wait / 1000).toFixed(1)} s; asking again`);
+      launch();
+    }, wait);
+  });
 }
 
 // The least thinking a model takes when it turned down `was`: the lightest
@@ -323,6 +396,7 @@ export async function POST(req: Request) {
     let diagnosis = "";
     let extra = "";
     let retried = false;
+    let backup: Answer["backup"];
     // A retry starts the turn over; the beats the student already heard are skipped.
     let skip = 0;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -391,6 +465,7 @@ export async function POST(req: Request) {
             pump();
           },
         );
+        backup ??= answer.backup;
         usage = {
           input: usage.input + answer.usage.input,
           output: usage.output + answer.usage.output,
@@ -447,7 +522,7 @@ export async function POST(req: Request) {
     console.log(
       `tutor ${body.trigger}: ${provider === "openai" ? `${openaiModel} (reasoning ${reasoningEffort || "default"})` : "claude-opus-5-5"}, ` +
         `first text ${sec(firstText)}, first beat ${sec(firstBeat)}, done ${sec(Date.now() - started)}; ` +
-        `${usage.input} tokens in (${usage.cached} cached), ${usage.output} out (${usage.thinking} thinking); ${sent.length} beats, ${move}${retried ? ", retried" : ""}${gone.signal.aborted ? ", cut off" : ""}`,
+        `${usage.input} tokens in (${usage.cached} cached), ${usage.output} out (${usage.thinking} thinking); ${sent.length} beats, ${move}${retried ? ", retried" : ""}${backup ? `, backup ${backup}` : ""}${gone.signal.aborted ? ", cut off" : ""}`,
     );
 
     const record: PastTurn = {
