@@ -30,7 +30,7 @@ This puts the tutor online so testers can sign up, give consent, and use it on t
    | `STUDY_CONDITIONS` | optional: study arms to compare, e.g. `socratic,explain`. Each tester gets one at consent, filling the smallest arm first. `socratic` is the full tutor, `on_request` only looks and speaks when asked or spoken to, `explain` gives worked solutions directly like a typical AI helper. Leave empty and everyone gets the full tutor |
    | `STUDY_PRETEST` | optional: `on` asks each tester an 8-question quiz before their first session |
    | `STUDY_POSTTEST` | optional: `on` offers the parallel end-of-study quiz in each tester's menu. Turn it on when the study period ends |
-   | `OPENAI_API_KEY` | runs the tutor on GPT-6 Luna if no Anthropic key is set (`OPENAI_TUTOR_MODEL` changes the model); also the natural tutor voice |
+   | `OPENAI_API_KEY` | runs the tutor on GPT-6 Sol if no Anthropic key is set (`OPENAI_TUTOR_MODEL` changes the model); also the natural tutor voice |
 
 3. Deploy. Copy the site address Vercel gives you (for example `https://study-tutor.vercel.app`).
 4. Back in Supabase, open **Authentication → URL Configuration**. Set **Site URL** to that address and add `https://<your-address>/auth/callback` under **Redirect URLs**, so confirmation and password-reset links come back to the app.

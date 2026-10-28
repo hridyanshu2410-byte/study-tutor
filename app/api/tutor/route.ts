@@ -11,14 +11,16 @@ import { allowedMoves, EXPLAIN_PROMPT, LADDER, MOVES, PAPER_PROMPT, REVIEW_PROMP
 import { BeatChecker, readingFlag, TurnScanner } from "@/lib/turn-stream";
 
 // The tutor runs on Claude when ANTHROPIC_API_KEY is set, otherwise on OpenAI
-// (OPENAI_TUTOR_MODEL, default GPT-6 Luna). TUTOR_PROVIDER forces one.
+// (OPENAI_TUTOR_MODEL, default GPT-6 Sol). TUTOR_PROVIDER forces one.
 const provider: "anthropic" | "openai" =
   process.env.TUTOR_PROVIDER === "openai" || process.env.TUTOR_PROVIDER === "anthropic"
     ? process.env.TUTOR_PROVIDER
     : process.env.ANTHROPIC_API_KEY
       ? "anthropic"
       : "openai";
-const openaiModel = process.env.OPENAI_TUTOR_MODEL || "gpt-6-luna";
+// Sol over Luna: on real turns beside a paper it started as fast (3.6 to 4.2 s),
+// never stalled, and taught clearly better, at about 20 times the price.
+const openaiModel = process.env.OPENAI_TUTOR_MODEL || "gpt-6-sol";
 // GPT-6 models can reason before they answer. Timed on real turns, even low
 // thinking put the first words one to two seconds later, so by default the
 // tutor answers straight away. OPENAI_REASONING_EFFORT changes it; a model that
