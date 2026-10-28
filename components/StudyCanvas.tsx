@@ -14,10 +14,10 @@ import {
   type Point,
   type Stroke,
 } from "@/lib/ink";
-import type { PublicTurn, TutorRequest } from "@/lib/tutor";
-import { planAnnotations, retime, speechMs, strokeAt, type PenPlan } from "@/lib/handwriting";
+import type { Beat, PublicTurn, TurnEnd, TutorRequest } from "@/lib/tutor";
+import { retime, speechMs, strokeAt, TurnPlanner, type Mark, type PenPlan } from "@/lib/handwriting";
 import type { Box } from "@/lib/ink";
-import { Conversation, speak, speechInputSupported, stopSpeaking } from "@/lib/voice";
+import { Conversation, prepareClip, speechInputSupported, stopSpeaking, type Clip } from "@/lib/voice";
 import { useStudyMemory } from "@/lib/memory-store";
 import type { AnkiNote } from "@/lib/anki";
 import {
@@ -51,11 +51,37 @@ type ReviewRun = { ids: string[]; index: number; suggested: Grade | null; reveal
 const GRADES: Grade[] = [1, 2, 3, 4] as Grade[];
 type TutorState = "idle" | "thinking" | "speaking";
 
-// One turn's worth of tutor pen strokes. `born` is when the pen started, in
+// One phrase's worth of tutor pen strokes. `born` is when the pen started, in
 // performance.now() time; 0 means already fully written (e.g. restored), and
 // Infinity means waiting to start with the voice.
 // `marks` are passages it highlighted in a paper, shown as the pen starts.
 type TutorInk = { id: string; plan: PenPlan; born: number; marks?: Box[]; rules?: Box[] };
+// One spoken phrase of a turn: its words, its ink and its voice, and how far along it is.
+// `region` is everything the phrase marks or draws; `figure` the whole of the figure it draws or adds to.
+type Act = { beat: Beat; ink: TutorInk | null; clip: Clip | null; region: Box | null; figure: Box | null; started: boolean; voiceDone: boolean; inkDone: boolean };
+// A turn being performed. Phrases keep arriving while earlier ones are spoken;
+// each one's ink is drawn while its words are heard, and the next follows
+// when both are done.
+type Show = {
+  trigger: TutorRequest["trigger"];
+  lines: InkLine[];
+  planner: TurnPlanner;
+  acts: Act[];
+  next: number;
+  playing: Act | null;
+  // between two phrases, taking a breath
+  breathing: boolean;
+  end: TurnEnd | null;
+  // everything the turn has said, and the sentence being said (it can run over several phrases)
+  said: string;
+  sentence: string;
+  // the caption as it stands
+  shown: string;
+  timers: ReturnType<typeof setTimeout>[];
+  // what of the turn is kept in view, and the figure it is drawing
+  region: Box | null;
+  figure: Box | null;
+};
 // Which paper is open and where its pages start; the paper itself lives in IndexedDB.
 type PaperRef = { id: string; title: string; x: number; y: number; w: number };
 type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string; images?: PageImage[]; sims?: PageSim[]; paper?: PaperRef | null };
@@ -95,8 +121,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const tutorFont = useRef("cursive");
   const paper = useRef<OpenPaper | null>(null);
   const camera = useRef<Camera>({ x: -40, y: -40, z: 1 });
-  // A turn waiting for its voice: shows its words and ink, and when nothing is heard in time, the fallback does.
-  const pendingTurn = useRef<{ start: () => void; fallback: ReturnType<typeof setTimeout> } | null>(null);
+  // The turn the tutor is saying and drawing right now.
+  const show = useRef<Show | null>(null);
   const glide = useRef<{ from: Camera; to: Camera; start: number } | null>(null);
   const drawing = useRef<{ stroke: Stroke; pointerId: number; simulate: boolean } | null>(null);
   const pointers = useRef(new Map<number, { x: number; y: number; type: string }>());
@@ -239,7 +265,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   const save = useCallback(() => {
     if (stateRef.current.mode === "review") return;
-    const page: SavedPage = { strokes: strokes.current, tutorInk: tutorInk.current, problem: stateRef.current.problem, images: images.current, sims: sims.current, paper: paper.current?.ref ?? null };
+    // ink for phrases not yet spoken isn't on the page yet
+    const ink = tutorInk.current.filter((t) => t.born !== Infinity);
+    const page: SavedPage = { strokes: strokes.current, tutorInk: ink, problem: stateRef.current.problem, images: images.current, sims: sims.current, paper: paper.current?.ref ?? null };
     if (account) saveCloud(account.userId, "page", page);
     try {
       localStorage.setItem(pageKey, JSON.stringify(page));
@@ -353,7 +381,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         if (f === 1) glide.current = null;
         dirty.current = true;
       }
-      const animating = simRuns.current.size > 0 || tutorInk.current.some((t) => t.born > 0 && now - t.born < t.plan.duration + 50);
+      const animating = simRuns.current.size > 0 || tutorInk.current.some((t) => t.born > 0 && t.born !== Infinity && now - t.born < t.plan.duration + 50);
       if (!dirty.current && !animating) return;
       dirty.current = false;
 
@@ -430,7 +458,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       if (pauseTimer.current) clearTimeout(pauseTimer.current);
       const lines = groupLines(strokes.current);
       if (!lines.length && !speech && !watched && !stateRef.current.problem.trim() && !images.current.length && !paper.current) return;
-      if (trigger !== "pause") stopSpeaking();
+      if (trigger !== "pause") {
+        stopShow();
+        stopSpeaking();
+      } else if (show.current) return; // never glance while still talking
 
       const abort = new AbortController();
       const mine = { trigger, speech, abort };
@@ -480,26 +511,72 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
               : renderPageImages(strokes.current, lines, loadedPictures())),
           } satisfies TutorRequest),
         });
-        const data = await res.json();
         if (inFlight.current !== mine) return;
-        inFlight.current = null;
-        stats.current.turns++;
-        if (trigger !== "pause" && focus.current) {
-          focus.current = null; // the pointing has been answered
-          dirty.current = true;
-        }
-        if (!res.ok && !data.say) throw new Error(data.error ?? `Tutor error ${res.status}`);
-        // Don't talk over a student who started speaking while we looked.
-        if (trigger === "pause" && hearing.current) {
-          setTutorState("idle");
+        const answered = () => {
+          stats.current.turns++;
+          if (trigger !== "pause" && focus.current) {
+            focus.current = null; // the pointing has been answered
+            dirty.current = true;
+          }
+        };
+        if (!res.ok || !res.body || !(res.headers.get("content-type") ?? "").includes("ndjson")) {
+          // a whole turn at once: an error, or a canned reply such as the daily limit
+          const data = (await res.json()) as Partial<PublicTurn> & { error?: string };
+          if (inFlight.current !== mine) return;
+          inFlight.current = null;
+          answered();
+          if (!res.ok && !data.say) throw new Error(data.error ?? `Tutor error ${res.status}`);
+          if (trigger === "pause" && hearing.current) return settle();
+          const s = beginShow(trigger, lines);
+          for (const b of data.beats ?? []) addBeat(s, b);
+          endShow(s, data as TurnEnd);
           return;
         }
-        respond(data as PublicTurn, lines, trigger);
+        // The turn arrives phrase by phrase; the first is spoken while the rest is still being written.
+        answered();
+        let s: Show | null = null;
+        // voices fetched for phrases whose ink is still coming
+        const ahead = new Map<string, Clip>();
+        try {
+          for await (const event of readLines(res.body)) {
+            if (inFlight.current !== mine) return;
+            const e = event as { upcoming?: string; beat?: Beat; turn?: TurnEnd; error?: string };
+            if (e.error) throw new Error(e.error);
+            if (e.upcoming) {
+              if (!stateRef.current.muted && !ahead.has(e.upcoming) && !(trigger === "pause" && hearing.current)) ahead.set(e.upcoming, prepareClip(e.upcoming));
+              continue;
+            }
+            if (!s && (e.beat || e.turn)) {
+              // Don't talk over a student who started speaking while we looked.
+              if (trigger === "pause" && hearing.current) {
+                abort.abort();
+                inFlight.current = null;
+                return settle();
+              }
+              s = beginShow(trigger, lines);
+            }
+            if (s && e.beat) addBeat(s, e.beat, ahead);
+            else if (s && e.turn) endShow(s, e.turn);
+          }
+        } finally {
+          for (const c of ahead.values()) c.stop();
+        }
+        if (inFlight.current === mine) inFlight.current = null;
+        if (!s) return settle();
+        // the stream broke off before the end of the turn: finish what was said
+        if (!s.end) endShow(s, { move: "ask_plan", say: s.acts.map((a) => a.beat.say).join(" "), simulate: null, skill: { concept: "", evidence: "none" }, card: null, review_result: null });
       } catch (e) {
         if (abort.signal.aborted) return; // replaced by a newer turn
         if (inFlight.current === mine) inFlight.current = null;
         setError(e instanceof Error ? e.message : "The tutor could not be reached.");
-        settle();
+        if (show.current?.acts.length) {
+          // say what has arrived, then stop
+          const s = show.current;
+          if (!s.end) endShow(s, { move: "ask_plan", say: s.acts.map((a) => a.beat.say).join(" "), simulate: null, skill: { concept: "", evidence: "none" }, card: null, review_result: null });
+        } else {
+          stopShow();
+          settle();
+        }
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -545,91 +622,230 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     return { line_id: best.line.id, token: td < 80 ? token : null };
   };
 
-  const respond = (turn: PublicTurn, lines: InkLine[], trigger: TutorRequest["trigger"] = "pause") => {
-    remember(turn);
-    if (trigger === "wrap_up") {
-      const s = stats.current;
-      setSummary({ recap: turn.say, stats: { ...s } });
-      logEvent(
-        account,
-        "session_finished",
-        { minutes: Math.round((Date.now() - s.startedAt) / 60000), turns: s.turns, concepts: s.concepts, cards: s.cards.length },
-        sessionId.current,
-      );
-    }
-    const write = turn.write ?? [];
-    const figures = turn.draw ?? [];
+  // ---------- performing a turn ----------
+  const beginShow = (trigger: TutorRequest["trigger"], lines: InkLine[]): Show => {
+    stopShow();
+    const cam = camera.current;
+    const p = paper.current;
+    const planner = new TurnPlanner(lines, Math.floor(Math.random() * 2 ** 31), {
+      avoid: tutorInk.current.flatMap((t) => (p && t.plan.parts ? t.plan.parts : t.plan.box ? [t.plan.box] : [])),
+      origin: { x: cam.x, y: cam.y + 60 / cam.z },
+      // the caption panel covers the bottom of the screen
+      column: p ? { x: p.ref.x + p.ref.w + 70, top: Math.max(p.ref.y, cam.y + 80 / cam.z), bottom: cam.y + viewBox().h - 180 / cam.z } : undefined,
+      size: p ? 19 : undefined,
+    });
+    const s: Show = { trigger, lines, planner, acts: [], next: 0, playing: null, breathing: false, end: null, said: "", sentence: "", shown: "", timers: [], region: null, figure: null };
+    show.current = s;
+    return s;
+  };
+
+  const later = (s: Show, fn: () => void, ms: number) => {
+    s.timers.push(setTimeout(() => show.current === s && fn(), Math.max(0, ms)));
+  };
+
+  // A phrase has arrived: plan its ink and fetch its voice now (unless it is
+  // already coming), so both are ready when its turn comes.
+  const addBeat = (s: Show, beat: Beat, ahead?: Map<string, Clip>) => {
+    if (show.current !== s) return;
     // Passages it points at in the paper, in page coordinates.
-    const marks = (turn.highlights ?? []).flatMap((h) => {
+    const marks: Mark[] = beat.highlights.flatMap((h) => {
       const found = paper.current ? findSentence(paper.current.data, h.ref) : null;
       const at = found ? paperPage(found.page.n) : null;
       if (!found || !at) return [];
       const boxes = found.sentence.boxes.map((b) => ({ x: at.x + b.x * at.w - 2, y: at.y + b.y * at.h - 1, w: b.w * at.w + 4, h: b.h * at.h + 2 }));
       return boxes.length ? [{ boxes, kind: h.kind, note: h.note, edge: at.x + at.w }] : [];
     });
-    if (turn.move === "wait" || (!turn.say && !turn.annotations.length && !write.length && !figures.length && !turn.simulate && !marks.length)) {
-      settle();
+    const plan = s.planner.plan({
+      annotations: beat.annotations,
+      marks,
+      write: beat.write,
+      figures: beat.draw ? [beat.draw] : [],
+      continueFigure: beat.continue_figure,
+    });
+    const rects = marks.filter((m) => m.kind === "highlight").flatMap((m) => m.boxes);
+    // Paper lines sit close together, so an underline is a neat rule just under the baseline (boxes run to 1.2× the font height).
+    const rules = marks.filter((m) => m.kind === "underline").flatMap((m) => m.boxes.map((b) => ({ x: b.x, y: b.y + (b.h - 2) / 1.2 + 2, w: b.w, h: 1.6 })));
+    let ink: TutorInk | null = null;
+    if (plan.strokes.length || rects.length || rules.length) {
+      ink = { id: crypto.randomUUID(), plan, born: Infinity, marks: rects, rules };
+      tutorInk.current.push(ink);
+    }
+    const region = [...marks.flatMap((m) => m.boxes), ...(plan.box ? [plan.box] : [])].reduce<Box | null>((a, b) => (a ? unionBox(a, b) : b), null);
+    let clip = ahead?.get(beat.say) ?? null;
+    ahead?.delete(beat.say);
+    if (!clip && beat.say && !stateRef.current.muted) clip = prepareClip(beat.say);
+    s.acts.push({ beat, ink, clip, region, figure: plan.figure ?? null, started: false, voiceDone: false, inkDone: !ink });
+    if (!s.playing && !s.breathing) playNext(s);
+  };
+
+  // The rest of the turn is known: what it teaches about the student, and any simulation.
+  const endShow = (s: Show, end: TurnEnd) => {
+    if (show.current !== s || s.end) return;
+    s.end = end;
+    if (end.simulate) placeSim(end.simulate, s.lines);
+    if (!s.playing && s.next >= s.acts.length) finishShow(s);
+  };
+
+  const playNext = (s: Show) => {
+    if (show.current !== s) return;
+    const act = s.acts[s.next];
+    s.breathing = false;
+    if (!act) {
+      // caught up: the next phrase is still being written, or the turn is over
+      s.playing = null;
+      if (s.end) finishShow(s);
       return;
     }
-    // The pen starts when the voice does, so the math appears as it is said.
-    let ink: TutorInk | null = null;
-    if (turn.annotations.length || write.length || figures.length || marks.length) {
-      const cam = camera.current;
-      const p = paper.current;
-      const plan = planAnnotations(turn.annotations, lines, Math.floor(Math.random() * 2 ** 31), {
-        write,
-        figures,
-        avoid: tutorInk.current.flatMap((t) => (p && t.plan.parts ? t.plan.parts : t.plan.box ? [t.plan.box] : [])),
-        origin: { x: cam.x, y: cam.y + 60 / cam.z },
-        // the caption panel covers the bottom of the screen
-        column: p ? { x: p.ref.x + p.ref.w + 70, top: Math.max(p.ref.y, cam.y + 80 / cam.z), bottom: cam.y + viewBox().h - 180 / cam.z } : undefined,
-        marks,
-        size: p ? 19 : undefined,
-      });
-      const rects = marks.filter((m) => m.kind === "highlight").flatMap((m) => m.boxes);
-      // Paper lines sit close together, so an underline is a neat rule just under the baseline (boxes run to 1.2× the font height).
-      const rules = marks.filter((m) => m.kind === "underline").flatMap((m) => m.boxes.map((b) => ({ x: b.x, y: b.y + (b.h - 2) / 1.2 + 2, w: b.w, h: 1.6 })));
-      if (plan.strokes.length || rects.length || rules.length) {
-        ink = { id: crypto.randomUUID(), plan, born: Infinity, marks: rects, rules };
-        tutorInk.current.push(ink);
-        // Keep the passages it points at and what it writes on screen together,
-        // zooming out to fit them or back in when they're small.
-        const target = [...marks.flatMap((m) => m.boxes), ...(plan.box ? [plan.box] : [])].reduce<Box | null>((a, b) => (a ? unionBox(a, b) : b), null);
-        if (target) reveal(target, Boolean(p));
+    s.next++;
+    s.playing = act;
+    setTutorState("speaking");
+    stateRef.current.tutorState = "speaking";
+    ear.current?.pause();
+    follow(s, act);
+    const words = act.beat.say;
+    const begin = (ms: number | null) => {
+      if (act.started || show.current !== s) return;
+      act.started = true;
+      const speaking = words ? (ms ?? speechMs(words)) : 0;
+      if (act.ink) {
+        // the pen keeps pace so the phrase's ink is done about when its words are
+        if (words) act.ink.plan = retime(act.ink.plan, Math.min(1, speaking / Math.max(1, act.ink.plan.duration)));
+        act.ink.born = performance.now();
+        later(s, () => {
+          act.inkDone = true;
+          after(s, act);
+        }, act.ink.plan.duration);
       }
-    }
-    if (turn.simulate) placeSim(turn.simulate, lines);
-    // The words, the caption and the pen all start the moment the voice is heard,
-    // and the pen keeps pace so the drawing is done about when the sentence is.
-    if (ink && turn.say && !stateRef.current.muted) ink.plan = retime(ink.plan, Math.min(1, speechMs(turn.say) / Math.max(1, ink.plan.duration)));
-    const startPen = () => {
-      if (pendingTurn.current?.start === startPen) {
-        clearTimeout(pendingTurn.current.fallback);
-        pendingTurn.current = null;
-      }
-      if (turn.say) setCaption(turn.say);
-      if (ink && ink.born === Infinity) ink.born = performance.now();
+      fillCaption(s, words, speaking, () => act.voiceDone);
+      if (!act.clip) later(s, () => {
+        act.voiceDone = true;
+        after(s, act);
+      }, speaking);
       dirty.current = true;
     };
+    if (act.clip) {
+      act.clip.play(begin, () => {
+        act.voiceDone = true;
+        begin(0);
+        // the words are all said, whatever the estimate was
+        if (show.current === s) setCaption(s.shown);
+        after(s, act);
+      });
+      // the voice never came: go on without it
+      later(s, () => {
+        if (act.started) return;
+        act.clip?.stop();
+        act.clip = null;
+        act.voiceDone = false;
+        begin(null);
+      }, 7000);
+    } else begin(null);
+  };
+
+  // A phrase is over once its words and its ink both are; a breath, then the next.
+  const after = (s: Show, act: Act) => {
+    if (show.current !== s || s.playing !== act || !act.voiceDone || !act.inkDone) return;
+    s.playing = null;
+    s.breathing = true;
+    save();
+    later(s, () => playNext(s), 160);
+  };
+
+  // The caption shows the sentence being said, filling in word by word as the
+  // words are spoken (until `over`, when the voice has said them all).
+  const fillCaption = (s: Show, text: string, ms: number, over: () => boolean) => {
+    const words = text.split(/\s+/).filter(Boolean);
+    if (!words.length) return;
+    s.said = `${s.said} ${text}`.trim();
+    const before = s.sentence;
+    s.shown = `${before} ${text}`.trim();
+    s.sentence = /[.?!]["'”’)]*$/.test(text.trim()) ? "" : s.shown;
+    const total = words.reduce((n, w) => n + w.length + 1, 0);
+    let at = 0;
+    words.forEach((w, i) => {
+      later(s, () => !over() && setCaption(`${before} ${words.slice(0, i + 1).join(" ")}`.trim()), (at / total) * ms * 0.92);
+      at += w.length + 1;
+    });
+  };
+
+  // Keeps what the turn draws in view: all of it while that is still readable,
+  // otherwise the figure being drawn and the newest marks.
+  const follow = (s: Show, act: Act) => {
+    if (!act.region) return;
+    if (act.figure) s.figure = act.figure;
+    const canvas = canvasRef.current;
+    const readable = (b: Box) => !canvas || Math.min((canvas.clientWidth - 80) / b.w, (canvas.clientHeight - 260) / b.h) >= 0.8;
+    const all = s.region ? unionBox(s.region, act.region) : act.region;
+    const drawing = s.figure ? unionBox(s.figure, act.region) : act.region;
+    s.region = readable(all) ? all : readable(drawing) ? drawing : act.region;
+    reveal(s.region, Boolean(paper.current));
+  };
+
+  const finishShow = (s: Show) => {
+    if (show.current !== s || !s.end) return;
+    show.current = null;
+    s.timers.forEach(clearTimeout);
+    const end = s.end;
+    if (s.shown) setCaption(s.shown);
+    remember(end);
+    if (s.trigger === "wrap_up") {
+      const st = stats.current;
+      setSummary({ recap: end.say || s.said, stats: { ...st } });
+      logEvent(
+        account,
+        "session_finished",
+        { minutes: Math.round((Date.now() - st.startedAt) / 60000), turns: st.turns, concepts: st.concepts, cards: st.cards.length },
+        sessionId.current,
+      );
+    }
     dirty.current = true;
     save();
-    if (!turn.say || stateRef.current.muted) {
-      startPen();
-      settle();
-      return;
+    settle();
+  };
+
+  // Cuts the turn short: the phrase being drawn finishes, the rest never reaches the page.
+  const stopShow = () => {
+    const s = show.current;
+    if (!s) return;
+    show.current = null;
+    s.timers.forEach(clearTimeout);
+    for (const a of s.acts) a.clip?.stop();
+    tutorInk.current = tutorInk.current.filter((t) => t.born !== Infinity);
+    if (s.shown) setCaption(s.shown);
+    dirty.current = true;
+    save();
+  };
+
+  // Voice off in the middle of a turn: the rest of it plays on in silence.
+  const silenceShow = () => {
+    const s = show.current;
+    if (!s) return;
+    for (const a of s.acts) {
+      if (!a.clip) continue;
+      a.clip.stop();
+      a.clip = null;
+      if (a === s.playing) {
+        if (!a.started) {
+          a.voiceDone = false;
+          playNextSilently(s, a);
+        } else {
+          a.voiceDone = true;
+          after(s, a);
+        }
+      } else a.voiceDone = false;
     }
-    setTutorState("speaking");
-    ear.current?.pause();
-    pendingTurn.current?.start();
-    pendingTurn.current = { start: startPen, fallback: setTimeout(startPen, 8000) }; // the voice never came: show it anyway
-    speak(turn.say, settle, startPen);
+  };
+  // The phrase now playing loses its voice before it was heard: time it by its words instead.
+  const playNextSilently = (s: Show, a: Act) => {
+    s.next = s.acts.indexOf(a);
+    s.playing = null;
+    playNext(s);
   };
 
   // Stop talking now (a new page, a new card) and go back to listening.
   const hush = () => {
+    stopShow();
     stopSpeaking();
-    pendingTurn.current?.start();
-    tutorInk.current.forEach((t) => t.born === Infinity && (t.born = performance.now()));
     inFlight.current?.abort.abort();
     inFlight.current = null;
     setTutorState("idle");
@@ -647,7 +863,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   // What a turn teaches us about the student: mastery evidence, a new review
   // card after a fixed mistake, or the result of a review attempt.
-  const remember = (turn: PublicTurn) => {
+  const remember = (turn: TurnEnd) => {
     const at = new Date();
     if (stateRef.current.mode === "study") {
       if (turn.skill?.concept && (turn.skill.evidence === "slip" || turn.skill.evidence === "solved")) {
@@ -852,9 +1068,18 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     if (fit) {
       const sw = canvas.clientWidth - 80, sh = canvas.clientHeight - top - bottom;
       const best = Math.max(0.3, Math.min(1.1, sw / Math.max(1, b.w), sh / Math.max(1, b.h)));
-      const inView = b.x >= cam.x && b.y >= cam.y + top / cam.z && b.x + b.w <= cam.x + canvas.clientWidth / cam.z && b.y + b.h <= cam.y + (canvas.clientHeight - bottom) / cam.z;
-      // leave the view alone when it already shows everything at a comfortable size
-      if (inView && cam.z <= best && cam.z >= best * 0.6) return;
+      // At a comfortable size already: slide just enough to bring it all in, without zooming.
+      if (cam.z <= best && cam.z >= best * 0.6) {
+        const left = cam.x + 40 / cam.z, right = cam.x + (canvas.clientWidth - 40) / cam.z;
+        const upper = cam.y + top / cam.z, lower = cam.y + (canvas.clientHeight - bottom) / cam.z;
+        const dx = b.x < left ? b.x - left : b.x + b.w > right ? b.x + b.w - right : 0;
+        const dy = b.y < upper ? b.y - upper : b.y + b.h > lower ? b.y + b.h - lower : 0;
+        if (dx || dy) {
+          glide.current = { from: cam, to: { ...cam, x: cam.x + dx, y: cam.y + dy }, start: performance.now() };
+          dirty.current = true;
+        }
+        return;
+      }
       const z = best;
       const to = { z, x: b.x + b.w / 2 - canvas.clientWidth / 2 / z, y: b.y + b.h / 2 - (top + sh / 2) / z };
       glide.current = { from: cam, to, start: performance.now() };
@@ -1355,9 +1580,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   // Tapping the tutor while it talks cuts it short, like raising a hand.
   const interrupt = () => {
     if (stateRef.current.tutorState !== "speaking") return;
+    inFlight.current?.abort.abort();
+    inFlight.current = null;
+    stopShow();
     stopSpeaking();
-    pendingTurn.current?.start();
-    tutorInk.current.forEach((t) => t.born === Infinity && (t.born = performance.now()));
     settle();
   };
 
@@ -1629,8 +1855,11 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           )}
           <button
             onClick={() => {
+              if (!stateRef.current.muted) {
+                stateRef.current.muted = true;
+                silenceShow();
+              }
               setMuted((m) => !m);
-              hush();
             }}
             aria-pressed={muted}
           >
@@ -1700,7 +1929,7 @@ function drawTutorInk(ctx: CanvasRenderingContext2D, ink: TutorInk, now: number,
       for (let k = 1; k < s.points.length; k++) len += Math.hypot(s.points[k][0] - s.points[k - 1][0], s.points[k][1] - s.points[k - 1][1]);
       path = outlinePath(
         getStroke(pts, {
-          size: 3.6,
+          size: s.w ?? 3.6,
           thinning: 0.55,
           smoothing: 0.6,
           streamline: 0.2,
@@ -1715,7 +1944,7 @@ function drawTutorInk(ctx: CanvasRenderingContext2D, ink: TutorInk, now: number,
         // the pen nib, while it is moving
         const [x, y] = pts[pts.length - 1];
         ctx.beginPath();
-        ctx.arc(x, y, 2.2, 0, Math.PI * 2);
+        ctx.arc(x, y, (s.w ?? 3.6) * 0.6, 0, Math.PI * 2);
         ctx.fill();
       }
     }
@@ -1830,7 +2059,7 @@ function renderViewImage(
   for (const t of inks) {
     if (t.born === Infinity) continue;
     for (const st of t.plan.strokes) {
-      const outline = getStroke(st.points, { size: 3.6, thinning: 0.55, smoothing: 0.6, streamline: 0.2, simulatePressure: true });
+      const outline = getStroke(st.points, { size: st.w ?? 3.6, thinning: 0.55, smoothing: 0.6, streamline: 0.2, simulatePressure: true });
       if (outline.length) ctx.fill(outlinePath(outline));
     }
   }
@@ -1864,4 +2093,31 @@ function renderInkImage(strokes: Stroke[], maxSize: number): string {
     if (outline.length) ctx.fill(outlinePath(outline));
   }
   return canvas.toDataURL("image/png");
+}
+
+// The tutor's reply, one JSON value per line, as each line arrives.
+async function* readLines(body: ReadableStream<Uint8Array>): AsyncGenerator<unknown> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  const parse = (line: string) => {
+    try {
+      return JSON.parse(line);
+    } catch {
+      return null;
+    }
+  };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    for (let i = buf.indexOf("\n"); i >= 0; i = buf.indexOf("\n")) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      const v = line ? parse(line) : null;
+      if (v) yield v;
+    }
+  }
+  const last = buf.trim() ? parse(buf.trim()) : null;
+  if (last) yield last;
 }

@@ -38,7 +38,7 @@ To use it on an iPad, run `npm run dev -- -H 0.0.0.0` and open your computer's l
 | Canvas, pen input, palm rejection, tutor ink rendering | `components/StudyCanvas.tsx` |
 | Ink geometry: lines, tokens, camera, hit testing | `lib/ink.ts` |
 | Tutor pen: circles, underlines, strikes, arrows, handwritten notes | `lib/handwriting.ts` |
-| Tutor handwriting (single-stroke EMS Felix, OFL) | `lib/tutor-hand/` |
+| Tutor handwriting (pen strokes traced from Kalam and Mynerve, OFL) | `lib/tutor-hand/` |
 | Tutor prompt, hint ladder, response schema | `lib/tutor.ts` |
 | Figures the tutor sketches, and the safe formula reader for graphs | `lib/figure-schema.ts`, `lib/figures.ts`, `lib/expr.ts` |
 | Math checker that catches slips in the tutor's and student's steps | `lib/check.ts` |

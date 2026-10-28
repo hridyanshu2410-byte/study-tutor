@@ -73,11 +73,21 @@ const Steps = z.object({
 
 const Diagram = z.object({
   kind: z.literal("diagram"),
-  direction: z.enum(["right", "down"]).describe("Which way the main flow runs."),
+  title: label,
   nodes: z
-    .array(z.object({ id: z.string(), text: z.string().describe("A few words."), group: label.describe("Nodes with the same group are boxed together under that name, such as \"Encoder\".") }))
-    .describe("Up to twelve parts: the components of a method, model, system or argument."),
+    .array(
+      z.object({
+        id: z.string(),
+        text: z.string().describe("A few words."),
+        row: z.number().int().describe("Grid row, 0 at the top."),
+        col: z.number().int().describe("Grid column, 0 at the left."),
+      }),
+    )
+    .describe("The parts (components of a method, model, system or argument) as boxes on a grid of up to 4 columns and 4 rows, one box per cell. A pipeline runs along a row, left to right; a stack runs down a column."),
   edges: z.array(z.object({ from: z.string(), to: z.string(), label })).describe("Arrows between node ids, such as data flowing or one idea leading to another."),
+  frames: z
+    .array(z.object({ label: z.string(), nodes: z.array(z.string()) }))
+    .describe("Named outlines around neighbouring nodes that belong together, such as \"Encoder\". Usually none."),
 });
 
 const Bars = z.object({

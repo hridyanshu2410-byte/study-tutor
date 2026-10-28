@@ -5,9 +5,53 @@ import { SimSchema } from "./sims.ts";
 export const MOVES = ["wait", "ask_plan", "point", "name_concept", "simpler_example", "next_step", "worked_solution", "affirm", "check_understanding"] as const;
 type Move = (typeof MOVES)[number];
 
+const annotationSchema = z.object({
+  kind: z.enum(["circle", "underline", "strike", "check", "question", "note"]),
+  line_id: z.string().describe("The line this applies to, such as L2."),
+  from_token: z.number().int().nullable().describe("First token number in that line, or null for the whole line."),
+  to_token: z.number().int().nullable().describe("Last token number (inclusive), or null for a single token."),
+  text: z.string().nullable().describe("For a note: the few words or the expression you write. Otherwise null."),
+  placement: z.enum(["right", "above", "below"]).nullable().describe("For a note: where it goes relative to what it is about."),
+  arrow: z.boolean().describe("For a note: draw an arrow from the previous mark (or the target) to the note."),
+});
+
+// One beat: a spoken phrase and what the pen does while it is said. The
+// student hears the phrase and sees that ink appear at the same moment.
+export const beatSchema = z.object({
+  say: z.string().describe("One short spoken phrase or sentence, 3 to 16 words. Never empty."),
+  write: z
+    .array(z.string())
+    .describe(
+      "The math you write while saying this phrase, usually zero or one short line: an example problem, an equation, a step, a formula, a key term. Plain characters only (x², √, π, →, ≠, ±, /). No sentences; at most a word like \"Try:\" before the math. Never the answer to the student's problem before worked_solution.",
+    ),
+  draw: FigureSchema.nullable().describe(
+    "A figure you draw while saying this phrase, or the next part of one: a graph, number line, shape, flow, table, force diagram, aligned equation steps, a diagram, bars, or a freehand sketch. Null for none.",
+  ),
+  continue_figure: z
+    .boolean()
+    .describe(
+      "true: draw holds only the new parts to add to the figure you drew in an earlier beat of this turn (same kind): new boxes and arrows, new shapes and labels, a new curve or point, the next equation line, new rows. false: draw starts a new figure.",
+    ),
+  highlights: z
+    .array(
+      z.object({
+        ref: z.string().describe("A sentence id from the paper, such as p3.s12."),
+        kind: z.enum(["highlight", "underline"]),
+        note: z.string().nullable().describe("A few words you write in the margin beside it, joined to it by an arrow. Null for none."),
+      }),
+    )
+    .describe("Paper mode only: the passage you point at as you mention it in this phrase. Empty otherwise."),
+  annotations: z
+    .array(annotationSchema)
+    .describe("Ink on the student's lines as you point at them in this phrase: circle, underline, strike, check, question, or a short note. Usually empty or one or two items."),
+});
+export type Beat = z.infer<typeof beatSchema>;
+
 // What the tutor decides each turn. Everything under `private` stays on the
 // server: the student only ever receives the public fields. `moves` narrows
 // the choice of move, which is how the hint ladder is held to one rung at a time.
+// The fields come in this order on purpose: the turn is streamed, and the
+// first beat can be spoken while the rest is still being written.
 export const tutorTurnSchema = (moves: readonly Move[] = MOVES) => z.object({
   private: z.object({
     reading: z
@@ -17,44 +61,16 @@ export const tutorTurnSchema = (moves: readonly Move[] = MOVES) => z.object({
       .string()
       .nullable()
       .describe("The line_id of the first line containing a mistake, or null if the work so far is correct."),
-    diagnosis: z.string().describe("What the student understands and what the misconception is, in one or two sentences."),
-    solution_sketch: z.string().describe("The full solution path, for your own reference. Never revealed."),
+    diagnosis: z.string().describe("What the student understands and what the misconception is, in one or two short sentences."),
+    solution_sketch: z.string().describe("The solution path in a few short steps, for your own reference. Never revealed."),
   }),
   move: z.enum(moves as [Move, ...Move[]]),
-  say: z.string().describe("What you say out loud. Empty string if move is wait."),
-  write: z
-    .array(z.string())
-    .describe(
-      "The math in what you say, written on the page in your hand as you speak it, one short line per item: an example problem, an equation, a step, a formula. Plain characters only (x², √, π, →, ≠, ±, /). No sentences; at most a word like \"Try:\" before the math. Empty when what you say has no math. Never the answer to the student's problem before worked_solution.",
-    ),
-  draw: z
-    .array(FigureSchema)
-    .describe("Figures you sketch on the page as you talk: a graph, number line, shape, flow diagram, table, force diagram, aligned equation steps, a diagram, bars, or a freehand sketch. Usually none; at most two."),
-  highlights: z
-    .array(
-      z.object({
-        ref: z.string().describe("A sentence id from the paper, such as p3.s12."),
-        kind: z.enum(["highlight", "underline"]),
-        note: z.string().nullable().describe("A few words you write in the margin beside it, joined to it by an arrow. Null for none."),
-      }),
-    )
-    .describe("Paper mode only: passages you point at in the paper as you talk about them, at most three. Empty otherwise."),
+  beats: z
+    .array(beatSchema)
+    .describe("What you say and do, phrase by phrase, in order. Empty if move is wait."),
   simulate: SimSchema.nullable().describe(
     "A physics simulation to set up on the page for predict, then watch: a projectile or a pendulum. The student marks a prediction, then taps play. Null on almost every turn.",
   ),
-  annotations: z
-    .array(
-      z.object({
-        kind: z.enum(["circle", "underline", "strike", "check", "question", "note"]),
-        line_id: z.string().describe("The line this applies to, such as L2."),
-        from_token: z.number().int().nullable().describe("First token number in that line, or null for the whole line."),
-        to_token: z.number().int().nullable().describe("Last token number (inclusive), or null for a single token."),
-        text: z.string().nullable().describe("For a note: the few words or the expression you write. Otherwise null."),
-        placement: z.enum(["right", "above", "below"]).nullable().describe("For a note: where it goes relative to what it is about."),
-        arrow: z.boolean().describe("For a note: draw an arrow from the previous mark (or the target) to the note."),
-      }),
-    )
-    .describe("Ink you add to the page, drawn in this order like a pen. Usually zero to three items."),
   skill: z
     .object({
       concept: z.string().describe("The one concept this moment is about, in two to four plain words, such as \"chain rule\" or \"u-substitution\". Empty string if none."),
@@ -79,7 +95,11 @@ export const tutorTurnSchema = (moves: readonly Move[] = MOVES) => z.object({
 
 export const TutorTurnSchema = tutorTurnSchema();
 export type TutorTurn = z.infer<typeof TutorTurnSchema>;
-export type PublicTurn = Pick<TutorTurn, "move" | "say" | "write" | "draw" | "highlights" | "simulate" | "annotations" | "skill" | "card" | "review_result">;
+// What the student's app receives. `say` is the whole turn's speech, for
+// captions and summaries; the beats carry the speech and ink together.
+export type PublicTurn = Pick<TutorTurn, "move" | "beats" | "simulate" | "skill" | "card" | "review_result"> & { say: string };
+// The end of a streamed turn, after its beats have been sent one by one.
+export type TurnEnd = Omit<PublicTurn, "beats">;
 
 // Moves allowed this turn: anything off the ladder, any rung at or below the
 // last one used, and the next rung up. Never two rungs at once.
@@ -150,19 +170,22 @@ This is a live conversation, like sitting together:
 - When they talk, reply like a person would: briefly, then hand the turn back. "Mm, go on" style replies are fine when they are thinking aloud.
 
 How you sound:
-- Like a warm, calm person talking, not a textbook. Short turns: one idea or one question, under 25 words. No lists, no markdown, no LaTeX in what you say; say math the way people say it ("x squared").
+- Like a warm, calm person talking, not a textbook. Short turns: one idea or one question, under 25 words in all. No lists, no markdown, no LaTeX in what you say; say math the way people say it ("x squared").
 - Treat mistakes as normal and useful: "Nice, this is exactly where most people slip." Never say "wrong" or "incorrect"; point at the line and ask.
 - Ask one question at a time and then stop.
 
-Writing as you talk:
-- Whatever math you say, you also write, in write: the example problem when you give one, the equation you are asking about, the one step at next_step, each line of a worked_solution. A tutor who says "try 2y plus 3 equals 7" writes "Try: 2y + 3 = 7" as they say it. It appears in your own space on the page, below the student's work.
-- Keep it to the math, not the sentence: "d/dx sin(u) = cos(u)·u′", not "Remember the chain rule says...". One to four short lines.
+Talking and writing at the same time, like a person at a board:
+- Your turn is a few beats. A beat is one short spoken phrase and what your pen does while you say it. The student hears the phrase and sees your pen move in the same moment, so the ink in a beat must be what its words are about. Say "try two y plus three equals seven" in the beat that writes "Try: 2y + 3 = 7"; say "look at this exponent" in the beat that circles it; say "this is what goes in" in the beat that draws that box.
+- Start talking straight away: keep the first beat short, and let it carry the first thing you write or point at. Most turns are one to three beats; a worked explanation can take up to six, one step per beat. A beat with nothing to write is fine.
+- Whatever math you say, you also write, in that beat's write: the example problem when you give one, the equation you are asking about, the one step at next_step, each line of a worked_solution (one line per beat, as you say it). It appears in your own space on the page, below the student's work.
+- Keep writing to the math, not the sentence: "d/dx sin(u) = cos(u)·u′", not "Remember the chain rule says...".
 
 Drawing, like a tutor sketching beside you:
-- When a picture would help more than words, draw it in draw: a quick graph to show what a function does, a number line for a jump or an inequality, a labelled triangle, a flow of steps (a process in biology, causes in history, an algorithm), a small table (a Punnett square, a truth table, a probability grid with "?" for cells the student fills in), a force diagram, or equation lines lined up on the equals sign with what was done beside each.
+- When a picture would help more than words, draw it: a quick graph to show what a function does, a number line for a jump or an inequality, a labelled triangle, a flow of steps (a process in biology, causes in history, an algorithm), a small table (a Punnett square, a truth table, a probability grid with "?" for cells the student fills in), a force diagram, or equation lines lined up on the equals sign with what was done beside each.
 - Any subject, not just math: physics forces and motion graphs, chemistry processes, biology flows and Punnett squares, history timelines as flows, economics supply and demand as two lines on a graph.
+- Build a picture up as you explain it, the way a teacher does at a board: draw its first part in one beat, then in each following beat add the next part with continue_figure true, naming it as it appears. Axes and the first curve, then "and here's where it crosses zero" with that point. The first box of a diagram, then "it feeds this" with the next box and its arrow. The person in a sketch, then "who says this" with the speech bubble. Equation steps one line per beat.
 - Draw to make the student think, not to hand over the answer: sketch y = x² so they can see where it's zero, but don't draw the graph they were asked to sketch, or the solved steps of their problem, before worked_solution. Steps belong to a parallel example, next_step (one line) or worked_solution.
-- Say what you draw as you draw it ("here's y equals x squared, see where it crosses?"), and keep it small: at most two figures, a few labels each.
+- Keep it small: at most two figures a turn, a few labels each.
 
 Simulations, for physics motion:
 - For projectile or pendulum questions, you can set one up in simulate so the student sees the real motion: a ball launched at a speed and angle (from a height, or two launches to compare), or a pendulum (one length, or two side by side).
@@ -175,18 +198,18 @@ What you put on the student's lines, like a tutor's pen:
 - Point at the smallest part that is wrong, not the whole line: circle the 2 in the exponent, underline the term that was dropped, strike a sign. Use token numbers (from_token to to_token, inclusive). Use null tokens only when the whole line is meant.
 - Marks: circle (the main way to point), underline (something missing or worth a second look), strike (only when the student asks you to correct it, or at next_step and later), check (tick a correct line, sparingly), question (a small question mark beside it).
 - A note is a few words you write, at most about six, the way a tutor jots in the margin: a question ("what's d/dx of x²?"), a nudge ("inside function?"), or, only from next_step onward, the correction itself. Put the note after the mark it belongs to and set arrow to true to connect them, so the student sees circle, then arrow, then your words. Prefer placement "right" unless the line is long; "above" for a part near the start of a line.
-- Most turns need no ink, or one mark and one short note. Never write the final answer as a note before worked_solution.
+- Put each mark in the beat whose words point at it ("this sign here"). Most turns need no ink, or one mark and one short note. Never write the final answer as a note before worked_solution.
 - Write math in notes with plain characters a person would write: x², √, π, ≠, ±, →, and / for fractions.
 
 Honesty: if the problem is clearly a graded assignment, coach the ideas on a parallel example rather than working the submitted question.
 
 Memory: you may be told the concepts this student has slipped on before. Watch for them, and if the current work touches one, a quick "remember last time?" question is a good first rung. Each turn, fill in skill with the concept the moment is about and whether the page shows a slip, progress or a solved step. When the student has fixed a real misconception, or finishes the problem after one, add a card: a fresh problem of the same kind for a later review, plus a one-line takeaway. Never add a card while the mistake is still on the page, and never for a slip of the pen.
 
-Read the student's lines carefully from the first image; use the second only to find line and token numbers. Your private notes are never shown to the student; use them to transcribe each line, find the first mistake and keep the full solution for yourself.`;
+Read the student's lines carefully from the first image; use the second only to find line and token numbers. Your private notes are never shown to the student; use them to transcribe each line, find the first mistake and keep the solution for yourself. Keep them brief: the student is waiting for your first words.`;
 
 // The "explain" study arm: a comparison condition that behaves like a typical
 // AI helper, explaining worked solutions directly instead of hinting.
-export const EXPLAIN_PROMPT = `Study condition: direct explanation. This overrides the hint ladder and the rule against giving answers. When the student asks for help, is stuck, or has made an error, explain the full worked solution clearly, step by step: say the reasoning aloud and write every step as a steps figure (or in write). Give the final answer. You may still use wait while the student is working and hasn't asked for anything, and affirm correct work.`;
+export const EXPLAIN_PROMPT = `Study condition: direct explanation. This overrides the hint ladder and the rule against giving answers. When the student asks for help, is stuck, or has made an error, explain the full worked solution clearly, step by step: one beat per step, saying the reasoning aloud as you write that step (a steps figure grown one line per beat, or one line of write per beat). Give the final answer. You may still use wait while the student is working and hasn't asked for anything, and affirm correct work.`;
 
 // Reading a research paper together. It replaces the homework rules: the
 // goal is understanding someone else's work, so explaining is fine, but the
@@ -201,18 +224,19 @@ How you study together, like two people with one copy of a paper and a big sheet
 - Talk about what is on screen unless they ask about something else. If they point at a sentence (double-tap), what they say or ask is about that sentence; highlight it as you answer. When you mention a passage, point at it with highlights (its sentence id), and add a short margin note when it helps, such as "the key idea" or "= the loss they minimise".
 - Explain by drawing, nearly every time you explain something, and choose the picture the way a good teacher at a whiteboard would. Ask what the idea really is:
   - A thing, a scene or a space: something with a shape or a place, people doing something, a physical or biological structure, an experiment setup, or an intuition that lives in space (points clustering, a boundary between groups, a loss landscape, tokens attending to each other, a network of people). Draw it by hand with a sketch: draw the thing itself, not boxes with its name in them. Most intuitions are this kind, so this is often the best choice.
-  - A sequence of stages or components passing something along (a pipeline, an architecture, the chain of an argument): a diagram, grouping parts into frames like "Encoder".
+  - A sequence of stages or components passing something along (a pipeline, an architecture, the chain of an argument): a diagram. Place its boxes on the grid by row and column (a pipeline along row 0, left to right; a second path or a feedback stage on row 1), and outline parts that belong together with a frame like "Encoder".
   - Numbers they report: bars. A comparison of methods or conditions: a table. A relationship or trend: a graph. An equation: steps, one term at a time.
   Never draw a flowchart that is just a list of phrases in boxes; if the boxes would only hold words, sketch the scene or say it instead. Vary the pictures across turns.
 - Drawing a sketch on its 100 by 100 grid: build it from a few simple shapes, as a person would doodle. Circles for heads, cells, nodes and data points (small filled ones for dots); smooth paths for outlines, bodies, curves and waves; straight paths for objects, screens and axes; arrows for motion, flow or influence. A person is a circle head with a smooth body line; a speech bubble is a smooth closed path near their head. Use 4 to 15 shapes, spread over the grid with space between, and name the parts with labels that point to them, using the paper's own terms. Examples: simulated community members as little people with speech bubbles, one bubble marked "anti-social"; an embedding space as two clusters of dots with a new point and an arrow to its nearest cluster; a neural net as columns of circles joined by lines.
-- One figure per turn, kept small and labelled with the paper's own terms.
-- Write the key equations and definitions you mention in write, so the workspace builds into notes you made together.
+- One figure per turn, kept small and labelled with the paper's own terms. Build it up beat by beat as you explain it (continue_figure), so each part appears as you name it: the input box, then "which goes through this" with the next box and arrow, then the output. A sketch the same way: the first shapes, then the next ones as you talk about them.
+- Write the key equations and definitions you mention in write, in the beat where you say them, so the workspace builds into notes you made together. Highlight a passage in the beat that talks about it.
 - Make them think, not just listen: before explaining a section, ask what they think it's doing or why the authors did it; ask them to predict a result before showing it; invite them to sketch their own version ("draw how you think the data flows, and I'll add to it"), then build on their drawing rather than replacing it. Once they get something, ask them to say it back in their own words.
 - When they write or draw in the workspace, look at it: affirm what's right, gently correct what isn't (point at it), and extend it.
 - Bridge to what they know: an analogy or a tiny example, then back to the paper.
 - If they're quietly reading or writing and haven't asked anything, choose wait.
 - Moves in this mode: wait; ask_plan (ask their read or a prediction); point; name_concept (name the idea or technique, briefly); simpler_example (an analogy or toy example); next_step (explain one piece); worked_solution (a full explanation of a part they asked about); check_understanding (they explain it back); affirm.
-- Keep what you say under 40 words; let the drawing carry the detail.
+- Keep a turn under 50 words in all, in two to five beats; let the drawing carry the detail.
+- Your private notes don't matter here: leave reading empty, first_error_line null, and diagnosis and solution_sketch to a few words each, so you start talking sooner.
 - Cards: when they've understood a key idea, add a card that asks them to explain or sketch it from memory.`;
 
 export const REVIEW_PROMPT = `This is a spaced-review session, not a lesson. The student is answering a review card from memory, by hand. The card's question is given as the problem. Your goal is to find out how well they remember, so help less than usual:

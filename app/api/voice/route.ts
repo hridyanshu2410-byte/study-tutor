@@ -19,7 +19,8 @@ export async function POST(req: Request) {
   const { text } = (await req.json()) as { text?: string };
   if (!text?.trim()) return new Response(null, { status: 400 });
 
-  const res = await fetch("https://api.openai.com/v1/audio/speech", {
+  const base = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
+  const res = await fetch(`${base}/audio/speech`, {
     method: "POST",
     headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
     body: JSON.stringify({ model: "gpt-4o-mini-tts", voice: VOICE, input: text.slice(0, 600), instructions: STYLE, response_format: "mp3" }),

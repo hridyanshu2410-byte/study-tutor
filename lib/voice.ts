@@ -4,52 +4,121 @@
 // hands-free: it hears the student out and hands over each finished thought.
 
 let serverVoice: boolean | null = null; // null until the first try
-let audio: HTMLAudioElement | null = null;
-let generation = 0;
 
-// onStart fires when the voice is actually heard, so the tutor's pen can move with it.
-export function speak(text: string, onEnd?: () => void, onStart?: () => void) {
-  if (typeof window === "undefined" || !text) {
-    onStart?.();
-    onEnd?.();
-    return;
+// A phrase of the tutor's voice, fetched as soon as the phrase is known so it
+// is ready to play the moment the phrase before it ends.
+export type Clip = {
+  // Speaks once the audio is ready. onStart fires when the voice is actually
+  // heard, with the clip's length in ms when the browser knows it.
+  play(onStart: (ms: number | null) => void, onEnd: () => void): void;
+  stop(): void;
+};
+
+const clips = new Set<Clip>();
+
+export function prepareClip(text: string): Clip {
+  let stopped = false;
+  let el: HTMLAudioElement | null = null;
+  let url: string | null = null;
+  let failed = typeof window === "undefined" || !text.trim() || serverVoice === false;
+  let asked: { onStart: (ms: number | null) => void; onEnd: () => void } | null = null;
+  let heard = false;
+  let inBrowser = false;
+  const fetching = new AbortController();
+
+  const release = () => {
+    if (url) URL.revokeObjectURL(url);
+    url = null;
+    clips.delete(clip);
+  };
+  const fallback = () => {
+    if (stopped || !asked) return;
+    const { onStart, onEnd } = asked;
+    inBrowser = true;
+    speakInBrowser(text, () => {
+      release();
+      if (!stopped) onEnd();
+    }, () => !stopped && onStart(null));
+  };
+  // Plays once the clip has been asked for and the audio (or its failure) is in.
+  const go = () => {
+    if (stopped || !asked) return;
+    if (failed) return fallback();
+    if (!el) return;
+    const audio = el;
+    const { onStart, onEnd } = asked;
+    audio.onplaying = () => {
+      if (stopped || heard) return;
+      heard = true;
+      onStart(Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration * 1000 : null);
+    };
+    audio.onended = () => {
+      release();
+      if (!stopped) onEnd();
+    };
+    audio.onerror = () => {
+      if (stopped) return;
+      if (heard) {
+        release();
+        onEnd();
+      } else fallback();
+    };
+    audio.play().catch(() => !heard && fallback());
+  };
+
+  if (!failed) {
+    fetch("/api/voice", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }), signal: fetching.signal })
+      .then(async (res) => {
+        if (res.status === 404) serverVoice = false;
+        if (!res.ok) throw new Error(`voice ${res.status}`);
+        serverVoice = true;
+        if (stopped) return void res.body?.cancel();
+        // Play the voice as it arrives rather than after the whole clip has downloaded.
+        const made = streamable(res, () => stopped) ?? (await whole(res));
+        if (stopped) return URL.revokeObjectURL(made.url);
+        el = made.el;
+        url = made.url;
+        el.preload = "auto";
+        go();
+      })
+      .catch(() => {
+        failed = true;
+        go();
+      });
   }
+
+  const clip: Clip = {
+    play(onStart, onEnd) {
+      asked = { onStart, onEnd };
+      go();
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      fetching.abort();
+      if (el) {
+        el.onplaying = el.onended = el.onerror = null;
+        el.pause();
+      }
+      if (inBrowser && typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
+      release();
+    },
+  };
+  clips.add(clip);
+  return clip;
+}
+
+// Says a line now. onStart fires when the voice is actually heard, so the tutor's pen can move with it.
+export function speak(text: string, onEnd?: () => void, onStart?: () => void) {
   stopSpeaking();
-  const mine = ++generation;
-  if (serverVoice === false) return speakInBrowser(text, onEnd, onStart);
-  fetch("/api/voice", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }) })
-    .then(async (res) => {
-      if (res.status === 404) serverVoice = false;
-      if (!res.ok) throw new Error(`voice ${res.status}`);
-      serverVoice = true;
-      if (mine !== generation) return void res.body?.cancel(); // interrupted while loading
-      // Play the voice as it arrives rather than after the whole clip has downloaded.
-      const { el, url } = streamable(res, mine) ?? (await whole(res));
-      if (mine !== generation) return URL.revokeObjectURL(url);
-      audio = el;
-      let heard = false;
-      const done = () => {
-        URL.revokeObjectURL(url);
-        if (mine !== generation) return;
-        if (!heard) speakInBrowser(text, onEnd, onStart);
-        else onEnd?.();
-      };
-      el.onended = done;
-      el.onerror = done;
-      el.onplaying = () => {
-        if (mine !== generation || heard) return;
-        heard = true;
-        onStart?.();
-      };
-      await el.play();
-    })
-    .catch(() => {
-      if (mine === generation) speakInBrowser(text, onEnd, onStart);
-    });
+  prepareClip(text).play(
+    () => onStart?.(),
+    () => onEnd?.(),
+  );
 }
 
 // Streams the MP3 into the audio element through MediaSource, where the browser supports it.
-function streamable(res: Response, mine: number): { el: HTMLAudioElement; url: string } | null {
+function streamable(res: Response, stopped: () => boolean): { el: HTMLAudioElement; url: string } | null {
   if (!res.body || typeof MediaSource === "undefined" || !MediaSource.isTypeSupported("audio/mpeg")) return null;
   const source = new MediaSource();
   const url = URL.createObjectURL(source);
@@ -63,7 +132,7 @@ function streamable(res: Response, mine: number): { el: HTMLAudioElement; url: s
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          if (mine !== generation) return void reader.cancel();
+          if (stopped()) return void reader.cancel();
           buf.appendBuffer(value);
           await settled();
         }
@@ -101,12 +170,7 @@ function speakInBrowser(text: string, onEnd?: () => void, onStart?: () => void) 
 }
 
 export function stopSpeaking() {
-  generation++;
-  if (audio) {
-    audio.onended = audio.onerror = null;
-    audio.pause();
-    audio = null;
-  }
+  for (const c of [...clips]) c.stop();
   if (typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
 }
 
