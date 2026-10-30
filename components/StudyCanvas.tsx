@@ -42,6 +42,8 @@ import { drawSim, playButton, runSeconds, SIM_H, SIM_W, simResult, type PageSim 
 import { findSentence, paperDigest, type Paper } from "@/lib/paper";
 import { openPaper } from "@/lib/paper-pdf";
 import { deletePaper, loadPaper, savePaper } from "@/lib/paper-store";
+import { reportHtml, reportStats, reportTitle, type JournalEntry, type ReportAnalysis, type ReportRequest, type SessionReport } from "@/lib/session-report";
+import { deleteReport, loadReports, saveReport } from "@/lib/report-store";
 
 type Tool = "pen" | "eraser" | "hand" | "keep";
 type Mode = "study" | "review";
@@ -93,8 +95,9 @@ const PAPER_GAP = 28;
 const PAPER_WATCH_MS = 3500;
 
 // What happened this session, logged when it wraps up.
-type SessionStats = { startedAt: number; turns: number; concepts: Record<string, { slips: number; solved: number }>; cards: string[] };
-const newStats = (): SessionStats => ({ startedAt: Date.now(), turns: 0, concepts: {}, cards: [] });
+// `journal` is the conversation, for the session report.
+type SessionStats = { startedAt: number; turns: number; concepts: Record<string, { slips: number; solved: number }>; cards: string[]; journal: JournalEntry[] };
+const newStats = (): SessionStats => ({ startedAt: Date.now(), turns: 0, concepts: {}, cards: [], journal: [] });
 // Where the student double-tapped to point, in page coordinates.
 type Focus = { world: [number, number]; at: number };
 const FOCUS_MS = 8000;
@@ -161,6 +164,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const [keepDraft, setKeepDraft] = useState<KeepDraft | null>(null);
   const [run, setRun] = useState<ReviewRun | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  // Session reports: the list, whether it is open, and one being made or just made.
+  const [reports, setReports] = useState<SessionReport[] | null>(null);
+  const [reporting, setReporting] = useState<"making" | SessionReport | null>(null);
   const [hasPhoto, setHasPhoto] = useState(false);
   const [paperTitle, setPaperTitle] = useState<string | null>(null);
   const [opening, setOpening] = useState<string | null>(null);
@@ -468,6 +474,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         quietAside();
       } else if (show.current) return; // never glance while still talking
 
+      if (trigger !== "pause") noteStudent(trigger, speech, watched);
       const abort = new AbortController();
       const mine = { trigger, speech, abort };
       inFlight.current = mine;
@@ -844,8 +851,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     s.timers.forEach(clearTimeout);
     const end = s.end;
     if (s.shown) setCaption(s.shown);
+    noteTutor(s, end);
     remember(end);
     if (s.trigger === "wrap_up") {
+      makeReport();
       const st = stats.current;
       logEvent(
         account,
@@ -868,8 +877,145 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     for (const a of s.acts) a.clip?.stop();
     tutorInk.current = tutorInk.current.filter((t) => t.born !== Infinity);
     if (s.shown) setCaption(s.shown);
+    noteTutor(s, null);
     dirty.current = true;
     save();
+  };
+
+  // ---------- the session's record ----------
+  // What the student said or did to start a turn.
+  const noteStudent = (trigger: TutorRequest["trigger"], speech: string | null, watched: string | null) => {
+    const text =
+      speech?.trim() ||
+      (trigger === "asked" ? pointedAt() : trigger === "wrap_up" ? "Let's finish here." : trigger === "watched" ? `Played the simulation. ${watched ?? ""}`.trim() : trigger === "paper_opened" ? `Opened “${paper.current?.ref.title ?? "a paper"}”.` : "");
+    if (!text) return;
+    const journal = stats.current.journal;
+    const last = journal.at(-1);
+    // said again before the tutor answered: the turn heard both, so keep them as one
+    if (last?.who === "student" && trigger === "spoke" && text.startsWith(last.text)) journal.pop();
+    journal.push({ at: Date.now(), who: "student", text, trigger });
+  };
+
+  // Asking with no words: pointing at a passage or at their writing, or the "I'm stuck" button.
+  const pointedAt = () => {
+    const ref = sentenceAt();
+    const found = ref && paper.current ? findSentence(paper.current.data, ref) : null;
+    if (found) return `Pointed at this passage (page ${found.page.n}): “${found.sentence.text}”`;
+    if (focus.current && Date.now() - focus.current.at < FOCUS_MS) return "Pointed at my writing.";
+    return "I'm stuck.";
+  };
+
+  // What the tutor said, pointed at and drew in a turn, as far as it got, and
+  // a picture of that part of the board when it finished.
+  const noteTutor = (s: Show, end: TurnEnd | null) => {
+    const acts = s.acts.filter((a) => a.started);
+    const text = acts.map((a) => a.beat.say).join(" ").trim();
+    if (!text && !acts.some((a) => a.ink)) return;
+    const p = paper.current;
+    const highlights = acts.flatMap((a) =>
+      a.beat.highlights.flatMap((h) => {
+        const found = p ? findSentence(p.data, h.ref) : null;
+        return found ? [{ ref: h.ref, note: h.note ?? null, text: found.sentence.text, page: found.page.n }] : [];
+      }),
+    );
+    const region = acts.map((a) => a.region).reduce<Box | null>((u, b) => (b ? (u ? unionBox(u, b) : b) : u), null);
+    let picture: string | undefined;
+    if (region) {
+      // a little room round it, and never so small a crop that a line of writing fills the picture
+      const w = Math.max(region.w + 60, 620), h = Math.max(region.h + 60, 240);
+      try {
+        picture = renderViewImage({ x: region.x + region.w / 2 - w / 2, y: region.y + region.h / 2 - h / 2, w, h }, [...(p?.pages ?? []), ...images.current], pictureFor, strokes.current, tutorInk.current, 900);
+      } catch {
+        // a picture is a nicety; the words are the record
+      }
+    }
+    stats.current.journal.push({ at: Date.now(), who: "tutor", text, trigger: s.trigger, move: end?.move, concept: end?.skill?.concept || undefined, evidence: end?.skill?.evidence, highlights, picture });
+  };
+
+  // The whole session as a report: the conversation and pictures from here,
+  // the analysis from the model. Kept on this device, ready to open or download.
+  const makeReport = async () => {
+    const st = stats.current;
+    const journal = [...st.journal];
+    if (!journal.length) {
+      flash("Talk with the tutor first, then there's something to report.");
+      return;
+    }
+    setReporting("making");
+    const p = paper.current;
+    const ink = [...strokes.current.flatMap((x) => x.points), ...tutorInk.current.flatMap((t) => (t.born === Infinity ? [] : t.plan.strokes.flatMap((x) => x.points)))];
+    let board: string | null = null;
+    if (ink.length) {
+      const m = 40;
+      const x0 = Math.min(...ink.map((q) => q[0])) - m, y0 = Math.min(...ink.map((q) => q[1])) - m;
+      const x1 = Math.max(...ink.map((q) => q[0])) + m, y1 = Math.max(...ink.map((q) => q[1])) + m;
+      try {
+        board = renderViewImage({ x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, [...(p?.pages ?? []), ...images.current], pictureFor, strokes.current, tutorInk.current, 1600);
+      } catch {
+        board = null;
+      }
+    }
+    const request: ReportRequest = {
+      startedAt: st.startedAt,
+      endedAt: Date.now(),
+      problem: stateRef.current.problem,
+      paper: p ? { title: p.ref.title, text: p.digest.text } : null,
+      journal: journal.map(({ picture: _p, ...e }) => e),
+      concepts: st.concepts,
+      cards: st.cards,
+    };
+    let analysis: ReportAnalysis | null = null;
+    try {
+      const res = await fetch("/api/report", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
+      const data = (await res.json()) as { analysis?: ReportAnalysis; error?: string };
+      analysis = data.analysis ?? null;
+      if (!analysis) flash(data.error ?? "The analysis didn't come through; the report has the conversation.");
+    } catch {
+      flash("The analysis didn't come through; the report has the conversation.");
+    }
+    const passages: SessionReport["passages"] = {};
+    for (const ref of [...(analysis?.reread ?? []).map((r) => r.ref), ...journal.flatMap((e) => (e.highlights ?? []).map((h) => h.ref))]) {
+      const found = p ? findSentence(p.data, ref.replace(/[[\]]/g, "")) : null;
+      if (found) passages[ref] = { text: found.sentence.text, page: found.page.n };
+    }
+    const report: SessionReport = {
+      id: crypto.randomUUID(),
+      startedAt: st.startedAt,
+      endedAt: request.endedAt,
+      paper: p ? { title: p.ref.title } : null,
+      problem: request.problem,
+      journal,
+      board,
+      analysis,
+      passages,
+      cards: [...st.cards],
+    };
+    try {
+      await saveReport(report);
+    } catch {
+      flash("This device is out of room, so the report wasn't kept. Download it now.");
+    }
+    setReporting(report);
+    setReports((list) => (list ? [report, ...list] : list));
+  };
+
+  const openReport = (r: SessionReport) => {
+    const url = URL.createObjectURL(new Blob([reportHtml(r)], { type: "text/html" }));
+    window.open(url, "_blank", "noopener");
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  };
+  const downloadReport = (r: SessionReport) => {
+    const url = URL.createObjectURL(new Blob([reportHtml(r)], { type: "text/html" }));
+    const a = document.createElement("a");
+    a.href = url;
+    const slug = reportTitle(r).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 50) || "session";
+    a.download = `${slug}-${new Date(r.startedAt).toISOString().slice(0, 10)}.html`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  };
+  const showReports = async () => {
+    if (reports) return setReports(null);
+    setReports(await loadReports());
   };
 
   // Voice off in the middle of a turn: the rest of it plays on in silence.
@@ -1712,6 +1858,11 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
               />
             </>
           )}
+          {mode === "study" && (
+            <button className={reports ? "on" : ""} onClick={showReports} aria-expanded={!!reports} title="Reports of your past sessions">
+              Reports
+            </button>
+          )}
           {mode === "study" ? (
             <button className={panelOpen ? "on" : ""} onClick={() => setPanelOpen((o) => !o)} aria-expanded={panelOpen}>
               Review{due.length ? <span className="badge">{due.length}</span> : null}
@@ -1771,6 +1922,71 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
             </button>
           </div>
         </form>
+      )}
+
+      {reports && (
+        <div className="reports" role="dialog" aria-label="Session reports">
+          <div className="reports-head">
+            <h2>Session reports</h2>
+            <button onClick={() => setReports(null)} aria-label="Close">
+              Close
+            </button>
+          </div>
+          <button className="primary" onClick={makeReport} disabled={reporting === "making"}>
+            {reporting === "making" ? "Making a report…" : "Report on this session so far"}
+          </button>
+          {reports.length ? (
+            <ul>
+              {reports.map((r) => {
+                const st = reportStats(r);
+                return (
+                  <li key={r.id}>
+                    <div>
+                      <strong>{reportTitle(r)}</strong>
+                      <span>
+                        {new Date(r.startedAt).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })} · {st.minutes} min · {st.exchanges} turns
+                      </span>
+                    </div>
+                    <div className="report-actions">
+                      <button onClick={() => openReport(r)}>Open</button>
+                      <button onClick={() => downloadReport(r)}>Download</button>
+                      <button
+                        onClick={async () => {
+                          await deleteReport(r.id);
+                          setReports((list) => list?.filter((x) => x.id !== r.id) ?? null);
+                        }}
+                        aria-label="Delete this report"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          ) : (
+            <p className="quiet">No reports yet. Press Finish at the end of a session and one is made for you.</p>
+          )}
+        </div>
+      )}
+
+      {reporting && !reports && (
+        <div className="report-ready" role="status">
+          {reporting === "making" ? (
+            <span>Writing up this session…</span>
+          ) : (
+            <>
+              <span>Your session report is ready.</span>
+              <button className="primary" onClick={() => openReport(reporting)}>
+                Open
+              </button>
+              <button onClick={() => downloadReport(reporting)}>Download</button>
+              <button onClick={() => setReporting(null)} aria-label="Dismiss">
+                ×
+              </button>
+            </>
+          )}
+        </div>
       )}
 
       {toast && (
@@ -2019,8 +2235,9 @@ function renderViewImage(
   pictureFor: (img: PageImage) => HTMLImageElement | null,
   strokes: Stroke[],
   inks: TutorInk[],
+  maxW = 1400,
 ): string {
-  const scale = Math.min(2, 1400 / view.w);
+  const scale = Math.min(2, maxW / view.w, (maxW * 1.6) / view.h);
   const canvas = document.createElement("canvas");
   canvas.width = Math.ceil(view.w * scale);
   canvas.height = Math.ceil(view.h * scale);
