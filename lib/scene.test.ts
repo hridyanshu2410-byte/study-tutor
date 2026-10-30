@@ -80,6 +80,28 @@ test("a circle stays close round what it circles and clear of the arrow's label"
   assert.equal(near.length, 0);
 });
 
+test("a scene that grows a bubble, a circle or a column on its left stays clear of the ink around it", () => {
+  // the last turn's scene, and the paper to its left
+  const first = new TurnPlanner([], 3, { column: { x: 0, top: 0, bottom: 2000 }, size: 19 }).plan({
+    figures: [scene([thing("d", "person", 0, 0, { caption: "designer" }), thing("m", "people", 0, 1, { count: 8, caption: "simulated members" }), thing("p", "chat", 0, 2, { caption: "posts and replies" })], { title: "Social simulacra" })],
+  });
+  const paper = { x: -600, y: 0, w: 560, h: 2000 };
+  const planner = new TurnPlanner([], 4, { column: { x: 0, top: 0, bottom: 2000 }, size: 19, avoid: [...(first.parts ?? []), paper] });
+  planner.plan({ figures: [scene([thing("pf", "people", 0, 1, { count: 14, caption: "populated forum" })])] });
+  const grown = planner.plan({
+    figures: [scene([thing("h", "chat", 0, 2, { caption: "hurtful reply", says: "I don't belong" }), thing("t", "people", 0, 0, { count: 3, caption: "friendly testers" })], {
+      arrows: [{ from: "pf", to: "h", label: "posts" }],
+      marks: [{ on: "h", kind: "circle", note: "possible harm" }],
+    })],
+    continueFigure: true,
+  });
+  assert.ok(grown.strokes.length > 0);
+  for (const [name, b] of [["the last scene", first.box!], ["the paper", paper]] as const) {
+    const clash = grown.strokes.flatMap((s) => s.points).filter(([x, y]) => x > b.x - 4 && x < b.x + b.w + 4 && y > b.y - 4 && y < b.y + b.h + 4);
+    assert.equal(clash.length, 0, `nothing new lands on ${name}`);
+  }
+});
+
 test("marks and arrows on things that aren't there are left out", () => {
   const { boxes } = parts(scene([thing("a", "person", 0, 0)], { arrows: [{ from: "a", to: "ghost", label: null }], marks: [{ on: "ghost", kind: "circle", note: "?" }] }));
   assert.deepEqual([...boxes.keys()], ["thing:a"]);

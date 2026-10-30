@@ -612,17 +612,24 @@ export function extendFigure(base: Figure, more: Figure): Figure | null {
 // left: a diagram's grid, a sketch's square, more equation lines or rows.
 export function figureRoom(fig: Figure, size: number, drawn: Box, x: number, y: number): Box {
   const grow = (w: number, h: number) => ({ x: drawn.x, y: drawn.y, w: Math.max(drawn.w, w - (drawn.x - x)), h: Math.max(drawn.h, h - (drawn.y - y)) });
+  // A grid figure can grow into any of its cells, above or left of its first
+  // ink too (a speech bubble, a thing in an earlier column), and a circle
+  // round an edge cell reaches a little past the grid: hold all of it.
+  const grid = (w: number, h: number, edge: number): Box => {
+    const x0 = Math.min(drawn.x, x - edge), y0 = Math.min(drawn.y, y - edge);
+    return { x: x0, y: y0, w: Math.max(drawn.x + drawn.w, x + w + edge) - x0, h: Math.max(drawn.y + drawn.h, y + h + edge) - y0 };
+  };
   if (fig.kind === "diagram") {
     const ts = Math.max(14, size * 0.55);
     // a diagram can grow along its row to the full width of the grid
     const cols = 4;
     const rows = Math.min(4, Math.max(0, ...fig.nodes.map((n) => n.row)) + 2);
     const head = fig.title ? ts * 3.2 : ts * 1.8;
-    return grow(cols * size * (DIAGRAM_CELL.w + DIAGRAM_CELL.gapX), head + rows * size * (DIAGRAM_CELL.h + DIAGRAM_CELL.gapY));
+    return grid(cols * size * (DIAGRAM_CELL.w + DIAGRAM_CELL.gapX), head + rows * size * (DIAGRAM_CELL.h + DIAGRAM_CELL.gapY), ts * 0.5);
   }
   if (fig.kind === "scene") {
     const room = sceneRoom(fig, size);
-    return grow(room.w, room.h);
+    return grid(room.w, room.h, Math.max(14, size * 0.52) * 1.2);
   }
   if (fig.kind === "sketch") {
     const ts = Math.max(14, size * 0.52);
