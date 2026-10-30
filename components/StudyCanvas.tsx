@@ -36,7 +36,6 @@ import {
 import type { Grade } from "ts-fsrs";
 import ReviewPanel from "./ReviewPanel";
 import AccountMenu from "./AccountMenu";
-import SessionSurvey from "./SessionSurvey";
 import { flushCloud, loadCloud, logEvent, saveCloud, type Account } from "@/lib/cloud";
 import { picturesFrom, type PageImage } from "@/lib/photo";
 import { drawSim, playButton, runSeconds, SIM_H, SIM_W, simResult, type PageSim } from "@/lib/sims";
@@ -93,7 +92,7 @@ const PAPER_GAP = 28;
 // Reading a paper, the tutor waits longer before glancing at new writing.
 const PAPER_WATCH_MS = 3500;
 
-// What happened this session, for the wrap-up summary.
+// What happened this session, logged when it wraps up.
 type SessionStats = { startedAt: number; turns: number; concepts: Record<string, { slips: number; solved: number }>; cards: string[] };
 const newStats = (): SessionStats => ({ startedAt: Date.now(), turns: 0, concepts: {}, cards: [] });
 // Where the student double-tapped to point, in page coordinates.
@@ -162,7 +161,6 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const [keepDraft, setKeepDraft] = useState<KeepDraft | null>(null);
   const [run, setRun] = useState<ReviewRun | null>(null);
   const [toast, setToast] = useState<string | null>(null);
-  const [summary, setSummary] = useState<{ recap: string; stats: SessionStats } | null>(null);
   const [hasPhoto, setHasPhoto] = useState(false);
   const [paperTitle, setPaperTitle] = useState<string | null>(null);
   const [opening, setOpening] = useState<string | null>(null);
@@ -849,7 +847,6 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     remember(end);
     if (s.trigger === "wrap_up") {
       const st = stats.current;
-      setSummary({ recap: end.say || s.said, stats: { ...st } });
       logEvent(
         account,
         "session_finished",
@@ -1477,40 +1474,6 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     save();
   };
 
-  // A picture of the whole page, both inks, to keep or hand in.
-  const saveNotes = () => {
-    const tutorStrokes = tutorInk.current.flatMap((t) => t.plan.strokes.map((st) => st.points));
-    const all = [
-      ...strokes.current.flatMap((s) => s.points.map((p) => [p[0], p[1]])),
-      ...tutorStrokes.flat(),
-      ...images.current.flatMap((i) => [
-        [i.x, i.y],
-        [i.x + i.w, i.y + i.h],
-      ]),
-    ];
-    if (!all.length) return;
-    const m = 40;
-    const x0 = Math.min(...all.map((p) => p[0])) - m, y0 = Math.min(...all.map((p) => p[1])) - m;
-    const x1 = Math.max(...all.map((p) => p[0])) + m, y1 = Math.max(...all.map((p) => p[1])) + m;
-    const scale = Math.min(2, 2400 / (x1 - x0), 3200 / (y1 - y0));
-    const c = document.createElement("canvas");
-    c.width = Math.ceil((x1 - x0) * scale);
-    c.height = Math.ceil((y1 - y0) * scale);
-    const ctx = c.getContext("2d")!;
-    ctx.fillStyle = "#fff";
-    ctx.fillRect(0, 0, c.width, c.height);
-    ctx.setTransform(scale, 0, 0, scale, -x0 * scale, -y0 * scale);
-    for (const { img, el } of loadedPictures()) ctx.drawImage(el, img.x, img.y, img.w, img.h);
-    ctx.fillStyle = STUDENT_INK;
-    for (const s of strokes.current) ctx.fill(outlinePath(getStroke(s.points, { size: s.size, thinning: 0.6, smoothing: 0.55, streamline: 0.45 })));
-    ctx.fillStyle = TUTOR_INK;
-    for (const pts of tutorStrokes) ctx.fill(outlinePath(getStroke(pts, { size: 3.6, thinning: 0.55, smoothing: 0.6, streamline: 0.2, simulatePressure: true })));
-    const a = document.createElement("a");
-    a.href = c.toDataURL("image/png");
-    a.download = `study-notes-${new Date().toISOString().slice(0, 10)}.png`;
-    a.click();
-  };
-
   const newProblem = () => {
     hush();
     strokes.current = [];
@@ -1525,7 +1488,6 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     sessionId.current = crypto.randomUUID();
     stats.current = newStats();
     setProblem("");
-    setSummary(null);
     setCaption("Fresh page. What are we working on next?");
     dirty.current = true;
     save();
@@ -1809,47 +1771,6 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
             </button>
           </div>
         </form>
-      )}
-
-      {summary && (
-        <div className="summary" role="dialog" aria-label="Session summary">
-          <h2>Nice session</h2>
-          <p className="summary-recap">{summary.recap}</p>
-          <dl>
-            <div>
-              <dt>Time</dt>
-              <dd>{Math.max(1, Math.round((Date.now() - summary.stats.startedAt) / 60000))} min</dd>
-            </div>
-            <div>
-              <dt>Back-and-forths</dt>
-              <dd>{summary.stats.turns}</dd>
-            </div>
-            <div>
-              <dt>Review cards saved</dt>
-              <dd>{summary.stats.cards.length}</dd>
-            </div>
-          </dl>
-          {Object.keys(summary.stats.concepts).length > 0 && (
-            <ul className="summary-concepts">
-              {Object.entries(summary.stats.concepts).map(([c, v]) => (
-                <li key={c}>
-                  <span>{c}</span>
-                  <span className={v.solved && !v.slips ? "good" : v.solved ? "mixed" : "work"}>
-                    {v.solved && !v.slips ? "solid" : v.solved ? "got there" : "keep practising"}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-          {account && <SessionSurvey key={summary.stats.startedAt} account={account} sessionId={sessionId.current} />}
-          <div className="keep-actions">
-            <button onClick={saveNotes}>Save notes</button>
-            <button onClick={() => setSummary(null)}>Keep going</button>
-            <button className="primary" onClick={newProblem}>
-              New problem
-            </button>
-          </div>
-        </div>
       )}
 
       {toast && (
