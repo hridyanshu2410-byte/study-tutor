@@ -6,6 +6,7 @@ import {
   distanceToStroke,
   groupLines,
   screenToWorld,
+  strokeBox,
   strokesInLasso,
   unionBox,
   zoomAt,
@@ -101,6 +102,8 @@ const newStats = (): SessionStats => ({ startedAt: Date.now(), turns: 0, concept
 // Where the student double-tapped to point, in page coordinates.
 type Focus = { world: [number, number]; at: number };
 const FOCUS_MS = 8000;
+// After the student moves the page, the tutor waits this long before moving it to show its writing.
+const STEER_MS = 6000;
 
 const STUDENT_INK = "#1f2a44";
 const TUTOR_INK = "#c2410c";
@@ -134,6 +137,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const pinch = useRef<{ dist: number; cx: number; cy: number } | null>(null);
   const penSeen = useRef(false);
   const spaceHeld = useRef(false);
+  // When the student last moved or zoomed the page themselves: the tutor's
+  // camera leaves them be for a while after.
+  const steered = useRef(0);
+  const zoomLabel = useRef<HTMLButtonElement>(null);
   const dirty = useRef(true);
   const pauseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const changedSinceTutor = useRef(false);
@@ -394,6 +401,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       const animating = simRuns.current.size > 0 || tutorInk.current.some((t) => t.born > 0 && t.born !== Infinity && now - t.born < t.plan.duration + 50);
       if (!dirty.current && !animating) return;
       dirty.current = false;
+      if (zoomLabel.current) zoomLabel.current.textContent = `${Math.round(camera.current.z * 100)}%`;
 
       const dpr = window.devicePixelRatio || 1;
       const { clientWidth: w, clientHeight: h } = canvas;
@@ -1270,7 +1278,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   // With `fit`, it also zooms: out until the whole thing fits, or in when it would look small.
   const reveal = (b: Box, fit = false) => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas || performance.now() - steered.current < STEER_MS) return;
     const cam = camera.current;
     const top = 80, bottom = 180; // the toolbar and the caption panel
     if (fit) {
@@ -1363,6 +1371,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         drawing.current = null;
       }
       pinch.current = pinchOf(touches);
+      steer();
       return;
     }
 
@@ -1372,7 +1381,11 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       e.button === 1 ||
       e.button === 2 ||
       (e.pointerType === "touch" && penSeen.current); // palm rejection once a pen is in use
-    if (pans) return;
+    if (pans) {
+      if (e.button === 1) e.preventDefault(); // no autoscroll on a middle-button drag
+      steer();
+      return;
+    }
 
     {
       const [wx, wy] = screenToWorld(camera.current, sx, sy);
@@ -1424,6 +1437,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         cam = { ...cam, x: cam.x - (next.cx - pinch.current.cx) / cam.z, y: cam.y - (next.cy - pinch.current.cy) / cam.z };
         camera.current = cam;
         pinch.current = next;
+        steer();
         dirty.current = true;
       }
       return;
@@ -1458,6 +1472,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         x: camera.current.x - (sx - prev.x) / camera.current.z,
         y: camera.current.y - (sy - prev.y) / camera.current.z,
       };
+      steer();
       dirty.current = true;
     }
   };
@@ -1555,19 +1570,74 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     return false;
   };
 
-  const onWheel = (e: React.WheelEvent) => {
-    const [sx, sy] = local(e);
-    if (e.ctrlKey || e.metaKey) {
-      camera.current = zoomAt(camera.current, sx, sy, Math.exp(-e.deltaY * 0.01));
-    } else {
-      camera.current = {
-        ...camera.current,
-        x: camera.current.x + e.deltaX / camera.current.z,
-        y: camera.current.y + e.deltaY / camera.current.z,
-      };
-    }
+  // The student takes the camera: any glide the tutor started stops where it is.
+  const steer = () => {
+    steered.current = performance.now();
+    glide.current = null;
+  };
+  // Zooms about a point on screen (the middle of the page when none is given).
+  const zoomBy = (factor: number, at?: [number, number]) => {
+    const canvas = canvasRef.current;
+    const [sx, sy] = at ?? [(canvas?.clientWidth ?? 0) / 2, (canvas?.clientHeight ?? 0) / 2];
+    camera.current = zoomAt(camera.current, sx, sy, factor);
+    steer();
     dirty.current = true;
   };
+
+  // Everything on the page in view.
+  const fitAll = () => {
+    const boxes: Box[] = [
+      ...strokes.current.map((st) => strokeBox(st)),
+      ...tutorInk.current.flatMap((t) => (t.born !== Infinity && t.plan.box ? [t.plan.box] : [])),
+      ...(paper.current?.pages ?? []),
+      ...images.current,
+    ];
+    const all = boxes.reduce<Box | null>((u, b) => (u ? unionBox(u, b) : b), null);
+    if (!all) return zoomBy(1 / camera.current.z);
+    steered.current = 0;
+    reveal(all, true);
+    steer();
+  };
+
+  // Mouse wheel zooms about the pointer; a touchpad scrolls the page with two
+  // fingers and zooms with a pinch (which browsers send as a wheel with ctrl
+  // held); ctrl or cmd with the wheel always zooms, shift scrolls sideways.
+  // The listener isn't passive, so the browser itself never zooms or scrolls.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const r = canvas.getBoundingClientRect();
+      const at: [number, number] = [e.clientX - r.left, e.clientY - r.top];
+      const px = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? canvas.clientHeight : 1;
+      const dx = e.deltaX * px, dy = e.deltaY * px;
+      if (e.ctrlKey || e.metaKey) {
+        // a pinch sends many small steps, a mouse notch one big one
+        zoomBy(Math.exp(-Math.max(-60, Math.min(60, dy)) * (Math.abs(dy) < 50 ? 0.012 : 0.004)), at);
+        return;
+      }
+      if (wheelIsMouse(e) && !e.shiftKey) {
+        zoomBy(dy < 0 ? 1.15 : 1 / 1.15, at);
+        return;
+      }
+      const [sxd, syd] = e.shiftKey && !dx ? [dy, 0] : [dx, dy];
+      camera.current = { ...camera.current, x: camera.current.x + sxd / camera.current.z, y: camera.current.y + syd / camera.current.z };
+      steer();
+      dirty.current = true;
+    };
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    // Safari's own pinch gestures, which would otherwise zoom the whole page
+    const stop = (e: Event) => e.preventDefault();
+    canvas.addEventListener("gesturestart", stop);
+    canvas.addEventListener("gesturechange", stop);
+    return () => {
+      canvas.removeEventListener("wheel", onWheel);
+      canvas.removeEventListener("gesturestart", stop);
+      canvas.removeEventListener("gesturechange", stop);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const undo = useCallback(() => {
     const prev = undoStack.current.pop();
@@ -1580,8 +1650,32 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement).tagName === "INPUT") return;
-      if (e.code === "Space") spaceHeld.current = true;
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.code === "Space") {
+        // held space pans with the mouse; it never presses a focused button or scrolls
+        e.preventDefault();
+        if (!spaceHeld.current) {
+          spaceHeld.current = true;
+          canvasRef.current?.classList.add("panning");
+        }
+        return;
+      }
+      if (e.ctrlKey || e.metaKey) {
+        // the page zooms, not the browser
+        if (e.key === "=" || e.key === "+") {
+          e.preventDefault();
+          return zoomBy(1.25);
+        }
+        if (e.key === "-") {
+          e.preventDefault();
+          return zoomBy(1 / 1.25);
+        }
+        if (e.key === "0") {
+          e.preventDefault();
+          return zoomBy(1 / camera.current.z);
+        }
+      }
       if ((e.metaKey || e.ctrlKey) && e.key === "z") {
         e.preventDefault();
         undo();
@@ -1592,7 +1686,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       if (e.key === "k" && stateRef.current.mode === "study") setTool("keep");
     };
     const up = (e: KeyboardEvent) => {
-      if (e.code === "Space") spaceHeld.current = false;
+      if (e.code === "Space") {
+        spaceHeld.current = false;
+        canvasRef.current?.classList.remove("panning");
+      }
     };
     window.addEventListener("keydown", down);
     window.addEventListener("keyup", up);
@@ -2002,9 +2099,23 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerUp}
-        onWheel={onWheel}
         onContextMenu={(e) => e.preventDefault()}
       />
+
+      <div className="zoom" aria-label="Zoom">
+        <button onClick={() => zoomBy(1 / 1.25)} aria-label="Zoom out" title="Zoom out (Ctrl −)">
+          −
+        </button>
+        <button ref={zoomLabel} onClick={() => zoomBy(1 / camera.current.z)} title="Back to 100% (Ctrl 0)">
+          100%
+        </button>
+        <button onClick={() => zoomBy(1.25)} aria-label="Zoom in" title="Zoom in (Ctrl +)">
+          +
+        </button>
+        <button onClick={fitAll} title="Show everything on the page">
+          Fit
+        </button>
+      </div>
 
       <footer className={mode === "review" ? "tutor reviewing" : "tutor"}>
         <button
@@ -2071,6 +2182,13 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       </footer>
     </div>
   );
+}
+
+// A mouse wheel moves in notches: whole lines, or big round steps with
+// nothing sideways. A touchpad sends small, often fractional, steps.
+function wheelIsMouse(e: WheelEvent): boolean {
+  if (e.deltaMode === 1) return true;
+  return e.deltaX === 0 && Math.abs(e.deltaY) >= 50 && Number.isInteger(e.deltaY);
 }
 
 function pinchOf(touches: { x: number; y: number }[]) {
