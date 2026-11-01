@@ -19,7 +19,7 @@ import { scene, sceneRoom } from "./scene.ts";
 // Starts a part of the figure: tags the strokes that follow and gives the part its own randomness.
 type Part = (tag: string) => Rng;
 // Measurements taken from a figure's first part, so later parts line up with it.
-export type FigureLayout = { eqX?: number; restW?: number; widths?: number[] };
+export type FigureLayout = { eqX?: number; restW?: number; widths?: number[]; span?: number };
 
 function niceStep(span: number, target: number): number {
   const raw = span / target;
@@ -539,6 +539,208 @@ function sketch(pen: Pen, fig: Extract<Figure, { kind: "sketch" }>, x: number, y
   });
 }
 
+
+// ---------- timelines, Venn diagrams, trees and cycles ----------
+// A line with a tick per event, the date under it and what happened above;
+// each event draws its own stretch of line, so the timeline grows to the right.
+function timeline(pen: Pen, fig: Extract<Figure, { kind: "timeline" }>, x: number, y: number, size: number, part: Part) {
+  const ts = Math.max(13, size * 0.5);
+  let top = y;
+  if (fig.title) {
+    write(pen, fig.title, x, top + ts * 1.1, ts * 1.15, part("title"));
+    top += ts * 2.6;
+  }
+  const pitch = size * 5.2;
+  const ly = top + ts * 4.4;
+  fig.events.slice(0, 10).forEach((e, i) => {
+    const rng = part(`event:${i}`);
+    const tx = x + size * 2.6 + i * pitch;
+    line(pen, [i ? tx - pitch + 6 : x, ly], [tx + (i === fig.events.length - 1 ? size * 1.4 : 0), ly], rng, 2.2);
+    pen.lift(60);
+    line(pen, [tx, ly - 7], [tx, ly + 7], rng, 2);
+    const when = e.when.slice(0, 14);
+    write(pen, when, tx - measureText(when, ts) / 2, ly + ts * 1.9, ts, rng);
+    const rows = wrapTo(e.what, ts * 0.95, pitch - ts * 0.6);
+    rows.forEach((r, k) => write(pen, r, tx - measureText(r, ts * 0.95) / 2, ly - ts * 0.9 - (rows.length - 1 - k) * ts * 1.35, ts * 0.95, rng));
+  });
+}
+
+// Two or three overlapping circles and what goes in each region.
+function venn(pen: Pen, fig: Extract<Figure, { kind: "venn" }>, x: number, y: number, size: number, part: Part) {
+  const ts = Math.max(13, size * 0.5);
+  const n = Math.max(2, Math.min(3, fig.sets.length));
+  let top = y;
+  if (fig.title) {
+    write(pen, fig.title, x, top + ts * 1.1, ts * 1.15, part("title"));
+    top += ts * 2.6;
+  }
+  const R = size * 3.6;
+  const centres: Pt[] =
+    n === 2
+      ? [[x + R + ts, top + ts * 2 + R], [x + R * 2.1 + ts, top + ts * 2 + R]]
+      : [[x + R + ts, top + ts * 2 + R], [x + R * 2.1 + ts, top + ts * 2 + R], [x + R * 1.55 + ts, top + ts * 2 + R * 1.95]];
+  fig.sets.slice(0, n).forEach((st, i) => {
+    const rng = part(`set:${i}`);
+    const [cx, cy] = centres[i];
+    const pts: Pt[] = [];
+    const start = -2.2 + jitter(rng, 0.2);
+    for (let k = 0; k <= 48; k++) {
+      const a = start + (k / 48) * Math.PI * 2.04;
+      pts.push([cx + Math.cos(a) * R * (1 + jitter(rng, 0.006)), cy + Math.sin(a) * R]);
+    }
+    pen.draw(pts, 1.5);
+    const lw = measureText(st.label, ts * 1.05);
+    const lx = n === 2 ? (i === 0 ? cx - R * 0.55 - lw / 2 : cx + R * 0.55 - lw / 2) : i === 2 ? cx - lw / 2 : i === 0 ? cx - R * 0.55 - lw / 2 : cx + R * 0.55 - lw / 2;
+    const ly = i === 2 ? cy + R + ts * 1.5 : cy - R - ts * 0.5;
+    write(pen, st.label, lx, ly, ts * 1.05, rng);
+  });
+  // where each region's words go
+  const anchor = (sets: number[]): Pt => {
+    const ins = sets.filter((k) => k < n);
+    if (!ins.length) return [x + ts * 0.5, top + ts * 2 + R * (n === 3 ? 3.1 : 2.25)];
+    const c = ins.map((k) => centres[k]);
+    const mx = c.reduce((a, p) => a + p[0], 0) / c.length, my = c.reduce((a, p) => a + p[1], 0) / c.length;
+    if (ins.length === n) return n === 3 ? [centres.reduce((a, p) => a + p[0], 0) / 3, centres.reduce((a, p) => a + p[1], 0) / 3 - ts * 0.3] : [mx, my - ts * 0.6];
+    if (ins.length === 1) {
+      // away from the other circles
+      const all = centres.slice(0, n);
+      const gx = all.reduce((a, p) => a + p[0], 0) / n, gy = all.reduce((a, p) => a + p[1], 0) / n;
+      const dx = mx - gx, dy = my - gy, d = Math.hypot(dx, dy) || 1;
+      return [mx + (dx / d) * R * 0.42, my + (dy / d) * R * 0.42 - ts * 0.6];
+    }
+    // a pair in a three-set diagram: out from the middle, between the two
+    const gx = centres.reduce((a, p) => a + p[0], 0) / 3, gy = centres.reduce((a, p) => a + p[1], 0) / 3;
+    const dx = mx - gx, dy = my - gy, d = Math.hypot(dx, dy) || 1;
+    return [mx + (dx / d) * R * 0.28, my + (dy / d) * R * 0.28 - ts * 0.4];
+  };
+  const counts = new Map<string, number>();
+  fig.items.slice(0, 16).forEach((it, i) => {
+    const key = [...new Set(it.in)].sort().join(",");
+    const k = counts.get(key) ?? 0;
+    counts.set(key, k + 1);
+    const [ax, ay] = anchor([...new Set(it.in)]);
+    const t = it.text.slice(0, 22);
+    const w = measureText(t, ts);
+    write(pen, t, ax - (key ? w / 2 : 0), ay + k * ts * 1.45, ts, part(`item:${i}`));
+  });
+}
+
+// A tree: each node's children share out its span, so nodes added later
+// (the next level of a probability tree) land in place without moving the rest.
+function tree(pen: Pen, fig: Extract<Figure, { kind: "tree" }>, x: number, y: number, size: number, part: Part, fixed?: FigureLayout): FigureLayout {
+  const ts = Math.max(13, size * 0.52);
+  const nodes = fig.nodes.slice(0, 15);
+  const kids = new Map<string | null, typeof nodes>();
+  const ids = new Set(nodes.map((n) => n.id));
+  for (const n of nodes) {
+    const p = n.parent && ids.has(n.parent) && n.parent !== n.id ? n.parent : null;
+    kids.set(p, [...(kids.get(p) ?? []), n]);
+  }
+  const leaves = (id: string, depth = 0): number => (depth > 6 ? 1 : Math.max(1, (kids.get(id) ?? []).reduce((a, k) => a + leaves(k.id, depth + 1), 0)));
+  const roots = kids.get(null) ?? [];
+  const totalLeaves = Math.max(1, roots.reduce((a, r) => a + leaves(r.id), 0));
+  const span = fixed?.span ?? Math.max(totalLeaves, fig.direction === "right" ? 4 : 3) * (fig.direction === "right" ? ts * 2.6 : size * 4.2);
+  let top = y;
+  if (fig.title) {
+    write(pen, fig.title, x, top + ts * 1.1, ts * 1.15, part("title"));
+    top += ts * 2.6;
+  }
+  const step = fig.direction === "right" ? size * 5.4 : ts * 4.2;
+  const placed = new Map<string, Box>();
+  const place = (n: (typeof nodes)[number], depth: number, from: number, to: number, parentBox: Box | null) => {
+    if (depth > 6 || placed.has(n.id)) return;
+    const rng = part(`node:${n.id}`);
+    const t = n.text.slice(0, 24);
+    const w = measureText(t, ts), h = ts * 1.3;
+    const mid = (from + to) / 2;
+    const box: Box = fig.direction === "right" ? { x: x + depth * step, y: top + mid - h / 2, w, h } : { x: x + mid - w / 2, y: top + depth * step, w, h };
+    placed.set(n.id, box);
+    if (parentBox) {
+      const a: Pt = fig.direction === "right" ? [parentBox.x + parentBox.w + 8, parentBox.y + parentBox.h / 2] : [parentBox.x + parentBox.w / 2, parentBox.y + parentBox.h + 6];
+      const b: Pt = fig.direction === "right" ? [box.x - 8, box.y + box.h / 2] : [box.x + box.w / 2, box.y - 6];
+      line(pen, a, b, rng, 2);
+      if (n.edge) {
+        const e = n.edge.slice(0, 12);
+        const ew = measureText(e, ts * 0.85);
+        const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+        const above = fig.direction === "right" ? b[1] <= a[1] : b[0] <= a[0];
+        if (fig.direction === "right") write(pen, e, mx - ew / 2, above ? my - ts * 0.45 : my + ts * 1.15, ts * 0.85, rng);
+        else write(pen, e, above ? mx - ew - ts * 0.5 : mx + ts * 0.5, my + ts * 0.3, ts * 0.85, rng);
+      }
+      pen.lift(80);
+    }
+    write(pen, t, box.x, box.y + ts * 1.05, ts, rng);
+    const children = kids.get(n.id) ?? [];
+    const total = children.reduce((a, c) => a + leaves(c.id), 0) || 1;
+    let at = from;
+    for (const c of children) {
+      const share = ((to - from) * leaves(c.id)) / total;
+      place(c, depth + 1, at, at + share, box);
+      at += share;
+    }
+  };
+  const rootTotal = roots.reduce((a, r) => a + leaves(r.id), 0) || 1;
+  let at = 0;
+  for (const r of roots) {
+    const share = (span * leaves(r.id)) / rootTotal;
+    place(r, 0, at, at + share, null);
+    at += share;
+  }
+  return { span };
+}
+
+// Stages round a circle with an arrow from each to the next; the last arrow
+// closes the loop once the last stage is drawn.
+function cycle(pen: Pen, fig: Extract<Figure, { kind: "cycle" }>, x: number, y: number, size: number, part: Part) {
+  const ts = Math.max(13, size * 0.52);
+  const total = Math.max(3, Math.min(8, Math.max(fig.total || 0, fig.stages.length)));
+  let top = y;
+  if (fig.title) {
+    write(pen, fig.title, x, top + ts * 1.1, ts * 1.15, part("title"));
+    top += ts * 2.6;
+  }
+  const R = size * (total > 5 ? 4.6 : 3.9);
+  const cx = x + R + size * 3.2, cy = top + R + size * 1.4;
+  const at = (k: number): Pt => {
+    const a = -Math.PI / 2 + (k / total) * Math.PI * 2;
+    return [cx + Math.cos(a) * R, cy + Math.sin(a) * R];
+  };
+  const boxes: Box[] = [];
+  const stages = fig.stages.slice(0, total);
+  stages.forEach((st, i) => {
+    const rows = wrapTo(st.text, ts, size * 4.6);
+    const w = Math.max(...rows.map((r) => measureText(r, ts)));
+    const h = rows.length * ts * 1.35;
+    const [px, py] = at(i);
+    boxes.push({ x: px - w / 2, y: py - h / 2, w, h });
+  });
+  if (fig.center) write(pen, fig.center, cx - measureText(fig.center, ts * 1.1) / 2, cy + ts * 0.4, ts * 1.1, part("center"));
+  stages.forEach((st, i) => {
+    const rng = part(`stage:${i}`);
+    const b = boxes[i];
+    const rows = wrapTo(st.text, ts, size * 4.6);
+    rows.forEach((r, k) => write(pen, r, b.x + (b.w - measureText(r, ts)) / 2, b.y + ts * 1.05 + k * ts * 1.35, ts, rng));
+    // the arrow from the stage before, along the circle
+    const arc = (from: number, to: number, r: Rng) => {
+      const a0 = -Math.PI / 2 + (from / total) * Math.PI * 2, a1 = -Math.PI / 2 + (to / total) * Math.PI * 2;
+      const pad = Math.min(0.5, (Math.max(boxes[from % stages.length]?.w ?? 0, b.w) / 2 + ts) / R) * 0.9;
+      const s = a0 + pad, e = a1 - pad;
+      if (e <= s) return;
+      const pts: Pt[] = [];
+      for (let k = 0; k <= 16; k++) {
+        const a = s + ((e - s) * k) / 16;
+        pts.push([cx + Math.cos(a) * R * 1.0, cy + Math.sin(a) * R * 1.0]);
+      }
+      pen.lift(80);
+      pen.draw(pts, 1.4);
+      const end = pts.at(-1)!, prev = pts.at(-3)!;
+      head(pen, end, Math.atan2(end[1] - prev[1], end[0] - prev[0]), 10, r);
+    };
+    if (i > 0) arc(i - 1, i, rng);
+    if (i === total - 1) arc(i, total, part("close"));
+  });
+}
+
 function hash(s: string): number {
   let h = 0x811c9dc5;
   for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193);
@@ -565,6 +767,10 @@ export function drawFigure(pen: Pen, fig: Figure, x: number, y: number, size: nu
   else if (fig.kind === "bars") bars(pen, fig, x, y, size, part);
   else if (fig.kind === "sketch") sketch(pen, fig, x, y, size, part);
   else if (fig.kind === "scene") scene(pen, fig, x, y, size, part);
+  else if (fig.kind === "timeline") timeline(pen, fig, x, y, size, part);
+  else if (fig.kind === "venn") venn(pen, fig, x, y, size, part);
+  else if (fig.kind === "tree") out = tree(pen, fig, x, y, size, part, layout);
+  else if (fig.kind === "cycle") cycle(pen, fig, x, y, size, part);
   pen.tag = undefined;
   return out;
 }
@@ -614,6 +820,10 @@ export function extendFigure(base: Figure, more: Figure): Figure | null {
       arrows: added(base.arrows ?? [], more.arrows ?? []),
       labels: added(base.labels, more.labels),
     };
+  if (base.kind === "timeline" && more.kind === "timeline") return { ...base, events: added(base.events, more.events, (e) => `${e.when}|${e.what}`) };
+  if (base.kind === "venn" && more.kind === "venn") return { ...base, items: added(base.items, more.items, (i) => `${i.text}|${i.in.join(",")}`) };
+  if (base.kind === "tree" && more.kind === "tree") return { ...base, nodes: added(base.nodes, more.nodes, (n) => n.id) };
+  if (base.kind === "cycle" && more.kind === "cycle") return { ...base, total: Math.max(base.total, more.total), stages: added(base.stages, more.stages, (st) => st.text), center: base.center ?? more.center };
   return null;
 }
 
@@ -643,6 +853,18 @@ export function figureRoom(fig: Figure, size: number, drawn: Box, x: number, y: 
   if (fig.kind === "sketch") {
     const ts = Math.max(14, size * 0.52);
     return grow(size * SKETCH_SPAN + ts * 5, size * SKETCH_SPAN + (fig.title ? ts * 1.8 : 0) + ts);
+  }
+  if (fig.kind === "timeline") {
+    const ts = Math.max(13, size * 0.5);
+    return grow(size * 2.6 + 10 * size * 5.2, (fig.title ? ts * 2.6 : 0) + ts * 7.5);
+  }
+  if (fig.kind === "venn") return grow(drawn.w + size * 2, drawn.h + size * 2);
+  if (fig.kind === "tree") return grow(fig.direction === "right" ? size * 5.4 * 4 + size * 4 : drawn.w + size * 6, fig.direction === "right" ? drawn.h + size * 3 : Math.max(0, 5) * Math.max(13, size * 0.52) * 4.2);
+  if (fig.kind === "cycle") {
+    const total = Math.max(3, Math.min(8, Math.max(fig.total || 0, fig.stages.length)));
+    const R = size * (total > 5 ? 4.6 : 3.9);
+    const ts = Math.max(13, size * 0.52);
+    return grow(2 * R + size * 6.4, (fig.title ? ts * 2.6 : 0) + 2 * R + size * 2.8);
   }
   if (fig.kind === "steps") return grow(drawn.w + size * 4, (fig.lines.length + 3) * size * 2.3 + size);
   if (fig.kind === "table") return grow(drawn.w, drawn.h + Math.max(15, size * 0.62) * 2 * 3);

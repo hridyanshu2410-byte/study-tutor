@@ -142,6 +142,10 @@ function figureWords(f: NonNullable<Beat["draw"]>): string[] {
   if (f.kind === "sketch") return [f.title ?? "", ...f.labels.map((l) => l.text)];
   if (f.kind === "flow") return f.nodes.map((n) => n.text);
   if (f.kind === "bars") return [f.title ?? ""];
+  if (f.kind === "timeline") return [f.title ?? "", ...f.events.map((e) => e.what)];
+  if (f.kind === "venn") return [f.title ?? "", ...f.items.map((i) => i.text)];
+  if (f.kind === "tree") return [f.title ?? "", ...f.nodes.map((n) => n.text)];
+  if (f.kind === "cycle") return [f.title ?? "", ...f.stages.map((x) => x.text)];
   return [];
 }
 

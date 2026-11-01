@@ -683,5 +683,10 @@ function describeFigure(f: NonNullable<Beat["draw"]>): string {
     return `drew a scene${f.title ? ` "${f.title}"` : ""}: ${f.things
       .map((t) => `${t.what}${t.count ? ` ×${t.count}` : ""}${t.caption ? ` "${t.caption}"` : ""}${t.says ? ` saying "${t.says}"` : ""} (row ${t.row}, col ${t.col})`)
       .join(", ")}${f.arrows.length ? `; arrows ${f.arrows.map((a) => `${a.from}→${a.to}`).join(", ")}` : ""}${f.marks.length ? `; marked ${f.marks.map((m) => `${m.kind} on ${m.on}${m.note ? ` "${m.note}"` : ""}`).join(", ")}` : ""}`;
+  if (f.kind === "timeline") return `drew a timeline${f.title ? ` "${f.title}"` : ""}: ${f.events.map((e) => `${e.when} ${e.what}`).join(" → ")}`;
+  if (f.kind === "venn")
+    return `drew a Venn diagram of ${f.sets.map((x) => x.label).join(" and ")}: ${f.items.map((i) => `"${i.text}" in ${i.in.length ? i.in.map((k) => f.sets[k]?.label ?? k).join(" & ") : "neither"}`).join(", ")}`;
+  if (f.kind === "tree") return `drew a tree${f.title ? ` "${f.title}"` : ""}: ${f.nodes.map((n) => `${n.text}${n.parent ? ` (under ${n.parent}${n.edge ? `, branch "${n.edge}"` : ""})` : ""}`).join(", ")}`;
+  if (f.kind === "cycle") return `drew a cycle${f.title ? ` "${f.title}"` : ""}: ${f.stages.map((x) => x.text).join(" → ")} → back to the start`;
   return `wrote steps: ${f.lines.map((l) => l.math).join(" ; ")}`;
 }
