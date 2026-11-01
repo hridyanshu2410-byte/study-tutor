@@ -7,6 +7,7 @@ import { zodResponseFormat } from "openai/helpers/zod";
 import { adminClient, createClient } from "@/lib/supabase/server";
 import { researchMode } from "@/lib/supabase/env";
 import { conditionOf, dailyTutorLimit, startOfUtcDay, type Condition } from "@/lib/study";
+import { describeModel } from "@/lib/model3d";
 import { allowedMoves, EXPLAIN_PROMPT, LADDER, LITERATURE_PROMPT, MOVES, PAPER_PROMPT, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, tutorTurnSchema, type Beat, type PublicTurn, type TurnEnd, type TutorRequest, type TutorTurn } from "@/lib/tutor";
 import { BeatChecker, readingFlag, TurnScanner } from "@/lib/turn-stream";
 
@@ -351,6 +352,12 @@ export async function POST(req: Request) {
         (paper.truncated ? " Parts of the paper were left out of the text for length; if asked about them, say so and ask the student to scroll there." : "") +
         (paper.pointedAt ? ` The student is pointing at sentence ${paper.pointedAt} in the paper.` : "")
       : "",
+    (body.models ?? []).length
+      ? `3D models on the page (the last is the newest): ${(body.models ?? [])
+          .slice(-3)
+          .map((m) => `${String(m.title).slice(0, 80)}, showing ${String(m.view).slice(0, 20)}, parts: ${(m.parts ?? []).slice(0, 30).map((x) => String(x).slice(0, 30)).join(", ")}`)
+          .join("; ")}. model_focus and model_view act on the newest.`
+      : "",
     `Lines on the page: ${body.lines.map((l) => `${l.id} (${l.tokens} tokens)`).join(", ") || "none yet"}`,
     body.hasPhoto
       ? "The page has a photo or PDF of printed material (a worksheet, textbook page or notes) under the student's ink. Line ids and token boxes cover only the student's handwriting. Read the printed problems from the image; if several are printed and the student hasn't said or shown which one, ask which they're on."
@@ -446,7 +453,7 @@ export async function POST(req: Request) {
               return ctrl.abort();
             }
             checker.strip(beat);
-            if (!beat.say && !beat.write.length && !beat.draw && !beat.highlights.length && !beat.annotations.length) continue;
+            if (!beat.say && !beat.write.length && !beat.draw && !beat.highlights.length && !beat.annotations.length && !beat.model) continue;
           }
           checker.commit(beat);
           sent.push(beat);
@@ -649,7 +656,7 @@ function fallbackTurn(say: string): PublicTurn {
   return {
     move: "ask_plan",
     say,
-    beats: say ? [{ say, write: [], draw: null, continue_figure: false, highlights: [], annotations: [] }] : [],
+    beats: say ? [{ say, write: [], draw: null, continue_figure: false, highlights: [], annotations: [], model: null, model_focus: null, model_view: null }] : [],
     simulate: null,
     skill: { concept: "", evidence: "none" },
     card: null,
@@ -661,6 +668,9 @@ function describeInk(beats: Beat[], simulate: TutorTurn["simulate"]): string {
   const ink = beats.flatMap((b) => [
     ...b.write.map((w) => `wrote "${w}"`),
     ...(b.draw ? [`${b.continue_figure ? "added to the figure: " : ""}${describeFigure(b.draw)}`] : []),
+    ...(b.model ? [`put a ${describeModel(b.model)} on the page`] : []),
+    ...(b.model_focus ? [`lit up ${b.model_focus} on the 3D model`] : []),
+    ...(b.model_view ? [`switched the 3D model to ${b.model_view}`] : []),
     ...b.highlights.map((h) => `${h.kind}ed ${h.ref}${h.note ? ` with margin note "${h.note}"` : ""}`),
     ...b.annotations.map((a) => {
       const where = a.from_token == null ? a.line_id : `${a.line_id} tokens ${a.from_token}-${a.to_token ?? a.from_token}`;

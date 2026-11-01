@@ -43,6 +43,9 @@ import { drawSim, playButton, runSeconds, SIM_H, SIM_W, simResult, type PageSim 
 import { findSentence, isLiterature, paperDigest, phraseBoxes, type DocKind, type Paper } from "@/lib/paper";
 import { openPaper } from "@/lib/paper-pdf";
 import { typesetText } from "@/lib/text-doc";
+import { MODEL_H, MODEL_W, modelParts, type PageModel } from "@/lib/model3d";
+import { drawModelFrame, hitModel, modelButtons, modelView, placeLabels, type ModelButton, type ModelLabelBox } from "@/lib/model-page";
+import type { Built, ModelStage } from "@/lib/model3d-render";
 import { deletePaper, loadPaper, savePaper } from "@/lib/paper-store";
 import { reportHtml, reportStats, reportTitle, type JournalEntry, type ReportAnalysis, type ReportRequest, type SessionReport } from "@/lib/session-report";
 import { deleteReport, loadReports, saveReport } from "@/lib/report-store";
@@ -77,7 +80,7 @@ type TutorState = "idle" | "thinking" | "speaking";
 type TutorInk = { id: string; plan: PenPlan; born: number; marks?: Box[]; rules?: Box[] };
 // One spoken phrase of a turn: its words, its ink and its voice, and how far along it is.
 // `region` is everything the phrase marks or draws; `figure` the whole of the figure it draws or adds to.
-type Act = { beat: Beat; ink: TutorInk | null; clip: Clip | null; region: Box | null; figure: Box | null; started: boolean; voiceDone: boolean; inkDone: boolean };
+type Act = { beat: Beat; model: PageModel | null; ink: TutorInk | null; clip: Clip | null; region: Box | null; figure: Box | null; started: boolean; voiceDone: boolean; inkDone: boolean };
 // A turn being performed. Phrases keep arriving while earlier ones are spoken;
 // each one's ink is drawn while its words are heard, and the next follows
 // when both are done.
@@ -103,7 +106,7 @@ type Show = {
 };
 // Which paper is open and where its pages start; the paper itself lives in IndexedDB.
 type PaperRef = { id: string; title: string; x: number; y: number; w: number };
-type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string; images?: PageImage[]; sims?: PageSim[]; paper?: PaperRef | null };
+type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string; images?: PageImage[]; sims?: PageSim[]; models?: PageModel[]; paper?: PaperRef | null };
 // An open paper: its pages laid out in a column on the page.
 type OpenPaper = { ref: PaperRef; data: Paper; pages: PageImage[]; digest: { text: string; truncated: boolean } };
 const PAPER_W = 700;
@@ -140,6 +143,15 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   // Simulations on the page, and when each one started playing.
   const sims = useRef<PageSim[]>([]);
   const simRuns = useRef(new Map<string, number>());
+  // 3D models on the page. Each keeps its last frame on its own canvas; the
+  // renderer (three.js, loaded only when a model first appears) redraws it while it moves.
+  const models = useRef<PageModel[]>([]);
+  const modelStage = useRef<ModelStage | null>(null);
+  const modelLive = useRef(
+    new Map<string, { built: Built | null; canvas: HTMLCanvasElement; t: number; explode: number; stale: boolean; labels: ModelLabelBox[]; buttons: ModelButton[]; raw: { id: string; text: string; x: number; y: number; focused: boolean }[] }>(),
+  );
+  const modelDrag = useRef<{ id: string; pointerId: number; x: number; y: number; moved: boolean } | null>(null);
+  const loadingStage = useRef<Promise<typeof import("@/lib/model3d-render")> | null>(null);
   const tutorFont = useRef("cursive");
   const paper = useRef<OpenPaper | null>(null);
   const camera = useRef<Camera>({ x: -40, y: -40, z: 1 });
@@ -266,6 +278,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     setImages(saved?.images ?? []);
     sims.current = saved?.sims ?? [];
     simRuns.current.clear();
+    setModels(saved?.models ?? []);
     setPaper(null);
     const ref = saved?.paper;
     if (ref)
@@ -305,7 +318,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     if (stateRef.current.mode === "review") return;
     // ink for phrases not yet spoken isn't on the page yet
     const ink = tutorInk.current.filter((t) => t.born !== Infinity);
-    const page: SavedPage = { strokes: strokes.current, tutorInk: ink, problem: stateRef.current.problem, images: images.current, sims: sims.current, paper: paper.current?.ref ?? null };
+    const page: SavedPage = { strokes: strokes.current, tutorInk: ink, problem: stateRef.current.problem, images: images.current, sims: sims.current, models: models.current.map((m) => ({ ...m, shownAt: undefined })), paper: paper.current?.ref ?? null };
     if (account) saveCloud(account.userId, "page", page);
     try {
       localStorage.setItem(pageKey, JSON.stringify(page));
@@ -369,11 +382,27 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     }
     return el.complete && el.naturalWidth ? el : null;
   };
-  const loadedPictures = () =>
-    images.current.flatMap((img) => {
+  // The 3D models' latest frames, as pictures the tutor can see.
+  const modelPictures = (): LoadedPicture[] =>
+    models.current.flatMap((m) => {
+      const live = modelLive.current.get(m.id);
+      if (!live?.built || live.canvas.width < 2 || (m.shownAt != null && m.shownAt > performance.now())) return [];
+      const v = modelView(m);
+      return [{ img: { id: `model:${m.id}`, src: "", ...v }, el: live.canvas }];
+    });
+  const loadedPictures = (): LoadedPicture[] => [
+    ...images.current.flatMap((img) => {
       const el = pictureFor(img);
       return el ? [{ img, el }] : [];
-    });
+    }),
+    ...modelPictures(),
+  ];
+  // Pictures for a view of the page: paper pages, photos, and the models.
+  const viewPictures = (): [PageImage[], (img: PageImage) => CanvasImageSource | null] => {
+    const mp = modelPictures();
+    const els = new Map(mp.map((p) => [p.img.id, p.el]));
+    return [[...(paper.current?.pages ?? []), ...images.current, ...mp.map((p) => p.img)], (img) => els.get(img.id) ?? pictureFor(img)];
+  };
 
   // ---------- rendering ----------
   const pathFor = useCallback((s: Stroke, simulate = false) => {
@@ -402,8 +431,12 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   useEffect(() => {
     let raf = 0;
+    let lastFrame = performance.now();
     const frame = (now: number) => {
       raf = requestAnimationFrame(frame);
+      const dt = Math.min(0.1, (now - lastFrame) / 1000);
+      lastFrame = now;
+      const modelsMoving = models.current.length ? stepModels(now, dt, viewBox()) : false;
       const canvas = canvasRef.current;
       if (!canvas) return;
       if (glide.current) {
@@ -417,7 +450,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         if (f === 1) glide.current = null;
         dirty.current = true;
       }
-      const animating = simRuns.current.size > 0 || tutorInk.current.some((t) => t.born > 0 && t.born !== Infinity && now - t.born < t.plan.duration + 50);
+      const animating = modelsMoving || models.current.some((m) => m.shownAt != null && m.shownAt <= now && !modelLive.current.get(m.id)?.built) || simRuns.current.size > 0 || tutorInk.current.some((t) => t.born > 0 && t.born !== Infinity && now - t.born < t.plan.duration + 50);
       if (!dirty.current && !animating) return;
       dirty.current = false;
       if (zoomLabel.current) zoomLabel.current.textContent = `${Math.round(camera.current.z * 100)}%`;
@@ -437,6 +470,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       ctx.setTransform(dpr * cam.z, 0, 0, dpr * cam.z, -cam.x * cam.z * dpr, -cam.y * cam.z * dpr);
       for (const img of paper.current?.pages ?? []) drawPicture(ctx, img, pictureFor(img), cam.z);
       for (const img of images.current) drawPicture(ctx, img, pictureFor(img), cam.z);
+      drawModels(ctx, now);
       for (const sim of sims.current) {
         const start = simRuns.current.get(sim.id);
         const t = start == null ? null : (now - start) / 1000;
@@ -544,6 +578,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
             idleSeconds: lastPenAt.current ? (Date.now() - lastPenAt.current) / 1000 : undefined,
             focus: trigger === "pause" ? null : focusOn(lines),
             hasPhoto: images.current.length > 0,
+            models: models.current
+              .filter((m) => m.shownAt == null || m.shownAt <= performance.now())
+              .map((m) => ({ title: m.spec.title ?? m.spec.kind, parts: modelLive.current.get(m.id)?.built?.parts.map((p) => p.id) ?? modelParts(m.spec), view: m.state.view })),
             paper: paper.current
               ? {
                   title: paper.current.ref.title,
@@ -557,7 +594,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
             lines: lines.map((l) => ({ id: l.id, tokens: l.tokens.length })),
             ...(paper.current
               ? {
-                  pageImage: renderViewImage(viewBox(), [...(paper.current.pages ?? []), ...images.current], pictureFor, strokes.current, tutorInk.current),
+                  pageImage: renderViewImage(viewBox(), ...viewPictures(), strokes.current, tutorInk.current),
                   tokenImage: renderPageImages(strokes.current, lines).tokenImage,
                 }
               : renderPageImages(strokes.current, lines, loadedPictures())),
@@ -721,8 +758,13 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     const cam = camera.current;
     const p = paper.current;
     const planner = new TurnPlanner(lines, Math.floor(Math.random() * 2 ** 31), {
-      avoid: tutorInk.current.flatMap((t) => (p && t.plan.parts ? t.plan.parts : t.plan.box ? [t.plan.box] : [])),
-      origin: { x: cam.x, y: cam.y + 60 / cam.z },
+      avoid: [
+        ...tutorInk.current.flatMap((t) => (p && t.plan.parts ? t.plan.parts : t.plan.box ? [t.plan.box] : [])),
+        // models and simulations already on the page keep their place
+        ...models.current.map((m) => ({ x: m.x, y: m.y, w: m.w, h: m.h })),
+        ...sims.current.map((m) => ({ x: m.x, y: m.y, w: m.w, h: m.h })),
+      ],
+      origin: { x: cam.x + 70 / cam.z, y: cam.y + 80 / cam.z },
       // the caption panel covers the bottom of the screen
       column: p ? { x: p.ref.x + p.ref.w + 70, top: Math.max(p.ref.y, cam.y + 80 / cam.z), bottom: cam.y + viewBox().h - 180 / cam.z } : undefined,
       size: p ? 19 : undefined,
@@ -750,6 +792,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       const boxes = (exact ?? found.sentence.boxes).map((b) => ({ x: at.x + b.x * at.w - 2, y: at.y + b.y * at.h - 1, w: b.w * at.w + 4, h: b.h * at.h + 2 }));
       return boxes.length ? [{ boxes, kind: h.kind, note: h.note, edge: at.x + at.w }] : [];
     });
+    // a 3D model goes on the page first, so this phrase's ink keeps clear of it
+    const model = beat.model ? placeModel(s, beat.model) : null;
     const plan = s.planner.plan({
       annotations: beat.annotations,
       marks,
@@ -765,11 +809,11 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       ink = { id: crypto.randomUUID(), plan, born: Infinity, marks: rects, rules };
       tutorInk.current.push(ink);
     }
-    const region = [...marks.flatMap((m) => m.boxes), ...(plan.box ? [plan.box] : [])].reduce<Box | null>((a, b) => (a ? unionBox(a, b) : b), null);
+    const region = [...marks.flatMap((m) => m.boxes), ...(plan.box ? [plan.box] : []), ...(model ? [{ x: model.x, y: model.y, w: model.w, h: model.h }] : [])].reduce<Box | null>((a, b) => (a ? unionBox(a, b) : b), null);
     let clip = ahead?.get(beat.say) ?? null;
     ahead?.delete(beat.say);
     if (!clip && beat.say && !stateRef.current.muted) clip = prepareClip(beat.say);
-    s.acts.push({ beat, ink, clip, region, figure: plan.figure ?? null, started: false, voiceDone: false, inkDone: !ink });
+    s.acts.push({ beat, model, ink, clip, region, figure: plan.figure ?? null, started: false, voiceDone: false, inkDone: !ink });
     // the answer came before the line said while thinking could start: skip that line
     if (aside.current && !aside.current.speaking) quietAside();
     if (!s.playing && !s.breathing && !aside.current) playNext(s);
@@ -804,6 +848,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       if (act.started || show.current !== s) return;
       act.started = true;
       const speaking = words ? (ms ?? speechMs(words)) : 0;
+      // the model appears, and the part named lights up, as the words begin
+      if (act.model) act.model.shownAt = performance.now();
+      const target = act.model ?? models.current.at(-1);
+      if (target && (act.beat.model_focus !== null || act.beat.model_view)) setModelView(target, act.beat.model_view, act.beat.model_focus ?? undefined);
       if (act.ink) {
         // the pen keeps pace so the phrase's ink is done about when its words are
         if (words) act.ink.plan = retime(act.ink.plan, Math.min(1, speaking / Math.max(1, act.ink.plan.duration)));
@@ -957,7 +1005,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       // a little room round it, and never so small a crop that a line of writing fills the picture
       const w = Math.max(region.w + 60, 620), h = Math.max(region.h + 60, 240);
       try {
-        picture = renderViewImage({ x: region.x + region.w / 2 - w / 2, y: region.y + region.h / 2 - h / 2, w, h }, [...(p?.pages ?? []), ...images.current], pictureFor, strokes.current, tutorInk.current, 900);
+        picture = renderViewImage({ x: region.x + region.w / 2 - w / 2, y: region.y + region.h / 2 - h / 2, w, h }, ...viewPictures(), strokes.current, tutorInk.current, 900);
       } catch {
         // a picture is a nicety; the words are the record
       }
@@ -983,7 +1031,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       const x0 = Math.min(...ink.map((q) => q[0])) - m, y0 = Math.min(...ink.map((q) => q[1])) - m;
       const x1 = Math.max(...ink.map((q) => q[0])) + m, y1 = Math.max(...ink.map((q) => q[1])) + m;
       try {
-        board = renderViewImage({ x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, [...(p?.pages ?? []), ...images.current], pictureFor, strokes.current, tutorInk.current, 1600);
+        board = renderViewImage({ x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, ...viewPictures(), strokes.current, tutorInk.current, 1600);
       } catch {
         board = null;
       }
@@ -1145,6 +1193,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     setImages([]);
     setPaper(null);
     sims.current = [];
+    setModels([]);
     simRuns.current.clear();
     paths.current.clear();
     tutorPaths.current.clear();
@@ -1278,9 +1327,170 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       ...sims.current,
     ];
     const below = boxes.length ? Math.max(...boxes.map((b) => b.y + b.h)) + 36 : cam.y + 90 / cam.z;
-    const sim: PageSim = { id: crypto.randomUUID(), spec, x: cam.x + 40 / cam.z, y: below, w: SIM_W, h: SIM_H, ran: false };
+    const sim: PageSim = { id: crypto.randomUUID(), spec, x: cam.x + 90 / cam.z, y: below, w: SIM_W, h: SIM_H, ran: false };
     sims.current.push(sim);
     reveal(sim);
+  };
+
+  // ---------- 3D models ----------
+  const setModels = (list: PageModel[]) => {
+    for (const [id, live] of modelLive.current) if (!list.some((m) => m.id === id)) {
+      live.built?.dispose();
+      modelLive.current.delete(id);
+    }
+    models.current = list;
+    if (list.length) ensureStage();
+    dirty.current = true;
+  };
+
+  // Loads three.js and the model builders the first time a model is on the page.
+  const ensureStage = () => {
+    if (loadingStage.current) return loadingStage.current;
+    loadingStage.current = import("@/lib/model3d-render");
+    loadingStage.current
+      .then((mod) => {
+        try {
+          modelStage.current = new mod.ModelStage();
+        } catch {
+          flash("This browser can't show 3D models (WebGL is off).");
+        }
+        dirty.current = true;
+      })
+      .catch(() => flash("The 3D viewer couldn't load."));
+    return loadingStage.current;
+  };
+
+  const liveFor = (m: PageModel) => {
+    let live = modelLive.current.get(m.id);
+    if (!live) {
+      live = { built: null, canvas: document.createElement("canvas"), t: 0, explode: 0, stale: true, labels: [], buttons: [], raw: [] };
+      modelLive.current.set(m.id, live);
+    }
+    return live;
+  };
+
+  // Brings each model's frame up to date: builds it on first sight, moves its
+  // clock if it is playing, turns it slowly when left alone, eases the
+  // exploded view in and out, and redraws only what changed.
+  const stepModels = (now: number, dt: number, view: Box): boolean => {
+    let moving = false;
+    const stage = modelStage.current;
+    for (const m of models.current) {
+      if (m.shownAt != null && m.shownAt > now) continue;
+      const live = liveFor(m);
+      const onScreen = m.x < view.x + view.w && m.x + m.w > view.x && m.y < view.y + view.h && m.y + m.h > view.y;
+      if (!stage || !loadingStage.current) continue;
+      if (!live.built) {
+        loadingStage.current.then((mod) => {
+          if (live.built || !models.current.includes(m)) return;
+          try {
+            live.built = mod.buildModel(m.spec);
+            if (!live.built.views.some((v) => v.id === m.state.view)) m.state.view = live.built.views[0]?.id ?? "whole";
+            live.built.apply(m.state.view, m.state.focus);
+          } catch {
+            live.built = null;
+          }
+          live.stale = true;
+          dirty.current = true;
+        });
+        continue;
+      }
+      if (!onScreen) continue;
+      const b = live.built;
+      const idle = now - m.state.touched > 20000 && !modelDrag.current;
+      if (b.animated && m.state.playing) {
+        live.t += dt;
+        live.stale = true;
+      }
+      if (idle) {
+        m.state.yaw += dt * 0.12;
+        live.stale = true;
+      }
+      const target = m.state.view === "exploded" ? 1 : 0;
+      if (Math.abs(live.explode - target) > 0.002) {
+        live.explode += (target - live.explode) * Math.min(1, dt * 4);
+        live.stale = true;
+      } else live.explode = target;
+      if (live.stale) {
+        const v = modelView(m);
+        live.raw = stage.draw(b, m.state, live.t, live.explode, live.canvas, v.w, v.h, Math.min(2, (window.devicePixelRatio || 1) * Math.max(0.6, camera.current.z)));
+        live.stale = false;
+      }
+      if ((b.animated && m.state.playing) || idle || live.explode !== target) moving = true;
+    }
+    return moving;
+  };
+
+  const drawModels = (ctx: CanvasRenderingContext2D, now: number) => {
+    for (const m of models.current) {
+      if (m.shownAt != null && m.shownAt > now) continue;
+      const live = liveFor(m);
+      const b = live.built;
+      live.buttons = modelButtons(ctx, m, b?.views ?? [], !!b?.animated);
+      live.labels = placeLabels(ctx, m, live.raw.map((l) => ({ ...l, focused: l.id === m.state.focus })));
+      drawModelFrame(ctx, m, b && live.canvas.width > 1 ? live.canvas : null, m.spec.title ?? "3D model", b?.readout ?? null, live.labels, live.buttons, camera.current.z);
+    }
+  };
+
+  // Puts the model a phrase brings on the page, in space held by the turn's planner.
+  const placeModel = (s: Show, spec: PageModel["spec"]): PageModel => {
+    const spot = s.planner.reserve(MODEL_W, MODEL_H);
+    const m: PageModel = {
+      id: crypto.randomUUID(),
+      spec,
+      x: spot.x,
+      y: spot.y,
+      w: MODEL_W,
+      h: MODEL_H,
+      state: { yaw: 0.6, pitch: 0.38, zoom: 1, view: spec.kind === "preset" && /cell|earth/.test(spec.preset) ? "cutaway" : "whole", focus: null, playing: true, touched: 0 },
+      shownAt: Infinity,
+    };
+    setModels([...models.current, m]);
+    return m;
+  };
+
+  const setModelView = (m: PageModel, view: string | null, focus: string | null | undefined) => {
+    const live = liveFor(m);
+    if (view && live.built && !live.built.views.some((v) => v.id === view)) {
+      // a view this model doesn't have: the nearest it does
+      view = view === "slices" || view === "sweep" ? null : view === "cutaway" ? "xray" : null;
+    }
+    if (view) m.state.view = view;
+    if (focus !== undefined) m.state.focus = focus && live.built ? (live.built.parts.some((p) => p.id === focus) ? focus : null) : (focus ?? null);
+    live.built?.apply(m.state.view, m.state.focus);
+    live.stale = true;
+    dirty.current = true;
+  };
+
+  // A tap or drag on a model: buttons switch views, a label lights its part,
+  // and dragging the view turns the model.
+  const modelPointerDown = (e: React.PointerEvent, wx: number, wy: number): boolean => {
+    for (const m of [...models.current].reverse()) {
+      if (m.shownAt != null && m.shownAt > performance.now()) continue;
+      const live = modelLive.current.get(m.id);
+      const hit = hitModel(m, wx, wy, live?.buttons ?? [], live?.labels ?? []);
+      if (!hit) continue;
+      m.state.touched = performance.now();
+      if (hit.kind === "button") {
+        if (hit.id.startsWith("view:")) setModelView(m, hit.id.slice(5), undefined);
+        else if (hit.id === "play") m.state.playing = !m.state.playing;
+        else if (hit.id === "reset") {
+          Object.assign(m.state, { yaw: 0.6, pitch: 0.38, zoom: 1, focus: null });
+          setModelView(m, live?.built?.views[0]?.id ?? "whole", null);
+        }
+        if (live) live.stale = true;
+        dirty.current = true;
+        save();
+      } else if (hit.kind === "label") {
+        setModelView(m, null, m.state.focus === hit.id ? null : hit.id);
+        save();
+      } else if (hit.kind === "view") {
+        modelDrag.current = { id: m.id, pointerId: e.pointerId, x: e.clientX, y: e.clientY, moved: false };
+        (e.target as Element).setPointerCapture?.(e.pointerId);
+      }
+      return true;
+    }
+    return false;
   };
 
   // A run finished: keep its results on the page and let the tutor see what happened.
@@ -1414,6 +1624,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
     {
       const [wx, wy] = screenToWorld(camera.current, sx, sy);
+      if (tool !== "eraser" && tool !== "keep" && models.current.length && modelPointerDown(e, wx, wy)) return;
       const sim = simPlayAt(wx, wy);
       if (sim && !simRuns.current.has(sim.id)) {
         simRuns.current.set(sim.id, performance.now());
@@ -1465,6 +1676,24 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         camera.current = cam;
         pinch.current = next;
         steer();
+        dirty.current = true;
+      }
+      return;
+    }
+
+    const md = modelDrag.current;
+    if (md && md.pointerId === e.pointerId) {
+      const m = models.current.find((x) => x.id === md.id);
+      if (m) {
+        const dx = e.clientX - md.x, dy = e.clientY - md.y;
+        md.x = e.clientX;
+        md.y = e.clientY;
+        md.moved = true;
+        m.state.yaw -= dx * 0.01;
+        m.state.pitch = Math.max(-1.3, Math.min(1.45, m.state.pitch + dy * 0.008));
+        m.state.touched = performance.now();
+        const live = modelLive.current.get(m.id);
+        if (live) live.stale = true;
         dirty.current = true;
       }
       return;
@@ -1527,6 +1756,11 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   const onPointerUp = (e: React.PointerEvent) => {
     pointers.current.delete(e.pointerId);
+    if (modelDrag.current?.pointerId === e.pointerId) {
+      modelDrag.current = null;
+      save();
+      return;
+    }
     if (pointers.current.size < 2) pinch.current = null;
     if (lasso.current) {
       const picked = strokesInLasso(strokes.current, lasso.current);
@@ -1767,6 +2001,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     tutorPaths.current.clear();
     sessionId.current = crypto.randomUUID();
     sims.current = [];
+    setModels([]);
     simRuns.current.clear();
     stats.current = newStats();
     dirty.current = true;
@@ -1780,6 +2015,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     setImages([]);
     setPaper(null);
     sims.current = [];
+    setModels([]);
     simRuns.current.clear();
     paths.current.clear();
     tutorPaths.current.clear();
@@ -1804,7 +2040,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       const cam = camera.current;
       const viewW = canvas.clientWidth / cam.z;
       const width = Math.min(900, Math.max(320, viewW * 0.6));
-      const x = cam.x + 30 / cam.z;
+      const x = cam.x + 90 / cam.z;
       let y = cam.y + 90 / cam.z;
       const added: PageImage[] = [];
       for (const p of pictures) {
@@ -1863,6 +2099,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       tutorPaths.current.clear();
       undoStack.current = [];
       sims.current = [];
+      setModels([]);
+    setModels([]);
       simRuns.current.clear();
       setImages([]);
       sessionId.current = crypto.randomUUID();
@@ -2417,7 +2655,7 @@ function outlinePath(outline: number[][]): Path2D {
 // The tutor gets two pictures: the clean page to read, and the same page with
 // line ids and numbered token boxes so it can point at an exact part.
 // Tutor ink is left out of both so it never "reads" itself.
-type LoadedPicture = { img: PageImage; el: HTMLImageElement };
+type LoadedPicture = { img: PageImage; el: CanvasImageSource };
 
 function renderPageImages(strokes: Stroke[], lines: InkLine[], pictures: LoadedPicture[] = []): { pageImage: string; tokenImage: string } {
   if (!lines.length && !pictures.length) {
@@ -2474,7 +2712,7 @@ function renderPageImages(strokes: Stroke[], lines: InkLine[], pictures: LoadedP
 function renderViewImage(
   view: Box,
   pictures: PageImage[],
-  pictureFor: (img: PageImage) => HTMLImageElement | null,
+  pictureFor: (img: PageImage) => CanvasImageSource | null,
   strokes: Stroke[],
   inks: TutorInk[],
   maxW = 1400,

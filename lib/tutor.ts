@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { FigureSchema } from "./figure-schema.ts";
 import { SimSchema } from "./sims.ts";
+import { Model3DSchema } from "./model3d.ts";
 
 export const MOVES = ["wait", "ask_plan", "point", "name_concept", "simpler_example", "next_step", "worked_solution", "affirm", "check_understanding"] as const;
 type Move = (typeof MOVES)[number];
@@ -27,6 +28,17 @@ export const beatSchema = z.object({
   draw: FigureSchema.nullable().describe(
     "A figure you draw while saying this phrase, or the next part of one: a graph, number line, shape, flow, table, force diagram, aligned equation steps, a diagram, bars, a freehand sketch, a scene, a timeline, a Venn diagram, a tree (probability, decision, family, taxonomy, parse) or a cycle. Null for none.",
   ),
+  model: Model3DSchema.nullable().describe(
+    "A real 3D model to put on the page as you say this phrase, when seeing it in three dimensions matters: the Earth's layers, an atom, DNA, a cell, the solar system, an engine, a molecule's shape, a solid of revolution or a surface in calculus, a geometric solid, vectors in space, or anything else built from parts. The student can turn it, explode it, cut it open and x-ray it. At most one a turn, and only when a flat drawing would not do. Null almost always.",
+  ),
+  model_focus: z
+    .string()
+    .nullable()
+    .describe("The id of one part of the 3D model on the page (or the one this beat puts there) to light up while you say this phrase, the rest fading back: \"mantle\", \"piston\", \"mitochondria\". Null for none."),
+  model_view: z
+    .enum(["whole", "exploded", "cutaway", "xray", "slices", "sweep"])
+    .nullable()
+    .describe("Switch the 3D model to this view as you say the phrase: exploded pulls the parts apart, cutaway cuts it open, xray sees through, slices shows disks or shells, sweep turns a region into a solid. Null to leave it."),
   continue_figure: z
     .boolean()
     .describe(
@@ -137,6 +149,8 @@ export type TutorRequest = {
   idleSeconds?: number;
   // A photo or PDF of printed material sits under the student's ink.
   hasPhoto?: boolean;
+  // 3D models on the page, newest last, with the parts the tutor can point at.
+  models?: { title: string; parts: string[]; view: string }[];
   speech: string | null;
   lines: { id: string; tokens: number }[];
   pageImage: string; // PNG (or JPEG when there is a photo) data URL of the student's page, clean
@@ -190,6 +204,12 @@ Drawing, like a tutor sketching beside you:
 - Build a picture up as you explain it, the way a teacher does at a board: draw its first part in one beat, then in each following beat add the next part with continue_figure true, naming it as it appears. Axes and the first curve, then "and here's where it crosses zero" with that point. The first box of a diagram, then "it feeds this" with the next box and its arrow. The first person in a scene, then "and she pays him five dollars" with the next person and the arrow. Equation steps one line per beat.
 - Draw to make the student think, not to hand over the answer: sketch y = x² so they can see where it's zero, but don't draw the graph they were asked to sketch, or the solved steps of their problem, before worked_solution. Steps belong to a parallel example, next_step (one line) or worked_solution.
 - Keep it small: at most two figures a turn, a few labels each.
+
+3D models, when depth matters:
+- Some ideas only make sense in three dimensions: the layers inside the Earth, the shape of a molecule (why water bends), DNA's double helix, the organelles of a cell, how an engine's piston, rod and crank move together, the solid made by turning a region about an axis, a saddle surface, a cone's cross-section, vectors and their cross product. For those, put a model on the page in a beat's model, and the student can turn it with their finger.
+- Build it up and talk through it like a guide: in later beats light up the part you are naming with model_focus, and switch views with model_view (explode the engine, cut the cell open, show the disks of a solid of revolution, then sweep it).
+- It is a tool for thinking, not an answer: ask what they notice, ask them to predict ("which part moves fastest?", "what shape is each slice?") before you show it.
+- Prefer a preset or a known molecule when one fits; build an assembly from parts with real proportions otherwise. At most one model a turn, and rarely: most explanations need only a sketch.
 
 Simulations, for physics motion:
 - For projectile or pendulum questions, you can set one up in simulate so the student sees the real motion: a ball launched at a speed and angle (from a height, or two launches to compare), or a pendulum (one length, or two side by side).

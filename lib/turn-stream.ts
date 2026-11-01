@@ -3,6 +3,7 @@
 // the student the moment it is complete, while the rest is still being written.
 
 import { isMath } from "./math-ink.ts";
+import { sanitizeModel } from "./model3d.ts";
 import { firstBreak } from "./check.ts";
 import { beatSchema, type Beat, type TutorTurn } from "./tutor.ts";
 
@@ -160,6 +161,7 @@ export class BeatChecker {
   private figures = 0;
   private highlights = 0;
   private annotations = 0;
+  private models = 0;
   private rules: BeatRules;
   count = 0;
 
@@ -184,6 +186,9 @@ export class BeatChecker {
       .slice(0, Math.max(0, (paper ? 2 : 6) - this.writes.length));
     // beside a paper, one picture a turn; otherwise two at most
     if (b.draw && !b.continue_figure && this.figures >= (paper ? 1 : 2)) b.draw = null;
+    // one 3D model a turn
+    b.model = b.model && !this.models ? sanitizeModel(b.model) : null;
+    b.model_focus = b.model_focus?.trim().slice(0, 40) || null;
     b.highlights = !paper
       ? []
       : b.highlights
@@ -194,7 +199,7 @@ export class BeatChecker {
             return { ...h, note: note && !repeats(note, [...seen, ...b.write]) ? note : null };
           });
     b.annotations = b.annotations.filter((a) => this.rules.lines.has(a.line_id) || a.kind === "note").slice(0, Math.max(0, 4 - this.annotations));
-    if (!b.say && !b.write.length && !b.draw && !b.highlights.length && !b.annotations.length) return null;
+    if (!b.say && !b.write.length && !b.draw && !b.highlights.length && !b.annotations.length && !b.model) return null;
     return b;
   }
 
@@ -227,6 +232,7 @@ export class BeatChecker {
   // The beat is going out: count it toward the turn's limits.
   commit(b: Beat) {
     this.count++;
+    if (b.model) this.models++;
     this.writes.push(...b.write);
     this.inked.push(...b.write, ...b.highlights.flatMap((h) => (h.note ? [h.note] : [])), ...(b.draw ? figureWords(b.draw) : []));
     this.highlights += b.highlights.length;

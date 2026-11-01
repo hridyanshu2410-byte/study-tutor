@@ -651,6 +651,16 @@ export class TurnPlanner {
     return { x: left + jitter(this.rng, 6), y: bottom + this.size * 1.1 };
   }
 
+  // Holds a free spot w × h for something that isn't ink (a 3D model), placed
+  // as a figure would be, so this turn's later ink keeps clear of it.
+  reserve(w: number, h: number): Box {
+    const at = this.spot(w, h);
+    const box = { x: at.x, y: at.y, w, h };
+    this.occupied.push(box);
+    this.parts.push(box);
+    return box;
+  }
+
   plan(ink: BeatInk): PenPlan {
     const rng = this.rng;
     const size = this.size;
