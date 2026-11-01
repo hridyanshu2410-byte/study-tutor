@@ -46,7 +46,22 @@ import { deletePaper, loadPaper, savePaper } from "@/lib/paper-store";
 import { reportHtml, reportStats, reportTitle, type JournalEntry, type ReportAnalysis, type ReportRequest, type SessionReport } from "@/lib/session-report";
 import { deleteReport, loadReports, saveReport } from "@/lib/report-store";
 
-type Tool = "pen" | "eraser" | "hand" | "keep";
+type Tool = "pen" | "highlighter" | "line" | "arrow" | "rect" | "ellipse" | "eraser" | "hand" | "keep";
+const SHAPE_TOOLS: Tool[] = ["line", "arrow", "rect", "ellipse"];
+// The student's pens: dark ink first, then a few colours for marking up.
+const INKS = ["#1f2a44", "#2563eb", "#dc2626", "#16a34a", "#7c3aed"];
+const HIGHLIGHT = "rgba(250, 204, 21, 0.42)";
+const PALETTE: { tool: Tool; label: string; key?: string; hint?: string; icon: React.ReactNode }[] = [
+  { tool: "pen", label: "Pen", key: "p", hint: "hold still at the end of a stroke to straighten it", icon: <path d="M4 20l4-1 11-11-3-3L5 16l-1 4zM14 6l3 3" /> },
+  { tool: "highlighter", label: "Highlighter", key: "i", icon: <path d="M5 19h6M9 15l-2 2 2 2 2-2zM9 15l7-9 3 3-8 8" /> },
+  { tool: "line", label: "Line", key: "l", hint: "hold Shift to keep it level", icon: <path d="M5 19L19 5" /> },
+  { tool: "arrow", label: "Arrow", key: "a", icon: <path d="M5 19L19 5M11 5h8v8" /> },
+  { tool: "rect", label: "Box", key: "b", icon: <rect x="4.5" y="6.5" width="15" height="11" rx="1" /> },
+  { tool: "ellipse", label: "Oval", key: "o", icon: <ellipse cx="12" cy="12" rx="8" ry="6" /> },
+  { tool: "eraser", label: "Eraser", key: "e", icon: <path d="M8 19h11M5 15l8-9 6 6-7 7H9z" /> },
+  { tool: "hand", label: "Move the page", key: "h", icon: <path d="M8 12V6a1.5 1.5 0 013 0v5V4.5a1.5 1.5 0 013 0V11V6a1.5 1.5 0 013 0v8c0 3-2 6-6 6-3 0-4-1-6-4l-2-3a1.5 1.5 0 012.5-1.5L8 13" /> },
+  { tool: "keep", label: "Keep as a review card", key: "k", hint: "draw a loop around writing", icon: <path d="M6 4h12v16l-6-4-6 4z" /> },
+];
 type Mode = "study" | "review";
 type KeepDraft = { image: string; prompt: string; concept: string };
 type ReviewRun = { ids: string[]; index: number; suggested: Grade | null; revealed: boolean; done: number };
@@ -156,6 +171,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const lasso = useRef<[number, number][] | null>(null);
 
   const [tool, setTool] = useState<Tool>("pen");
+  const [ink, setInk] = useState(INKS[0]);
+  // Holding the pen still at the end of a stroke straightens it into a line, oval or box.
+  const holdTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [problem, setProblem] = useState("");
   const [tutorState, setTutorState] = useState<TutorState>("idle");
   const [caption, setCaption] = useState("Write your problem anywhere on the page. I'll be right here.");
@@ -360,10 +378,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     if (!p || drawing.current?.stroke.id === s.id) {
       const outline = getStroke(s.points, {
         size: s.size,
-        thinning: 0.6,
-        smoothing: 0.55,
-        streamline: 0.45,
-        simulatePressure: simulate,
+        ...inkStyle(s),
+        simulatePressure: simulate && !s.kind,
         last: drawing.current?.stroke.id !== s.id,
       });
       p = new Path2D();
@@ -427,10 +443,13 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           setTimeout(() => finishSim(sim), 0);
         }
       }
-      for (const s of strokes.current) {
-        ctx.fillStyle = s.color;
-        ctx.fill(pathFor(s, drawing.current?.stroke.id === s.id ? drawing.current.simulate : false));
-      }
+      // highlighter under the writing, then the writing
+      for (const pass of [true, false])
+        for (const s of strokes.current) {
+          if ((s.kind === "highlight") !== pass) continue;
+          ctx.fillStyle = s.color;
+          ctx.fill(pathFor(s, drawing.current?.stroke.id === s.id ? drawing.current.simulate : false));
+        }
       for (const t of tutorInk.current) drawTutorInk(ctx, t, now, tutorPaths.current);
       if (focus.current && Date.now() - focus.current.at < FOCUS_MS) {
         const [fx, fy] = focus.current.world;
@@ -474,7 +493,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         if (busy.speech && trigger === "spoke") speech = `${busy.speech} ${speech ?? ""}`.trim();
       }
       if (pauseTimer.current) clearTimeout(pauseTimer.current);
-      const lines = groupLines(strokes.current);
+      const lines = groupLines(strokes.current.filter((s) => s.kind !== "highlight"));
       if (!lines.length && !speech && !watched && !stateRef.current.problem.trim() && !images.current.length && !paper.current) return;
       if (trigger !== "pause") {
         stopShow();
@@ -1410,12 +1429,14 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
     undoStack.current.push([...strokes.current]);
     const [wx, wy] = screenToWorld(camera.current, sx, sy);
+    const shape = SHAPE_TOOLS.includes(tool) ? tool : null;
     const stroke: Stroke = {
       id: crypto.randomUUID(),
-      points: [[wx, wy, e.pointerType === "pen" ? e.pressure : 0.5]],
-      color: STUDENT_INK,
-      size: 4.2,
+      points: [[wx, wy, e.pointerType === "pen" && !shape ? e.pressure : 0.5]],
+      color: tool === "highlighter" ? HIGHLIGHT : ink,
+      size: tool === "highlighter" ? 20 : 4.2,
       createdAt: Date.now(),
+      ...(tool === "highlighter" ? { kind: "highlight" as const } : shape ? { kind: "shape" as const, anchor: [wx, wy] as [number, number] } : {}),
     };
     strokes.current.push(stroke);
     drawing.current = { stroke, pointerId: e.pointerId, simulate: e.pointerType !== "pen" };
@@ -1453,9 +1474,30 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     if (d && d.pointerId === e.pointerId) {
       const events = e.nativeEvent.getCoalescedEvents?.() ?? [e.nativeEvent];
       const r = canvasRef.current!.getBoundingClientRect();
+      if (d.stroke.kind === "shape" && d.stroke.anchor) {
+        const last = events[events.length - 1];
+        const [wx, wy] = screenToWorld(camera.current, last.clientX - r.left, last.clientY - r.top);
+        d.stroke.points = shapePoints(tool, d.stroke.anchor, [wx, wy], e.shiftKey);
+        dirty.current = true;
+        return;
+      }
       for (const ev of events) {
         const [wx, wy] = screenToWorld(camera.current, ev.clientX - r.left, ev.clientY - r.top);
         d.stroke.points.push([wx, wy, ev.pointerType === "pen" ? ev.pressure : 0.5] as Point);
+      }
+      if (holdTimer.current) clearTimeout(holdTimer.current);
+      if (d.stroke.kind !== "highlight") {
+        const held = d.stroke;
+        holdTimer.current = setTimeout(() => {
+          if (drawing.current?.stroke !== held) return;
+          const snapped = snapShape(held.points, camera.current.z);
+          if (snapped) {
+            held.points = snapped;
+            held.kind = "shape";
+            paths.current.delete(held.id);
+            dirty.current = true;
+          }
+        }, 650);
       }
       dirty.current = true;
       return;
@@ -1492,9 +1534,17 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       return;
     }
     const d = drawing.current;
+    if (holdTimer.current) clearTimeout(holdTimer.current);
     if (d && d.pointerId === e.pointerId) {
       drawing.current = null;
-      if (gesture(d.stroke)) {
+      if (d.stroke.kind === "shape" && d.stroke.anchor && d.stroke.points.length < 2) {
+        // a tap with a shape tool draws nothing
+        strokes.current = strokes.current.filter((s) => s !== d.stroke);
+        dirty.current = true;
+        return;
+      }
+      delete d.stroke.anchor;
+      if (d.stroke.kind !== "shape" && d.stroke.kind !== "highlight" && gesture(d.stroke)) {
         dirty.current = true;
         return;
       }
@@ -1680,9 +1730,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         e.preventDefault();
         undo();
       }
-      if (e.key === "p") setTool("pen");
-      if (e.key === "e") setTool("eraser");
-      if (e.key === "h") setTool("hand");
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      const picked = PALETTE.find((t) => t.key === e.key);
+      if (picked && (picked.tool !== "keep" || stateRef.current.mode === "study") && !e.metaKey && !e.ctrlKey) setTool(picked.tool);
       if (e.key === "k" && stateRef.current.mode === "study") setTool("keep");
     };
     const up = (e: KeyboardEvent) => {
@@ -1901,19 +1951,6 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           />
         )}
         <div className="tools" role="toolbar" aria-label="Drawing tools">
-          {(["pen", "eraser", "hand", "keep"] as Tool[])
-            .filter((t) => mode === "study" || t !== "keep")
-            .map((t) => (
-              <button
-                key={t}
-                className={tool === t ? "on" : ""}
-                onClick={() => setTool(t)}
-                aria-pressed={tool === t}
-                title={t === "keep" ? "Draw a loop around writing to keep it as a review card" : undefined}
-              >
-                {t === "pen" ? "Pen" : t === "eraser" ? "Eraser" : t === "hand" ? "Move" : "Keep"}
-              </button>
-            ))}
           <button onClick={undo}>Undo</button>
           <button onClick={clearPage}>Clear</button>
           {mode === "study" && (
@@ -2091,6 +2128,37 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           {toast}
         </div>
       )}
+
+      <div className="palette" role="toolbar" aria-label="Drawing tools" aria-orientation="vertical">
+        {PALETTE.filter((t) => mode === "study" || t.tool !== "keep").map((t) => (
+          <button
+            key={t.tool}
+            className={tool === t.tool ? "on" : ""}
+            onClick={() => setTool(t.tool)}
+            aria-pressed={tool === t.tool}
+            aria-label={t.label}
+            title={`${t.label}${t.key ? ` (${t.key})` : ""}${t.hint ? `: ${t.hint}` : ""}`}
+          >
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              {t.icon}
+            </svg>
+          </button>
+        ))}
+        <span className="palette-rule" />
+        {INKS.map((c) => (
+          <button
+            key={c}
+            className={`swatch${ink === c ? " on" : ""}`}
+            style={{ ["--swatch" as string]: c }}
+            onClick={() => {
+              setInk(c);
+              if (tool === "eraser" || tool === "hand" || tool === "keep" || tool === "highlighter") setTool("pen");
+            }}
+            aria-pressed={ink === c}
+            aria-label={`Ink colour ${c}`}
+          />
+        ))}
+      </div>
 
       <canvas
         ref={canvasRef}
@@ -2319,11 +2387,7 @@ function renderPageImages(strokes: Stroke[], lines: InkLine[], pictures: LoadedP
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.setTransform(scale, 0, 0, scale, (margin - box.x) * scale, (margin - box.y) * scale);
     for (const { img, el } of pictures) ctx.drawImage(el, img.x, img.y, img.w, img.h);
-    ctx.fillStyle = STUDENT_INK;
-    for (const s of strokes) {
-      const outline = getStroke(s.points, { size: s.size, thinning: 0.6, smoothing: 0.55, streamline: 0.45 });
-      if (outline.length) ctx.fill(outlinePath(outline));
-    }
+    fillInk(ctx, strokes);
     if (labels) {
       const px = 1 / scale;
       ctx.font = `${13 * px}px sans-serif`;
@@ -2371,11 +2435,7 @@ function renderViewImage(
   for (const t of inks) for (const b of t.marks ?? []) if (t.born !== Infinity) ctx.fillRect(b.x, b.y, b.w, b.h);
   ctx.fillStyle = TUTOR_INK;
   for (const t of inks) for (const b of t.rules ?? []) if (t.born !== Infinity) ctx.fillRect(b.x, b.y, b.w, b.h);
-  ctx.fillStyle = STUDENT_INK;
-  for (const s of strokes) {
-    const outline = getStroke(s.points, { size: s.size, thinning: 0.6, smoothing: 0.55, streamline: 0.45 });
-    if (outline.length) ctx.fill(outlinePath(outline));
-  }
+  fillInk(ctx, strokes);
   ctx.fillStyle = TUTOR_INK;
   for (const t of inks) {
     if (t.born === Infinity) continue;
@@ -2408,11 +2468,7 @@ function renderInkImage(strokes: Stroke[], maxSize: number): string {
   ctx.fillStyle = "#fff";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.setTransform(scale, 0, 0, scale, -box.x * scale, -box.y * scale);
-  ctx.fillStyle = STUDENT_INK;
-  for (const s of strokes) {
-    const outline = getStroke(s.points, { size: s.size, thinning: 0.6, smoothing: 0.55, streamline: 0.45 });
-    if (outline.length) ctx.fill(outlinePath(outline));
-  }
+  fillInk(ctx, strokes);
   return canvas.toDataURL("image/png");
 }
 
@@ -2441,4 +2497,75 @@ async function* readLines(body: ReadableStream<Uint8Array>): AsyncGenerator<unkn
   }
   const last = buf.trim() ? parse(buf.trim()) : null;
   if (last) yield last;
+}
+
+// How a stroke's outline is drawn: a pen thins with speed; a highlighter and a
+// ruled shape keep one width.
+function inkStyle(s: Stroke) {
+  return s.kind ? { thinning: 0, smoothing: 0.5, streamline: 0.3 } : { thinning: 0.6, smoothing: 0.55, streamline: 0.45 };
+}
+
+// The student's ink in a picture: highlighter first, then the writing, each in its colour.
+function fillInk(ctx: CanvasRenderingContext2D, strokes: Stroke[]) {
+  for (const pass of [true, false])
+    for (const s of strokes) {
+      if ((s.kind === "highlight") !== pass) continue;
+      const outline = getStroke(s.points, { size: s.size, ...inkStyle(s) });
+      if (!outline.length) continue;
+      ctx.fillStyle = s.color || STUDENT_INK;
+      ctx.fill(outlinePath(outline));
+    }
+}
+
+// The points of a line, arrow, box or oval dragged from `a` to `b`. Shift keeps it square or level.
+function shapePoints(tool: Tool, a: [number, number], b: [number, number], even: boolean): Point[] {
+  let [x1, y1] = b;
+  const [x0, y0] = a;
+  if (even) {
+    if (tool === "line" || tool === "arrow") {
+      const ang = Math.round(Math.atan2(y1 - y0, x1 - x0) / (Math.PI / 4)) * (Math.PI / 4);
+      const d = Math.hypot(x1 - x0, y1 - y0);
+      [x1, y1] = [x0 + Math.cos(ang) * d, y0 + Math.sin(ang) * d];
+    } else {
+      const d = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0));
+      [x1, y1] = [x0 + Math.sign(x1 - x0 || 1) * d, y0 + Math.sign(y1 - y0 || 1) * d];
+    }
+  }
+  const p = (x: number, y: number): Point => [x, y, 0.5];
+  const seg = (ax: number, ay: number, bx: number, by: number): Point[] => {
+    const n = Math.max(2, Math.ceil(Math.hypot(bx - ax, by - ay) / 6));
+    return Array.from({ length: n + 1 }, (_, i) => p(ax + ((bx - ax) * i) / n, ay + ((by - ay) * i) / n));
+  };
+  if (Math.hypot(x1 - x0, y1 - y0) < 3) return [p(x0, y0)];
+  if (tool === "line") return seg(x0, y0, x1, y1);
+  if (tool === "arrow") {
+    const ang = Math.atan2(y1 - y0, x1 - x0);
+    const wing = Math.min(22, Math.hypot(x1 - x0, y1 - y0) * 0.35);
+    const w1: [number, number] = [x1 - wing * Math.cos(ang - 0.45), y1 - wing * Math.sin(ang - 0.45)];
+    const w2: [number, number] = [x1 - wing * Math.cos(ang + 0.45), y1 - wing * Math.sin(ang + 0.45)];
+    return [...seg(x0, y0, x1, y1), ...seg(x1, y1, ...w1).slice(1), ...seg(...w1, x1, y1).slice(1), ...seg(x1, y1, ...w2).slice(1)];
+  }
+  if (tool === "rect") return [...seg(x0, y0, x1, y0), ...seg(x1, y0, x1, y1).slice(1), ...seg(x1, y1, x0, y1).slice(1), ...seg(x0, y1, x0, y0).slice(1)];
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, rx = Math.abs(x1 - x0) / 2, ry = Math.abs(y1 - y0) / 2;
+  return Array.from({ length: 73 }, (_, i) => p(cx + Math.cos((i / 72) * Math.PI * 2) * rx, cy + Math.sin((i / 72) * Math.PI * 2) * ry));
+}
+
+// A stroke the student held still at the end of: a near-straight one becomes a
+// line, a closed one an oval or a box. Null when it is neither.
+function snapShape(points: Point[], z: number): Point[] | null {
+  if (points.length < 8) return null;
+  const xs = points.map((q) => q[0]), ys = points.map((q) => q[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const w = maxX - minX, h = maxY - minY;
+  if (Math.max(w, h) * z < 40) return null;
+  const [ax, ay] = points[0], [bx, by] = points[points.length - 1];
+  const len = Math.hypot(bx - ax, by - ay);
+  let path = 0;
+  for (let i = 1; i < points.length; i++) path += Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]);
+  if (len > path * 0.92) return shapePoints("line", [ax, ay], [bx, by], false);
+  if (len > Math.max(w, h) * 0.25) return null;
+  // closed: an oval if the points keep an even distance from the middle, else a box
+  const cx = minX + w / 2, cy = minY + h / 2;
+  const off = points.reduce((acc, [x, y]) => acc + Math.abs(Math.hypot((x - cx) / (w / 2 || 1), (y - cy) / (h / 2 || 1)) - 1), 0) / points.length;
+  return shapePoints(off < 0.12 ? "ellipse" : "rect", [minX, minY], [maxX, maxY], false);
 }

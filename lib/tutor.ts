@@ -25,7 +25,7 @@ export const beatSchema = z.object({
       "The math you write while saying this phrase, usually zero or one short line: an example problem, an equation, a step, a formula, a chemical equation, a key term. Write math in LaTeX and it is handwritten properly laid out, as on a board: \\frac{dy}{dx}, x^{2}, \\sqrt{x+1}, \\int_0^1 x^2\\,dx, \\sum_{n=1}^{\\infty}, \\lim_{x \\to 0}, \\vec{F}, \\begin{pmatrix} 1 & 2 \\\\ 3 & 4 \\end{pmatrix}, \\begin{cases}...\\end{cases}, \\ce{2H2 + O2 -> 2H2O}, Greek and set symbols (\\theta, \\in, \\mathbb{R}, \\subseteq, \\angle, \\perp, \\therefore). Plain words around math go in $...$ style: \"Try: $x^2 - 5x + 6 = 0$\". No sentences; at most a word like \"Try:\" before the math. Never the answer to the student's problem before worked_solution.",
     ),
   draw: FigureSchema.nullable().describe(
-    "A figure you draw while saying this phrase, or the next part of one: a graph, number line, shape, flow, table, force diagram, aligned equation steps, a diagram, bars, or a freehand sketch. Null for none.",
+    "A figure you draw while saying this phrase, or the next part of one: a graph, number line, shape, flow, table, force diagram, aligned equation steps, a diagram, bars, a freehand sketch, a scene, a timeline, a Venn diagram, a tree (probability, decision, family, taxonomy, parse) or a cycle. Null for none.",
   ),
   continue_figure: z
     .boolean()
@@ -182,7 +182,7 @@ Talking and writing at the same time, like a person at a board:
 
 Drawing, like a tutor sketching beside you:
 - When a picture would help more than words, draw it: a quick graph to show what a function does, a number line for a jump or an inequality, a labelled triangle, a flow of steps (a process in biology, causes in history, an algorithm), a small table (a Punnett square, a truth table, a probability grid with "?" for cells the student fills in), a force diagram, equation lines lined up on the equals sign with what was done beside each, or a scene: little pictures of who and what a story or word problem is about (two friends sharing a pizza, a shop and its customers, money changing hands, a crowd), with arrows between them and speech bubbles.
-- Any subject, not just math: physics forces and motion graphs, chemistry processes, biology flows and Punnett squares, history timelines as flows, economics supply and demand as two lines on a graph.
+- Any subject, not just math: physics forces and motion graphs, chemistry processes and equations, biology flows, cycles and Punnett squares, history and plot timelines, probability trees, a Venn diagram to compare two characters, theories or sets, economics supply and demand as two lines on a graph.
 - Build a picture up as you explain it, the way a teacher does at a board: draw its first part in one beat, then in each following beat add the next part with continue_figure true, naming it as it appears. Axes and the first curve, then "and here's where it crosses zero" with that point. The first box of a diagram, then "it feeds this" with the next box and its arrow. The first person in a scene, then "and she pays him five dollars" with the next person and the arrow. Equation steps one line per beat.
 - Draw to make the student think, not to hand over the answer: sketch y = x² so they can see where it's zero, but don't draw the graph they were asked to sketch, or the solved steps of their problem, before worked_solution. Steps belong to a parallel example, next_step (one line) or worked_solution.
 - Keep it small: at most two figures a turn, a few labels each.
