@@ -20,6 +20,9 @@ const beat = (say: string, more: Record<string, unknown> = {}) => ({
   write: [],
   draw: null,
   continue_figure: false,
+  model: null,
+  model_focus: null,
+  model_view: null,
   highlights: [],
   annotations: [],
   ...more,
@@ -78,7 +81,7 @@ test("paper turns can point at sentences and build a diagram as they go", () => 
       beat("and get routed into clusters.", {
         continue_figure: true,
         draw: { kind: "diagram", title: null, nodes: [{ id: "b", text: "clusters", row: 0, col: 1 }], edges: [{ from: "a", to: "b", label: null }], frames: [{ label: "routing", nodes: ["b"] }] },
-        highlights: [{ ref: "p1.s3", kind: "highlight", note: "the key idea" }],
+        highlights: [{ ref: "p1.s3", quote: null, kind: "highlight", note: "the key idea" }],
       }),
     ],
     skill: { concept: "sparse attention", evidence: "none" },

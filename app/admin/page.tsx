@@ -3,7 +3,7 @@ import { loadStudy, requireAdmin } from "@/lib/research";
 import { researchMode } from "@/lib/supabase/env";
 
 export const dynamic = "force-dynamic";
-export const metadata = { title: "Study · Tutor" };
+export const metadata = { title: "Study · CoInk" };
 
 export default async function AdminPage() {
   if (!researchMode) notFound();

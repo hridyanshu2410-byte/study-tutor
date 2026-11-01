@@ -67,7 +67,7 @@ const Forces = z.object({
 const Steps = z.object({
   kind: z.literal("steps"),
   lines: z
-    .array(z.object({ math: z.string(), note: label.describe("What was done to get the next line, such as \"−5 both sides\".") }))
+    .array(z.object({ math: z.string().describe("One line, in LaTeX when it has fractions, powers, roots, integrals or matrices, such as \"\\frac{x}{2} + 3 = 7\"."), note: label.describe("What was done to get the next line, such as \"−5 both sides\".") }))
     .describe("Equation lines, written one under another and lined up on the equals sign."),
 });
 
@@ -119,6 +119,48 @@ const Sketch = z.object({
   labels: z
     .array(z.object({ x: z.number(), y: z.number(), text: z.string(), point_to: gridPt.nullable().describe("A part this label names; a short line is drawn from the label to it.") }))
     .describe("Short labels on the same grid, placed in clear space."),
+});
+
+
+const Timeline = z.object({
+  kind: z.literal("timeline"),
+  title: label,
+  events: z
+    .array(z.object({ when: z.string().describe("A date, year, era, act or chapter, such as \"1789\", \"Act 3\" or \"Ch. 12\"."), what: z.string().describe("A few words.") }))
+    .describe("Events in order along a line, left to right: a history sequence, a story's plot, the stages of a life cycle or an experiment. Up to ten."),
+});
+
+const Venn = z.object({
+  kind: z.literal("venn"),
+  title: label,
+  sets: z.array(z.object({ label: z.string() })).describe("Two or three overlapping circles, such as two characters, two theories, or events A and B."),
+  items: z
+    .array(z.object({ text: z.string().describe("One to four words, or a number for counts."), in: z.array(z.number().int()).describe("Indices of the sets it belongs to, from 0. Empty: outside every set.") }))
+    .describe("What goes in each region: traits only one has, what they share, and so on. Use \"?\" for a region the student fills in."),
+});
+
+const Tree = z.object({
+  kind: z.literal("tree"),
+  title: label,
+  direction: z.enum(["right", "down"]).describe("right: a probability tree or decision tree growing left to right. down: a family tree, a taxonomy, a sentence's parse, or a hierarchy."),
+  nodes: z
+    .array(
+      z.object({
+        id: z.string(),
+        text: z.string().describe("A few words or a value."),
+        parent: z.string().nullable().describe("The parent node's id; null for the root."),
+        edge: label.describe("Written on the branch from the parent, such as a probability \"1/3\" or \"yes\"."),
+      }),
+    )
+    .describe("The root first, then each node after its parent. Siblings come together. Up to fifteen."),
+});
+
+const Cycle = z.object({
+  kind: z.literal("cycle"),
+  title: label,
+  total: z.number().int().describe("How many stages the whole cycle has, even if you draw only the first now, from 3 to 8."),
+  stages: z.array(z.object({ text: z.string().describe("A few words.") })).describe("The stages in order, drawn round a circle with arrows from each to the next and the last back to the first: the water cycle, the cell cycle, the Krebs cycle, a feedback loop, the hero's journey."),
+  center: label.describe("A word or two in the middle, such as the cycle's name."),
 });
 
 // The things a scene can show. Each is drawn as a little picture by the app.
@@ -179,5 +221,5 @@ const Scene = z.object({
     .describe("Pointing out a thing you are talking about: a circle around it, a cross over it, a tick beside it. Usually none or one."),
 });
 
-export const FigureSchema = z.union([Graph, NumberLine, Shape, Flow, Table, Forces, Steps, Diagram, Bars, Sketch, Scene]);
+export const FigureSchema = z.union([Graph, NumberLine, Shape, Flow, Table, Forces, Steps, Diagram, Bars, Sketch, Scene, Timeline, Venn, Tree, Cycle]);
 export type Figure = z.infer<typeof FigureSchema>;

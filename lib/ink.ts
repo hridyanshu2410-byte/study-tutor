@@ -9,6 +9,11 @@ export type Stroke = {
   color: string;
   size: number;
   createdAt: number;
+  // highlight: a wide see-through marker under the writing. shape: a ruled
+  // line, arrow, box or oval. Neither is read as handwriting.
+  kind?: "highlight" | "shape";
+  // where a shape being dragged started
+  anchor?: [number, number];
 };
 
 export type Box = { x: number; y: number; w: number; h: number };

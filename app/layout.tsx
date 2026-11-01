@@ -6,9 +6,9 @@ const tutorHand = Caveat({ subsets: ["latin"], weight: ["500"], variable: "--fon
 const ui = Inter({ subsets: ["latin"], variable: "--font-ui" });
 
 export const metadata: Metadata = {
-  title: "Tutor",
+  title: "CoInk",
   description: "A private tutor on an infinite page that helps you learn by working it out yourself.",
-  appleWebApp: { capable: true, title: "Tutor", statusBarStyle: "default" },
+  appleWebApp: { capable: true, title: "CoInk", statusBarStyle: "default" },
 };
 
 export const viewport: Viewport = {

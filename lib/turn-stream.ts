@@ -2,6 +2,8 @@
 // as it comes, so each beat (a phrase and its ink) can be checked and sent to
 // the student the moment it is complete, while the rest is still being written.
 
+import { isMath } from "./math-ink.ts";
+import { sanitizeModel } from "./model3d.ts";
 import { firstBreak } from "./check.ts";
 import { beatSchema, type Beat, type TutorTurn } from "./tutor.ts";
 
@@ -132,7 +134,7 @@ function repeats(text: string, before: string[]): boolean {
 
 // Beside a paper the tutor writes only math or a key term, never a summary
 // sentence or a chain of phrases with arrows: that is what the drawing is for.
-const mathOrTerm = (line: string) => /[=≈≠<>≤≥∝:²³√∑∫πθλσμ^_]|\d/.test(line) || line.split(/\s+/).filter(Boolean).length <= 3;
+const mathOrTerm = (line: string) => isMath(line) || /[=≈≠<>≤≥∝:²³√∑∫πθλσμ^_]|\d/.test(line) || line.split(/\s+/).filter(Boolean).length <= 3;
 
 // The words a figure puts on the page, to catch the same idea written twice.
 function figureWords(f: NonNullable<Beat["draw"]>): string[] {
@@ -141,6 +143,10 @@ function figureWords(f: NonNullable<Beat["draw"]>): string[] {
   if (f.kind === "sketch") return [f.title ?? "", ...f.labels.map((l) => l.text)];
   if (f.kind === "flow") return f.nodes.map((n) => n.text);
   if (f.kind === "bars") return [f.title ?? ""];
+  if (f.kind === "timeline") return [f.title ?? "", ...f.events.map((e) => e.what)];
+  if (f.kind === "venn") return [f.title ?? "", ...f.items.map((i) => i.text)];
+  if (f.kind === "tree") return [f.title ?? "", ...f.nodes.map((n) => n.text)];
+  if (f.kind === "cycle") return [f.title ?? "", ...f.stages.map((x) => x.text)];
   return [];
 }
 
@@ -155,6 +161,7 @@ export class BeatChecker {
   private figures = 0;
   private highlights = 0;
   private annotations = 0;
+  private models = 0;
   private rules: BeatRules;
   count = 0;
 
@@ -172,12 +179,16 @@ export class BeatChecker {
     b.say = b.say.trim().slice(0, 240);
     const seen = [...this.inked, ...(b.draw ? figureWords(b.draw) : [])];
     b.write = b.write
-      .map((w) => w.trim().slice(0, paper ? 60 : 48))
+      // LaTeX takes more characters for the same line on the page
+      .map((w) => w.trim().slice(0, isMath(w) ? 160 : paper ? 60 : 48))
       .filter((w) => w && (!paper || (mathOrTerm(w) && !repeats(w, seen))))
       .slice(0, paper ? 1 : 2)
       .slice(0, Math.max(0, (paper ? 2 : 6) - this.writes.length));
     // beside a paper, one picture a turn; otherwise two at most
     if (b.draw && !b.continue_figure && this.figures >= (paper ? 1 : 2)) b.draw = null;
+    // one 3D model a turn
+    b.model = b.model && !this.models ? sanitizeModel(b.model) : null;
+    b.model_focus = b.model_focus?.trim().slice(0, 40) || null;
     b.highlights = !paper
       ? []
       : b.highlights
@@ -188,7 +199,7 @@ export class BeatChecker {
             return { ...h, note: note && !repeats(note, [...seen, ...b.write]) ? note : null };
           });
     b.annotations = b.annotations.filter((a) => this.rules.lines.has(a.line_id) || a.kind === "note").slice(0, Math.max(0, 4 - this.annotations));
-    if (!b.say && !b.write.length && !b.draw && !b.highlights.length && !b.annotations.length) return null;
+    if (!b.say && !b.write.length && !b.draw && !b.highlights.length && !b.annotations.length && !b.model) return null;
     return b;
   }
 
@@ -221,6 +232,7 @@ export class BeatChecker {
   // The beat is going out: count it toward the turn's limits.
   commit(b: Beat) {
     this.count++;
+    if (b.model) this.models++;
     this.writes.push(...b.write);
     this.inked.push(...b.write, ...b.highlights.flatMap((h) => (h.note ? [h.note] : [])), ...(b.draw ? figureWords(b.draw) : []));
     this.highlights += b.highlights.length;

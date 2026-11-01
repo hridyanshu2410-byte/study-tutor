@@ -40,13 +40,32 @@ import AccountMenu from "./AccountMenu";
 import { flushCloud, loadCloud, logEvent, saveCloud, type Account } from "@/lib/cloud";
 import { picturesFrom, type PageImage } from "@/lib/photo";
 import { drawSim, playButton, runSeconds, SIM_H, SIM_W, simResult, type PageSim } from "@/lib/sims";
-import { findSentence, paperDigest, type Paper } from "@/lib/paper";
+import { findSentence, isLiterature, paperDigest, phraseBoxes, type DocKind, type Paper } from "@/lib/paper";
 import { openPaper } from "@/lib/paper-pdf";
+import { typesetText } from "@/lib/text-doc";
+import { MODEL_H, MODEL_W, modelParts, type PageModel } from "@/lib/model3d";
+import { drawModelFrame, hitModel, modelButtons, modelView, placeLabels, type ModelButton, type ModelLabelBox } from "@/lib/model-page";
+import type { Built, ModelStage } from "@/lib/model3d-render";
 import { deletePaper, loadPaper, savePaper } from "@/lib/paper-store";
 import { reportHtml, reportStats, reportTitle, type JournalEntry, type ReportAnalysis, type ReportRequest, type SessionReport } from "@/lib/session-report";
 import { deleteReport, loadReports, saveReport } from "@/lib/report-store";
 
-type Tool = "pen" | "eraser" | "hand" | "keep";
+type Tool = "pen" | "highlighter" | "line" | "arrow" | "rect" | "ellipse" | "eraser" | "hand" | "keep";
+const SHAPE_TOOLS: Tool[] = ["line", "arrow", "rect", "ellipse"];
+// The student's pens: dark ink first, then a few colours for marking up.
+const INKS = ["#1f2a44", "#2563eb", "#dc2626", "#16a34a", "#7c3aed"];
+const HIGHLIGHT = "rgba(250, 204, 21, 0.42)";
+const PALETTE: { tool: Tool; label: string; key?: string; hint?: string; icon: React.ReactNode }[] = [
+  { tool: "pen", label: "Pen", key: "p", hint: "hold still at the end of a stroke to straighten it", icon: <path d="M4 20l4-1 11-11-3-3L5 16l-1 4zM14 6l3 3" /> },
+  { tool: "highlighter", label: "Highlighter", key: "i", icon: <path d="M5 19h6M9 15l-2 2 2 2 2-2zM9 15l7-9 3 3-8 8" /> },
+  { tool: "line", label: "Line", key: "l", hint: "hold Shift to keep it level", icon: <path d="M5 19L19 5" /> },
+  { tool: "arrow", label: "Arrow", key: "a", icon: <path d="M5 19L19 5M11 5h8v8" /> },
+  { tool: "rect", label: "Box", key: "b", icon: <rect x="4.5" y="6.5" width="15" height="11" rx="1" /> },
+  { tool: "ellipse", label: "Oval", key: "o", icon: <ellipse cx="12" cy="12" rx="8" ry="6" /> },
+  { tool: "eraser", label: "Eraser", key: "e", icon: <path d="M8 19h11M5 15l8-9 6 6-7 7H9z" /> },
+  { tool: "hand", label: "Move the page", key: "h", icon: <path d="M8 12V6a1.5 1.5 0 013 0v5V4.5a1.5 1.5 0 013 0V11V6a1.5 1.5 0 013 0v8c0 3-2 6-6 6-3 0-4-1-6-4l-2-3a1.5 1.5 0 012.5-1.5L8 13" /> },
+  { tool: "keep", label: "Keep as a review card", key: "k", hint: "draw a loop around writing", icon: <path d="M6 4h12v16l-6-4-6 4z" /> },
+];
 type Mode = "study" | "review";
 type KeepDraft = { image: string; prompt: string; concept: string };
 type ReviewRun = { ids: string[]; index: number; suggested: Grade | null; revealed: boolean; done: number };
@@ -61,7 +80,7 @@ type TutorState = "idle" | "thinking" | "speaking";
 type TutorInk = { id: string; plan: PenPlan; born: number; marks?: Box[]; rules?: Box[] };
 // One spoken phrase of a turn: its words, its ink and its voice, and how far along it is.
 // `region` is everything the phrase marks or draws; `figure` the whole of the figure it draws or adds to.
-type Act = { beat: Beat; ink: TutorInk | null; clip: Clip | null; region: Box | null; figure: Box | null; started: boolean; voiceDone: boolean; inkDone: boolean };
+type Act = { beat: Beat; model: PageModel | null; ink: TutorInk | null; clip: Clip | null; region: Box | null; figure: Box | null; started: boolean; voiceDone: boolean; inkDone: boolean };
 // A turn being performed. Phrases keep arriving while earlier ones are spoken;
 // each one's ink is drawn while its words are heard, and the next follows
 // when both are done.
@@ -87,7 +106,7 @@ type Show = {
 };
 // Which paper is open and where its pages start; the paper itself lives in IndexedDB.
 type PaperRef = { id: string; title: string; x: number; y: number; w: number };
-type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string; images?: PageImage[]; sims?: PageSim[]; paper?: PaperRef | null };
+type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string; images?: PageImage[]; sims?: PageSim[]; models?: PageModel[]; paper?: PaperRef | null };
 // An open paper: its pages laid out in a column on the page.
 type OpenPaper = { ref: PaperRef; data: Paper; pages: PageImage[]; digest: { text: string; truncated: boolean } };
 const PAPER_W = 700;
@@ -124,6 +143,15 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   // Simulations on the page, and when each one started playing.
   const sims = useRef<PageSim[]>([]);
   const simRuns = useRef(new Map<string, number>());
+  // 3D models on the page. Each keeps its last frame on its own canvas; the
+  // renderer (three.js, loaded only when a model first appears) redraws it while it moves.
+  const models = useRef<PageModel[]>([]);
+  const modelStage = useRef<ModelStage | null>(null);
+  const modelLive = useRef(
+    new Map<string, { built: Built | null; canvas: HTMLCanvasElement; t: number; explode: number; stale: boolean; labels: ModelLabelBox[]; buttons: ModelButton[]; raw: { id: string; text: string; x: number; y: number; focused: boolean }[] }>(),
+  );
+  const modelDrag = useRef<{ id: string; pointerId: number; x: number; y: number; moved: boolean } | null>(null);
+  const loadingStage = useRef<Promise<typeof import("@/lib/model3d-render")> | null>(null);
   const tutorFont = useRef("cursive");
   const paper = useRef<OpenPaper | null>(null);
   const camera = useRef<Camera>({ x: -40, y: -40, z: 1 });
@@ -156,6 +184,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const lasso = useRef<[number, number][] | null>(null);
 
   const [tool, setTool] = useState<Tool>("pen");
+  const [ink, setInk] = useState(INKS[0]);
+  // Holding the pen still at the end of a stroke straightens it into a line, oval or box.
+  const holdTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [problem, setProblem] = useState("");
   const [tutorState, setTutorState] = useState<TutorState>("idle");
   const [caption, setCaption] = useState("Write your problem anywhere on the page. I'll be right here.");
@@ -178,6 +209,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const [paperTitle, setPaperTitle] = useState<string | null>(null);
   const [opening, setOpening] = useState<string | null>(null);
   const paperInput = useRef<HTMLInputElement>(null);
+  // The "Read" dialog: paste a poem or passage, or pick a PDF or text file.
+  const [reading, setReading] = useState<{ title: string; text: string; kind: DocKind | "auto" } | null>(null);
   const [importing, setImporting] = useState(false);
   const photoInput = useRef<HTMLInputElement>(null);
   const { memory, memoryRef, update: updateMemory, storageFull, loaded } = useStudyMemory(account);
@@ -245,6 +278,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     setImages(saved?.images ?? []);
     sims.current = saved?.sims ?? [];
     simRuns.current.clear();
+    setModels(saved?.models ?? []);
     setPaper(null);
     const ref = saved?.paper;
     if (ref)
@@ -284,7 +318,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     if (stateRef.current.mode === "review") return;
     // ink for phrases not yet spoken isn't on the page yet
     const ink = tutorInk.current.filter((t) => t.born !== Infinity);
-    const page: SavedPage = { strokes: strokes.current, tutorInk: ink, problem: stateRef.current.problem, images: images.current, sims: sims.current, paper: paper.current?.ref ?? null };
+    const page: SavedPage = { strokes: strokes.current, tutorInk: ink, problem: stateRef.current.problem, images: images.current, sims: sims.current, models: models.current.map((m) => ({ ...m, shownAt: undefined })), paper: paper.current?.ref ?? null };
     if (account) saveCloud(account.userId, "page", page);
     try {
       localStorage.setItem(pageKey, JSON.stringify(page));
@@ -348,11 +382,27 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     }
     return el.complete && el.naturalWidth ? el : null;
   };
-  const loadedPictures = () =>
-    images.current.flatMap((img) => {
+  // The 3D models' latest frames, as pictures the tutor can see.
+  const modelPictures = (): LoadedPicture[] =>
+    models.current.flatMap((m) => {
+      const live = modelLive.current.get(m.id);
+      if (!live?.built || live.canvas.width < 2 || (m.shownAt != null && m.shownAt > performance.now())) return [];
+      const v = modelView(m);
+      return [{ img: { id: `model:${m.id}`, src: "", ...v }, el: live.canvas }];
+    });
+  const loadedPictures = (): LoadedPicture[] => [
+    ...images.current.flatMap((img) => {
       const el = pictureFor(img);
       return el ? [{ img, el }] : [];
-    });
+    }),
+    ...modelPictures(),
+  ];
+  // Pictures for a view of the page: paper pages, photos, and the models.
+  const viewPictures = (): [PageImage[], (img: PageImage) => CanvasImageSource | null] => {
+    const mp = modelPictures();
+    const els = new Map(mp.map((p) => [p.img.id, p.el]));
+    return [[...(paper.current?.pages ?? []), ...images.current, ...mp.map((p) => p.img)], (img) => els.get(img.id) ?? pictureFor(img)];
+  };
 
   // ---------- rendering ----------
   const pathFor = useCallback((s: Stroke, simulate = false) => {
@@ -360,10 +410,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     if (!p || drawing.current?.stroke.id === s.id) {
       const outline = getStroke(s.points, {
         size: s.size,
-        thinning: 0.6,
-        smoothing: 0.55,
-        streamline: 0.45,
-        simulatePressure: simulate,
+        ...inkStyle(s),
+        simulatePressure: simulate && !s.kind,
         last: drawing.current?.stroke.id !== s.id,
       });
       p = new Path2D();
@@ -383,8 +431,12 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   useEffect(() => {
     let raf = 0;
+    let lastFrame = performance.now();
     const frame = (now: number) => {
       raf = requestAnimationFrame(frame);
+      const dt = Math.min(0.1, (now - lastFrame) / 1000);
+      lastFrame = now;
+      const modelsMoving = models.current.length ? stepModels(now, dt, viewBox()) : false;
       const canvas = canvasRef.current;
       if (!canvas) return;
       if (glide.current) {
@@ -398,7 +450,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         if (f === 1) glide.current = null;
         dirty.current = true;
       }
-      const animating = simRuns.current.size > 0 || tutorInk.current.some((t) => t.born > 0 && t.born !== Infinity && now - t.born < t.plan.duration + 50);
+      const animating = modelsMoving || models.current.some((m) => m.shownAt != null && m.shownAt <= now && !modelLive.current.get(m.id)?.built) || simRuns.current.size > 0 || tutorInk.current.some((t) => t.born > 0 && t.born !== Infinity && now - t.born < t.plan.duration + 50);
       if (!dirty.current && !animating) return;
       dirty.current = false;
       if (zoomLabel.current) zoomLabel.current.textContent = `${Math.round(camera.current.z * 100)}%`;
@@ -418,6 +470,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       ctx.setTransform(dpr * cam.z, 0, 0, dpr * cam.z, -cam.x * cam.z * dpr, -cam.y * cam.z * dpr);
       for (const img of paper.current?.pages ?? []) drawPicture(ctx, img, pictureFor(img), cam.z);
       for (const img of images.current) drawPicture(ctx, img, pictureFor(img), cam.z);
+      drawModels(ctx, now);
       for (const sim of sims.current) {
         const start = simRuns.current.get(sim.id);
         const t = start == null ? null : (now - start) / 1000;
@@ -427,10 +480,13 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           setTimeout(() => finishSim(sim), 0);
         }
       }
-      for (const s of strokes.current) {
-        ctx.fillStyle = s.color;
-        ctx.fill(pathFor(s, drawing.current?.stroke.id === s.id ? drawing.current.simulate : false));
-      }
+      // highlighter under the writing, then the writing
+      for (const pass of [true, false])
+        for (const s of strokes.current) {
+          if ((s.kind === "highlight") !== pass) continue;
+          ctx.fillStyle = s.color;
+          ctx.fill(pathFor(s, drawing.current?.stroke.id === s.id ? drawing.current.simulate : false));
+        }
       for (const t of tutorInk.current) drawTutorInk(ctx, t, now, tutorPaths.current);
       if (focus.current && Date.now() - focus.current.at < FOCUS_MS) {
         const [fx, fy] = focus.current.world;
@@ -474,7 +530,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         if (busy.speech && trigger === "spoke") speech = `${busy.speech} ${speech ?? ""}`.trim();
       }
       if (pauseTimer.current) clearTimeout(pauseTimer.current);
-      const lines = groupLines(strokes.current);
+      const lines = groupLines(strokes.current.filter((s) => s.kind !== "highlight"));
       if (!lines.length && !speech && !watched && !stateRef.current.problem.trim() && !images.current.length && !paper.current) return;
       if (trigger !== "pause") {
         stopShow();
@@ -522,6 +578,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
             idleSeconds: lastPenAt.current ? (Date.now() - lastPenAt.current) / 1000 : undefined,
             focus: trigger === "pause" ? null : focusOn(lines),
             hasPhoto: images.current.length > 0,
+            models: models.current
+              .filter((m) => m.shownAt == null || m.shownAt <= performance.now())
+              .map((m) => ({ title: m.spec.title ?? m.spec.kind, parts: modelLive.current.get(m.id)?.built?.parts.map((p) => p.id) ?? modelParts(m.spec), view: m.state.view })),
             paper: paper.current
               ? {
                   title: paper.current.ref.title,
@@ -529,12 +588,13 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
                   truncated: paper.current.digest.truncated,
                   visiblePages: visiblePages(),
                   pointedAt: trigger === "pause" ? null : sentenceAt(),
+                  kind: paper.current.data.kind ?? "paper",
                 }
               : null,
             lines: lines.map((l) => ({ id: l.id, tokens: l.tokens.length })),
             ...(paper.current
               ? {
-                  pageImage: renderViewImage(viewBox(), [...(paper.current.pages ?? []), ...images.current], pictureFor, strokes.current, tutorInk.current),
+                  pageImage: renderViewImage(viewBox(), ...viewPictures(), strokes.current, tutorInk.current),
                   tokenImage: renderPageImages(strokes.current, lines).tokenImage,
                 }
               : renderPageImages(strokes.current, lines, loadedPictures())),
@@ -698,8 +758,13 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     const cam = camera.current;
     const p = paper.current;
     const planner = new TurnPlanner(lines, Math.floor(Math.random() * 2 ** 31), {
-      avoid: tutorInk.current.flatMap((t) => (p && t.plan.parts ? t.plan.parts : t.plan.box ? [t.plan.box] : [])),
-      origin: { x: cam.x, y: cam.y + 60 / cam.z },
+      avoid: [
+        ...tutorInk.current.flatMap((t) => (p && t.plan.parts ? t.plan.parts : t.plan.box ? [t.plan.box] : [])),
+        // models and simulations already on the page keep their place
+        ...models.current.map((m) => ({ x: m.x, y: m.y, w: m.w, h: m.h })),
+        ...sims.current.map((m) => ({ x: m.x, y: m.y, w: m.w, h: m.h })),
+      ],
+      origin: { x: cam.x + 70 / cam.z, y: cam.y + 80 / cam.z },
       // the caption panel covers the bottom of the screen
       column: p ? { x: p.ref.x + p.ref.w + 70, top: Math.max(p.ref.y, cam.y + 80 / cam.z), bottom: cam.y + viewBox().h - 180 / cam.z } : undefined,
       size: p ? 19 : undefined,
@@ -722,9 +787,13 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       const found = paper.current ? findSentence(paper.current.data, h.ref) : null;
       const at = found ? paperPage(found.page.n) : null;
       if (!found || !at) return [];
-      const boxes = found.sentence.boxes.map((b) => ({ x: at.x + b.x * at.w - 2, y: at.y + b.y * at.h - 1, w: b.w * at.w + 4, h: b.h * at.h + 2 }));
+      // just the word or phrase it names, when it names one
+      const exact = h.quote ? phraseBoxes(found.sentence, h.quote) : null;
+      const boxes = (exact ?? found.sentence.boxes).map((b) => ({ x: at.x + b.x * at.w - 2, y: at.y + b.y * at.h - 1, w: b.w * at.w + 4, h: b.h * at.h + 2 }));
       return boxes.length ? [{ boxes, kind: h.kind, note: h.note, edge: at.x + at.w }] : [];
     });
+    // a 3D model goes on the page first, so this phrase's ink keeps clear of it
+    const model = beat.model ? placeModel(s, beat.model) : null;
     const plan = s.planner.plan({
       annotations: beat.annotations,
       marks,
@@ -740,11 +809,11 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       ink = { id: crypto.randomUUID(), plan, born: Infinity, marks: rects, rules };
       tutorInk.current.push(ink);
     }
-    const region = [...marks.flatMap((m) => m.boxes), ...(plan.box ? [plan.box] : [])].reduce<Box | null>((a, b) => (a ? unionBox(a, b) : b), null);
+    const region = [...marks.flatMap((m) => m.boxes), ...(plan.box ? [plan.box] : []), ...(model ? [{ x: model.x, y: model.y, w: model.w, h: model.h }] : [])].reduce<Box | null>((a, b) => (a ? unionBox(a, b) : b), null);
     let clip = ahead?.get(beat.say) ?? null;
     ahead?.delete(beat.say);
     if (!clip && beat.say && !stateRef.current.muted) clip = prepareClip(beat.say);
-    s.acts.push({ beat, ink, clip, region, figure: plan.figure ?? null, started: false, voiceDone: false, inkDone: !ink });
+    s.acts.push({ beat, model, ink, clip, region, figure: plan.figure ?? null, started: false, voiceDone: false, inkDone: !ink });
     // the answer came before the line said while thinking could start: skip that line
     if (aside.current && !aside.current.speaking) quietAside();
     if (!s.playing && !s.breathing && !aside.current) playNext(s);
@@ -779,6 +848,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       if (act.started || show.current !== s) return;
       act.started = true;
       const speaking = words ? (ms ?? speechMs(words)) : 0;
+      // the model appears, and the part named lights up, as the words begin
+      if (act.model) act.model.shownAt = performance.now();
+      const target = act.model ?? models.current.at(-1);
+      if (target && (act.beat.model_focus !== null || act.beat.model_view)) setModelView(target, act.beat.model_view, act.beat.model_focus ?? undefined);
       if (act.ink) {
         // the pen keeps pace so the phrase's ink is done about when its words are
         if (words) act.ink.plan = retime(act.ink.plan, Math.min(1, speaking / Math.max(1, act.ink.plan.duration)));
@@ -932,7 +1005,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       // a little room round it, and never so small a crop that a line of writing fills the picture
       const w = Math.max(region.w + 60, 620), h = Math.max(region.h + 60, 240);
       try {
-        picture = renderViewImage({ x: region.x + region.w / 2 - w / 2, y: region.y + region.h / 2 - h / 2, w, h }, [...(p?.pages ?? []), ...images.current], pictureFor, strokes.current, tutorInk.current, 900);
+        picture = renderViewImage({ x: region.x + region.w / 2 - w / 2, y: region.y + region.h / 2 - h / 2, w, h }, ...viewPictures(), strokes.current, tutorInk.current, 900);
       } catch {
         // a picture is a nicety; the words are the record
       }
@@ -958,7 +1031,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       const x0 = Math.min(...ink.map((q) => q[0])) - m, y0 = Math.min(...ink.map((q) => q[1])) - m;
       const x1 = Math.max(...ink.map((q) => q[0])) + m, y1 = Math.max(...ink.map((q) => q[1])) + m;
       try {
-        board = renderViewImage({ x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, [...(p?.pages ?? []), ...images.current], pictureFor, strokes.current, tutorInk.current, 1600);
+        board = renderViewImage({ x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, ...viewPictures(), strokes.current, tutorInk.current, 1600);
       } catch {
         board = null;
       }
@@ -1120,6 +1193,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     setImages([]);
     setPaper(null);
     sims.current = [];
+    setModels([]);
     simRuns.current.clear();
     paths.current.clear();
     tutorPaths.current.clear();
@@ -1253,9 +1327,170 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       ...sims.current,
     ];
     const below = boxes.length ? Math.max(...boxes.map((b) => b.y + b.h)) + 36 : cam.y + 90 / cam.z;
-    const sim: PageSim = { id: crypto.randomUUID(), spec, x: cam.x + 40 / cam.z, y: below, w: SIM_W, h: SIM_H, ran: false };
+    const sim: PageSim = { id: crypto.randomUUID(), spec, x: cam.x + 90 / cam.z, y: below, w: SIM_W, h: SIM_H, ran: false };
     sims.current.push(sim);
     reveal(sim);
+  };
+
+  // ---------- 3D models ----------
+  const setModels = (list: PageModel[]) => {
+    for (const [id, live] of modelLive.current) if (!list.some((m) => m.id === id)) {
+      live.built?.dispose();
+      modelLive.current.delete(id);
+    }
+    models.current = list;
+    if (list.length) ensureStage();
+    dirty.current = true;
+  };
+
+  // Loads three.js and the model builders the first time a model is on the page.
+  const ensureStage = () => {
+    if (loadingStage.current) return loadingStage.current;
+    loadingStage.current = import("@/lib/model3d-render");
+    loadingStage.current
+      .then((mod) => {
+        try {
+          modelStage.current = new mod.ModelStage();
+        } catch {
+          flash("This browser can't show 3D models (WebGL is off).");
+        }
+        dirty.current = true;
+      })
+      .catch(() => flash("The 3D viewer couldn't load."));
+    return loadingStage.current;
+  };
+
+  const liveFor = (m: PageModel) => {
+    let live = modelLive.current.get(m.id);
+    if (!live) {
+      live = { built: null, canvas: document.createElement("canvas"), t: 0, explode: 0, stale: true, labels: [], buttons: [], raw: [] };
+      modelLive.current.set(m.id, live);
+    }
+    return live;
+  };
+
+  // Brings each model's frame up to date: builds it on first sight, moves its
+  // clock if it is playing, turns it slowly when left alone, eases the
+  // exploded view in and out, and redraws only what changed.
+  const stepModels = (now: number, dt: number, view: Box): boolean => {
+    let moving = false;
+    const stage = modelStage.current;
+    for (const m of models.current) {
+      if (m.shownAt != null && m.shownAt > now) continue;
+      const live = liveFor(m);
+      const onScreen = m.x < view.x + view.w && m.x + m.w > view.x && m.y < view.y + view.h && m.y + m.h > view.y;
+      if (!stage || !loadingStage.current) continue;
+      if (!live.built) {
+        loadingStage.current.then((mod) => {
+          if (live.built || !models.current.includes(m)) return;
+          try {
+            live.built = mod.buildModel(m.spec);
+            if (!live.built.views.some((v) => v.id === m.state.view)) m.state.view = live.built.views[0]?.id ?? "whole";
+            live.built.apply(m.state.view, m.state.focus);
+          } catch {
+            live.built = null;
+          }
+          live.stale = true;
+          dirty.current = true;
+        });
+        continue;
+      }
+      if (!onScreen) continue;
+      const b = live.built;
+      const idle = now - m.state.touched > 20000 && !modelDrag.current;
+      if (b.animated && m.state.playing) {
+        live.t += dt;
+        live.stale = true;
+      }
+      if (idle) {
+        m.state.yaw += dt * 0.12;
+        live.stale = true;
+      }
+      const target = m.state.view === "exploded" ? 1 : 0;
+      if (Math.abs(live.explode - target) > 0.002) {
+        live.explode += (target - live.explode) * Math.min(1, dt * 4);
+        live.stale = true;
+      } else live.explode = target;
+      if (live.stale) {
+        const v = modelView(m);
+        live.raw = stage.draw(b, m.state, live.t, live.explode, live.canvas, v.w, v.h, Math.min(2, (window.devicePixelRatio || 1) * Math.max(0.6, camera.current.z)));
+        live.stale = false;
+      }
+      if ((b.animated && m.state.playing) || idle || live.explode !== target) moving = true;
+    }
+    return moving;
+  };
+
+  const drawModels = (ctx: CanvasRenderingContext2D, now: number) => {
+    for (const m of models.current) {
+      if (m.shownAt != null && m.shownAt > now) continue;
+      const live = liveFor(m);
+      const b = live.built;
+      live.buttons = modelButtons(ctx, m, b?.views ?? [], !!b?.animated);
+      live.labels = placeLabels(ctx, m, live.raw.map((l) => ({ ...l, focused: l.id === m.state.focus })));
+      drawModelFrame(ctx, m, b && live.canvas.width > 1 ? live.canvas : null, m.spec.title ?? "3D model", b?.readout ?? null, live.labels, live.buttons, camera.current.z);
+    }
+  };
+
+  // Puts the model a phrase brings on the page, in space held by the turn's planner.
+  const placeModel = (s: Show, spec: PageModel["spec"]): PageModel => {
+    const spot = s.planner.reserve(MODEL_W, MODEL_H);
+    const m: PageModel = {
+      id: crypto.randomUUID(),
+      spec,
+      x: spot.x,
+      y: spot.y,
+      w: MODEL_W,
+      h: MODEL_H,
+      state: { yaw: 0.6, pitch: 0.38, zoom: 1, view: spec.kind === "preset" && /cell|earth/.test(spec.preset) ? "cutaway" : "whole", focus: null, playing: true, touched: 0 },
+      shownAt: Infinity,
+    };
+    setModels([...models.current, m]);
+    return m;
+  };
+
+  const setModelView = (m: PageModel, view: string | null, focus: string | null | undefined) => {
+    const live = liveFor(m);
+    if (view && live.built && !live.built.views.some((v) => v.id === view)) {
+      // a view this model doesn't have: the nearest it does
+      view = view === "slices" || view === "sweep" ? null : view === "cutaway" ? "xray" : null;
+    }
+    if (view) m.state.view = view;
+    if (focus !== undefined) m.state.focus = focus && live.built ? (live.built.parts.some((p) => p.id === focus) ? focus : null) : (focus ?? null);
+    live.built?.apply(m.state.view, m.state.focus);
+    live.stale = true;
+    dirty.current = true;
+  };
+
+  // A tap or drag on a model: buttons switch views, a label lights its part,
+  // and dragging the view turns the model.
+  const modelPointerDown = (e: React.PointerEvent, wx: number, wy: number): boolean => {
+    for (const m of [...models.current].reverse()) {
+      if (m.shownAt != null && m.shownAt > performance.now()) continue;
+      const live = modelLive.current.get(m.id);
+      const hit = hitModel(m, wx, wy, live?.buttons ?? [], live?.labels ?? []);
+      if (!hit) continue;
+      m.state.touched = performance.now();
+      if (hit.kind === "button") {
+        if (hit.id.startsWith("view:")) setModelView(m, hit.id.slice(5), undefined);
+        else if (hit.id === "play") m.state.playing = !m.state.playing;
+        else if (hit.id === "reset") {
+          Object.assign(m.state, { yaw: 0.6, pitch: 0.38, zoom: 1, focus: null });
+          setModelView(m, live?.built?.views[0]?.id ?? "whole", null);
+        }
+        if (live) live.stale = true;
+        dirty.current = true;
+        save();
+      } else if (hit.kind === "label") {
+        setModelView(m, null, m.state.focus === hit.id ? null : hit.id);
+        save();
+      } else if (hit.kind === "view") {
+        modelDrag.current = { id: m.id, pointerId: e.pointerId, x: e.clientX, y: e.clientY, moved: false };
+        (e.target as Element).setPointerCapture?.(e.pointerId);
+      }
+      return true;
+    }
+    return false;
   };
 
   // A run finished: keep its results on the page and let the tutor see what happened.
@@ -1389,6 +1624,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
     {
       const [wx, wy] = screenToWorld(camera.current, sx, sy);
+      if (tool !== "eraser" && tool !== "keep" && models.current.length && modelPointerDown(e, wx, wy)) return;
       const sim = simPlayAt(wx, wy);
       if (sim && !simRuns.current.has(sim.id)) {
         simRuns.current.set(sim.id, performance.now());
@@ -1410,12 +1646,14 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
     undoStack.current.push([...strokes.current]);
     const [wx, wy] = screenToWorld(camera.current, sx, sy);
+    const shape = SHAPE_TOOLS.includes(tool) ? tool : null;
     const stroke: Stroke = {
       id: crypto.randomUUID(),
-      points: [[wx, wy, e.pointerType === "pen" ? e.pressure : 0.5]],
-      color: STUDENT_INK,
-      size: 4.2,
+      points: [[wx, wy, e.pointerType === "pen" && !shape ? e.pressure : 0.5]],
+      color: tool === "highlighter" ? HIGHLIGHT : ink,
+      size: tool === "highlighter" ? 20 : 4.2,
       createdAt: Date.now(),
+      ...(tool === "highlighter" ? { kind: "highlight" as const } : shape ? { kind: "shape" as const, anchor: [wx, wy] as [number, number] } : {}),
     };
     strokes.current.push(stroke);
     drawing.current = { stroke, pointerId: e.pointerId, simulate: e.pointerType !== "pen" };
@@ -1443,6 +1681,24 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       return;
     }
 
+    const md = modelDrag.current;
+    if (md && md.pointerId === e.pointerId) {
+      const m = models.current.find((x) => x.id === md.id);
+      if (m) {
+        const dx = e.clientX - md.x, dy = e.clientY - md.y;
+        md.x = e.clientX;
+        md.y = e.clientY;
+        md.moved = true;
+        m.state.yaw -= dx * 0.01;
+        m.state.pitch = Math.max(-1.3, Math.min(1.45, m.state.pitch + dy * 0.008));
+        m.state.touched = performance.now();
+        const live = modelLive.current.get(m.id);
+        if (live) live.stale = true;
+        dirty.current = true;
+      }
+      return;
+    }
+
     if (lasso.current && tool === "keep") {
       lasso.current.push(screenToWorld(camera.current, sx, sy));
       dirty.current = true;
@@ -1453,9 +1709,30 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     if (d && d.pointerId === e.pointerId) {
       const events = e.nativeEvent.getCoalescedEvents?.() ?? [e.nativeEvent];
       const r = canvasRef.current!.getBoundingClientRect();
+      if (d.stroke.kind === "shape" && d.stroke.anchor) {
+        const last = events[events.length - 1];
+        const [wx, wy] = screenToWorld(camera.current, last.clientX - r.left, last.clientY - r.top);
+        d.stroke.points = shapePoints(tool, d.stroke.anchor, [wx, wy], e.shiftKey);
+        dirty.current = true;
+        return;
+      }
       for (const ev of events) {
         const [wx, wy] = screenToWorld(camera.current, ev.clientX - r.left, ev.clientY - r.top);
         d.stroke.points.push([wx, wy, ev.pointerType === "pen" ? ev.pressure : 0.5] as Point);
+      }
+      if (holdTimer.current) clearTimeout(holdTimer.current);
+      if (d.stroke.kind !== "highlight") {
+        const held = d.stroke;
+        holdTimer.current = setTimeout(() => {
+          if (drawing.current?.stroke !== held) return;
+          const snapped = snapShape(held.points, camera.current.z);
+          if (snapped) {
+            held.points = snapped;
+            held.kind = "shape";
+            paths.current.delete(held.id);
+            dirty.current = true;
+          }
+        }, 650);
       }
       dirty.current = true;
       return;
@@ -1479,6 +1756,11 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   const onPointerUp = (e: React.PointerEvent) => {
     pointers.current.delete(e.pointerId);
+    if (modelDrag.current?.pointerId === e.pointerId) {
+      modelDrag.current = null;
+      save();
+      return;
+    }
     if (pointers.current.size < 2) pinch.current = null;
     if (lasso.current) {
       const picked = strokesInLasso(strokes.current, lasso.current);
@@ -1492,9 +1774,17 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       return;
     }
     const d = drawing.current;
+    if (holdTimer.current) clearTimeout(holdTimer.current);
     if (d && d.pointerId === e.pointerId) {
       drawing.current = null;
-      if (gesture(d.stroke)) {
+      if (d.stroke.kind === "shape" && d.stroke.anchor && d.stroke.points.length < 2) {
+        // a tap with a shape tool draws nothing
+        strokes.current = strokes.current.filter((s) => s !== d.stroke);
+        dirty.current = true;
+        return;
+      }
+      delete d.stroke.anchor;
+      if (d.stroke.kind !== "shape" && d.stroke.kind !== "highlight" && gesture(d.stroke)) {
         dirty.current = true;
         return;
       }
@@ -1680,9 +1970,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         e.preventDefault();
         undo();
       }
-      if (e.key === "p") setTool("pen");
-      if (e.key === "e") setTool("eraser");
-      if (e.key === "h") setTool("hand");
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      const picked = PALETTE.find((t) => t.key === e.key);
+      if (picked && (picked.tool !== "keep" || stateRef.current.mode === "study") && !e.metaKey && !e.ctrlKey) setTool(picked.tool);
       if (e.key === "k" && stateRef.current.mode === "study") setTool("keep");
     };
     const up = (e: KeyboardEvent) => {
@@ -1711,6 +2001,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     tutorPaths.current.clear();
     sessionId.current = crypto.randomUUID();
     sims.current = [];
+    setModels([]);
     simRuns.current.clear();
     stats.current = newStats();
     dirty.current = true;
@@ -1724,6 +2015,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     setImages([]);
     setPaper(null);
     sims.current = [];
+    setModels([]);
     simRuns.current.clear();
     paths.current.clear();
     tutorPaths.current.clear();
@@ -1748,7 +2040,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       const cam = camera.current;
       const viewW = canvas.clientWidth / cam.z;
       const width = Math.min(900, Math.max(320, viewW * 0.6));
-      const x = cam.x + 30 / cam.z;
+      const x = cam.x + 90 / cam.z;
       let y = cam.y + 90 / cam.z;
       const added: PageImage[] = [];
       for (const p of pictures) {
@@ -1779,15 +2071,25 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   // Study a paper: its pages go down the left, the workspace is to the right,
   // and the tutor opens with the big picture.
-  const studyPaper = async (file: File) => {
+  // What the Read dialog was given: a file (a PDF, or a .txt), or pasted text.
+  const studyPaper = async (source: { file: File; kind: DocKind | "auto" } | { title: string; text: string; kind: DocKind | "auto" }) => {
     const busyPage = strokes.current.length || tutorInk.current.length || images.current.length || paper.current;
-    if (busyPage && !confirm("Start a fresh page for this paper? Your current page will be cleared.")) return;
+    if (busyPage && !confirm("Start a fresh page for this reading? Your current page will be cleared.")) return;
     setError(null);
-    setOpening("Reading the paper…");
+    setReading(null);
+    setOpening("Opening…");
     try {
-      const data = await openPaper(file, (done, total) => setOpening(`Reading page ${Math.min(done + 1, total)} of ${total}…`));
+      let data: Paper;
+      if ("text" in source) data = await typesetText(source.title, source.text, source.kind === "paper" ? "prose" : source.kind);
+      else if (/\.pdf$/i.test(source.file.name) || source.file.type === "application/pdf") {
+        data = await openPaper(source.file, (done, total) => setOpening(`Reading page ${Math.min(done + 1, total)} of ${total}…`));
+        data.kind = source.kind === "auto" ? "paper" : source.kind;
+      } else {
+        const text = await source.file.text();
+        data = await typesetText(source.file.name.replace(/\.(txt|md|text)$/i, ""), text, source.kind === "auto" || source.kind === "paper" ? "auto" : source.kind);
+      }
       if (!data.pages.some((p) => p.sentences.length))
-        throw new Error("That PDF has no text layer (it may be a scan), so I can't read it. Try the publisher's or arXiv's PDF.");
+        throw new Error("That file has no text I can read (a PDF may be a scan). Try a PDF with selectable text, or paste the text.");
       await savePaper(data).catch(() => flash("This paper is too big to keep on this device; it'll need reopening next time."));
       if (paper.current) deletePaper(paper.current.ref.id);
       hush();
@@ -1797,6 +2099,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       tutorPaths.current.clear();
       undoStack.current = [];
       sims.current = [];
+      setModels([]);
+    setModels([]);
       simRuns.current.clear();
       setImages([]);
       sessionId.current = crypto.randomUUID();
@@ -1810,7 +2114,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       dirty.current = true;
       save();
       logEvent(account, "paper_opened", { pages: data.pages.length, page_count: data.pageCount, sentences: data.pages.reduce((n, p) => n + p.sentences.length, 0) }, sessionId.current);
-      setCaption(`Got "${data.title}". Give me a second to read it…`);
+      setCaption(isLiterature(data.kind) ? `"${data.title}". Let me open it…` : `Got "${data.title}". Give me a second to read it…`);
       // The tutor's first look should see the pages, not blank paper.
       await Promise.all(
         (paper.current?.pages ?? []).slice(0, 2).map((img) => {
@@ -1820,14 +2124,14 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       );
       askTutor("paper_opened");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "That paper couldn't be opened.");
+      setError(e instanceof Error ? e.message : "That couldn't be opened.");
     } finally {
       setOpening(null);
     }
   };
 
   const closePaper = () => {
-    if (!paper.current || !confirm("Close the paper? Your notes and the tutor's drawings stay on the page.")) return;
+    if (!paper.current || !confirm("Close this reading? Your notes and the tutor's drawings stay on the page.")) return;
     deletePaper(paper.current.ref.id);
     setPaper(null);
     save();
@@ -1873,7 +2177,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   return (
     <div className="shell">
       <header className="bar">
-        <span className="brand">Tutor</span>
+        <span className="brand">CoInk</span>
         {mode === "review" && run && currentCard ? (
           <div className="card-now" aria-live="polite">
             <span className="card-meta">
@@ -1901,19 +2205,6 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           />
         )}
         <div className="tools" role="toolbar" aria-label="Drawing tools">
-          {(["pen", "eraser", "hand", "keep"] as Tool[])
-            .filter((t) => mode === "study" || t !== "keep")
-            .map((t) => (
-              <button
-                key={t}
-                className={tool === t ? "on" : ""}
-                onClick={() => setTool(t)}
-                aria-pressed={tool === t}
-                title={t === "keep" ? "Draw a loop around writing to keep it as a review card" : undefined}
-              >
-                {t === "pen" ? "Pen" : t === "eraser" ? "Eraser" : t === "hand" ? "Move" : "Keep"}
-              </button>
-            ))}
           <button onClick={undo}>Undo</button>
           <button onClick={clearPage}>Clear</button>
           {mode === "study" && (
@@ -1924,22 +2215,22 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
               {hasPhoto && <button onClick={removePhotos}>Remove photo</button>}
               {paperTitle ? (
                 <button onClick={closePaper} title={paperTitle}>
-                  Close paper
+                  Close reading
                 </button>
               ) : (
-                <button onClick={() => paperInput.current?.click()} disabled={!!opening} title="Open a research paper (PDF) to read and discuss together">
-                  {opening ?? "Study a paper"}
+                <button onClick={() => setReading({ title: "", text: "", kind: "auto" })} disabled={!!opening} title="Read a poem, a story, a play, a chapter or a research paper together">
+                  {opening ?? "Read"}
                 </button>
               )}
               <input
                 ref={paperInput}
                 type="file"
-                accept="application/pdf"
+                accept="application/pdf,.pdf,text/plain,.txt,.md"
                 hidden
                 onChange={(e) => {
                   const f = e.target.files?.[0];
                   e.target.value = "";
-                  if (f) studyPaper(f);
+                  if (f) studyPaper({ file: f, kind: reading?.kind ?? "auto" });
                 }}
               />
               <input
@@ -2091,6 +2382,81 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           {toast}
         </div>
       )}
+
+      {reading && (
+        <div className="read-dialog" role="dialog" aria-modal="true" aria-label="Read something together">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (reading.text.trim()) studyPaper({ title: reading.title, text: reading.text, kind: reading.kind });
+            }}
+          >
+            <h2>Read together</h2>
+            <p className="quiet">Paste a poem, a passage or a chapter, or open a PDF or text file. We&apos;ll read it side by side and talk it through.</p>
+            <label>
+              Title (optional)
+              <input value={reading.title} onChange={(e) => setReading({ ...reading, title: e.target.value })} placeholder="Ozymandias, Percy Bysshe Shelley" />
+            </label>
+            <label>
+              What is it?
+              <select value={reading.kind} onChange={(e) => setReading({ ...reading, kind: e.target.value as DocKind | "auto" })}>
+                <option value="auto">Work it out for me</option>
+                <option value="poem">A poem</option>
+                <option value="prose">A story, novel, essay or article</option>
+                <option value="play">A play or script</option>
+                <option value="paper">A research paper (PDF)</option>
+              </select>
+            </label>
+            <label>
+              The text
+              <textarea value={reading.text} onChange={(e) => setReading({ ...reading, text: e.target.value })} rows={9} placeholder={"I met a traveller from an antique land,\nWho said—\"Two vast and trunkless legs of stone\nStand in the desert. . . ."} />
+            </label>
+            <div className="read-actions">
+              <button type="button" onClick={() => paperInput.current?.click()}>
+                Open a file…
+              </button>
+              <span className="spacer" />
+              <button type="button" onClick={() => setReading(null)}>
+                Cancel
+              </button>
+              <button type="submit" className="primary" disabled={!reading.text.trim()}>
+                Start reading
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      <div className="palette" role="toolbar" aria-label="Drawing tools" aria-orientation="vertical">
+        {PALETTE.filter((t) => mode === "study" || t.tool !== "keep").map((t) => (
+          <button
+            key={t.tool}
+            className={tool === t.tool ? "on" : ""}
+            onClick={() => setTool(t.tool)}
+            aria-pressed={tool === t.tool}
+            aria-label={t.label}
+            title={`${t.label}${t.key ? ` (${t.key})` : ""}${t.hint ? `: ${t.hint}` : ""}`}
+          >
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              {t.icon}
+            </svg>
+          </button>
+        ))}
+        <span className="palette-rule" />
+        {INKS.map((c) => (
+          <button
+            key={c}
+            className={`swatch${ink === c ? " on" : ""}`}
+            style={{ ["--swatch" as string]: c }}
+            onClick={() => {
+              setInk(c);
+              if (tool === "eraser" || tool === "hand" || tool === "keep" || tool === "highlighter") setTool("pen");
+            }}
+            aria-pressed={ink === c}
+            aria-label={`Ink colour ${c}`}
+          />
+        ))}
+      </div>
 
       <canvas
         ref={canvasRef}
@@ -2289,7 +2655,7 @@ function outlinePath(outline: number[][]): Path2D {
 // The tutor gets two pictures: the clean page to read, and the same page with
 // line ids and numbered token boxes so it can point at an exact part.
 // Tutor ink is left out of both so it never "reads" itself.
-type LoadedPicture = { img: PageImage; el: HTMLImageElement };
+type LoadedPicture = { img: PageImage; el: CanvasImageSource };
 
 function renderPageImages(strokes: Stroke[], lines: InkLine[], pictures: LoadedPicture[] = []): { pageImage: string; tokenImage: string } {
   if (!lines.length && !pictures.length) {
@@ -2319,11 +2685,7 @@ function renderPageImages(strokes: Stroke[], lines: InkLine[], pictures: LoadedP
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.setTransform(scale, 0, 0, scale, (margin - box.x) * scale, (margin - box.y) * scale);
     for (const { img, el } of pictures) ctx.drawImage(el, img.x, img.y, img.w, img.h);
-    ctx.fillStyle = STUDENT_INK;
-    for (const s of strokes) {
-      const outline = getStroke(s.points, { size: s.size, thinning: 0.6, smoothing: 0.55, streamline: 0.45 });
-      if (outline.length) ctx.fill(outlinePath(outline));
-    }
+    fillInk(ctx, strokes);
     if (labels) {
       const px = 1 / scale;
       ctx.font = `${13 * px}px sans-serif`;
@@ -2350,7 +2712,7 @@ function renderPageImages(strokes: Stroke[], lines: InkLine[], pictures: LoadedP
 function renderViewImage(
   view: Box,
   pictures: PageImage[],
-  pictureFor: (img: PageImage) => HTMLImageElement | null,
+  pictureFor: (img: PageImage) => CanvasImageSource | null,
   strokes: Stroke[],
   inks: TutorInk[],
   maxW = 1400,
@@ -2371,11 +2733,7 @@ function renderViewImage(
   for (const t of inks) for (const b of t.marks ?? []) if (t.born !== Infinity) ctx.fillRect(b.x, b.y, b.w, b.h);
   ctx.fillStyle = TUTOR_INK;
   for (const t of inks) for (const b of t.rules ?? []) if (t.born !== Infinity) ctx.fillRect(b.x, b.y, b.w, b.h);
-  ctx.fillStyle = STUDENT_INK;
-  for (const s of strokes) {
-    const outline = getStroke(s.points, { size: s.size, thinning: 0.6, smoothing: 0.55, streamline: 0.45 });
-    if (outline.length) ctx.fill(outlinePath(outline));
-  }
+  fillInk(ctx, strokes);
   ctx.fillStyle = TUTOR_INK;
   for (const t of inks) {
     if (t.born === Infinity) continue;
@@ -2408,11 +2766,7 @@ function renderInkImage(strokes: Stroke[], maxSize: number): string {
   ctx.fillStyle = "#fff";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.setTransform(scale, 0, 0, scale, -box.x * scale, -box.y * scale);
-  ctx.fillStyle = STUDENT_INK;
-  for (const s of strokes) {
-    const outline = getStroke(s.points, { size: s.size, thinning: 0.6, smoothing: 0.55, streamline: 0.45 });
-    if (outline.length) ctx.fill(outlinePath(outline));
-  }
+  fillInk(ctx, strokes);
   return canvas.toDataURL("image/png");
 }
 
@@ -2441,4 +2795,75 @@ async function* readLines(body: ReadableStream<Uint8Array>): AsyncGenerator<unkn
   }
   const last = buf.trim() ? parse(buf.trim()) : null;
   if (last) yield last;
+}
+
+// How a stroke's outline is drawn: a pen thins with speed; a highlighter and a
+// ruled shape keep one width.
+function inkStyle(s: Stroke) {
+  return s.kind ? { thinning: 0, smoothing: 0.5, streamline: 0.3 } : { thinning: 0.6, smoothing: 0.55, streamline: 0.45 };
+}
+
+// The student's ink in a picture: highlighter first, then the writing, each in its colour.
+function fillInk(ctx: CanvasRenderingContext2D, strokes: Stroke[]) {
+  for (const pass of [true, false])
+    for (const s of strokes) {
+      if ((s.kind === "highlight") !== pass) continue;
+      const outline = getStroke(s.points, { size: s.size, ...inkStyle(s) });
+      if (!outline.length) continue;
+      ctx.fillStyle = s.color || STUDENT_INK;
+      ctx.fill(outlinePath(outline));
+    }
+}
+
+// The points of a line, arrow, box or oval dragged from `a` to `b`. Shift keeps it square or level.
+function shapePoints(tool: Tool, a: [number, number], b: [number, number], even: boolean): Point[] {
+  let [x1, y1] = b;
+  const [x0, y0] = a;
+  if (even) {
+    if (tool === "line" || tool === "arrow") {
+      const ang = Math.round(Math.atan2(y1 - y0, x1 - x0) / (Math.PI / 4)) * (Math.PI / 4);
+      const d = Math.hypot(x1 - x0, y1 - y0);
+      [x1, y1] = [x0 + Math.cos(ang) * d, y0 + Math.sin(ang) * d];
+    } else {
+      const d = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0));
+      [x1, y1] = [x0 + Math.sign(x1 - x0 || 1) * d, y0 + Math.sign(y1 - y0 || 1) * d];
+    }
+  }
+  const p = (x: number, y: number): Point => [x, y, 0.5];
+  const seg = (ax: number, ay: number, bx: number, by: number): Point[] => {
+    const n = Math.max(2, Math.ceil(Math.hypot(bx - ax, by - ay) / 6));
+    return Array.from({ length: n + 1 }, (_, i) => p(ax + ((bx - ax) * i) / n, ay + ((by - ay) * i) / n));
+  };
+  if (Math.hypot(x1 - x0, y1 - y0) < 3) return [p(x0, y0)];
+  if (tool === "line") return seg(x0, y0, x1, y1);
+  if (tool === "arrow") {
+    const ang = Math.atan2(y1 - y0, x1 - x0);
+    const wing = Math.min(22, Math.hypot(x1 - x0, y1 - y0) * 0.35);
+    const w1: [number, number] = [x1 - wing * Math.cos(ang - 0.45), y1 - wing * Math.sin(ang - 0.45)];
+    const w2: [number, number] = [x1 - wing * Math.cos(ang + 0.45), y1 - wing * Math.sin(ang + 0.45)];
+    return [...seg(x0, y0, x1, y1), ...seg(x1, y1, ...w1).slice(1), ...seg(...w1, x1, y1).slice(1), ...seg(x1, y1, ...w2).slice(1)];
+  }
+  if (tool === "rect") return [...seg(x0, y0, x1, y0), ...seg(x1, y0, x1, y1).slice(1), ...seg(x1, y1, x0, y1).slice(1), ...seg(x0, y1, x0, y0).slice(1)];
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, rx = Math.abs(x1 - x0) / 2, ry = Math.abs(y1 - y0) / 2;
+  return Array.from({ length: 73 }, (_, i) => p(cx + Math.cos((i / 72) * Math.PI * 2) * rx, cy + Math.sin((i / 72) * Math.PI * 2) * ry));
+}
+
+// A stroke the student held still at the end of: a near-straight one becomes a
+// line, a closed one an oval or a box. Null when it is neither.
+function snapShape(points: Point[], z: number): Point[] | null {
+  if (points.length < 8) return null;
+  const xs = points.map((q) => q[0]), ys = points.map((q) => q[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const w = maxX - minX, h = maxY - minY;
+  if (Math.max(w, h) * z < 40) return null;
+  const [ax, ay] = points[0], [bx, by] = points[points.length - 1];
+  const len = Math.hypot(bx - ax, by - ay);
+  let path = 0;
+  for (let i = 1; i < points.length; i++) path += Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]);
+  if (len > path * 0.92) return shapePoints("line", [ax, ay], [bx, by], false);
+  if (len > Math.max(w, h) * 0.25) return null;
+  // closed: an oval if the points keep an even distance from the middle, else a box
+  const cx = minX + w / 2, cy = minY + h / 2;
+  const off = points.reduce((acc, [x, y]) => acc + Math.abs(Math.hypot((x - cx) / (w / 2 || 1), (y - cy) / (h / 2 || 1)) - 1), 0) / points.length;
+  return shapePoints(off < 0.12 ? "ellipse" : "rect", [minX, minY], [maxX, maxY], false);
 }

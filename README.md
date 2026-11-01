@@ -1,4 +1,4 @@
-# Tutor
+# CoInk
 
 A private tutor on an infinite page. You work a problem by hand with an Apple Pencil, a stylus, a finger or a mouse; the tutor watches, talks to you, and writes in the margin in its own handwriting. It is built to make you do the hard part: it waits while you are on track, points at the line where a mistake starts, and climbs a hint ladder one rung at a time instead of handing over the answer.
 

@@ -7,7 +7,8 @@ import { zodResponseFormat } from "openai/helpers/zod";
 import { adminClient, createClient } from "@/lib/supabase/server";
 import { researchMode } from "@/lib/supabase/env";
 import { conditionOf, dailyTutorLimit, startOfUtcDay, type Condition } from "@/lib/study";
-import { allowedMoves, EXPLAIN_PROMPT, LADDER, MOVES, PAPER_PROMPT, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, tutorTurnSchema, type Beat, type PublicTurn, type TurnEnd, type TutorRequest, type TutorTurn } from "@/lib/tutor";
+import { describeModel } from "@/lib/model3d";
+import { allowedMoves, EXPLAIN_PROMPT, LADDER, LITERATURE_PROMPT, MOVES, PAPER_PROMPT, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, tutorTurnSchema, type Beat, type PublicTurn, type TurnEnd, type TutorRequest, type TutorTurn } from "@/lib/tutor";
 import { BeatChecker, readingFlag, TurnScanner } from "@/lib/turn-stream";
 
 // The tutor runs on Claude when ANTHROPIC_API_KEY is set, otherwise on OpenAI
@@ -321,6 +322,7 @@ export async function POST(req: Request) {
           truncated: Boolean(body.paper.truncated) || body.paper.text.length > 160_000,
           visible: (Array.isArray(body.paper.visiblePages) ? body.paper.visiblePages : []).filter(Number.isInteger).slice(0, 6),
           pointedAt: typeof body.paper.pointedAt === "string" && /^p\d+\.s\d+$/.test(body.paper.pointedAt) ? body.paper.pointedAt : null,
+          kind: (["poem", "prose", "play"] as const).find((k) => k === body.paper?.kind) ?? ("paper" as const),
         }
       : null;
   const reference = reviewing ? png(body.review?.answerImage ?? undefined) : undefined;
@@ -346,9 +348,15 @@ export async function POST(req: Request) {
       : `Problem the student is working on: ${body.problem.trim() || "not stated; infer it from the page"}`,
     weakSpots.length ? `Concepts this student has slipped on before: ${weakSpots.join(", ")}` : "",
     paper
-      ? `Reading the paper "${paper.title}". Pages on screen: ${paper.visible.join(", ") || "none (they are looking at the workspace)"}.` +
+      ? `Reading ${paper.kind === "paper" ? "the paper" : paper.kind === "poem" ? "the poem" : paper.kind === "play" ? "the play" : "the text"} "${paper.title}". Pages on screen: ${paper.visible.join(", ") || "none (they are looking at the workspace)"}.` +
         (paper.truncated ? " Parts of the paper were left out of the text for length; if asked about them, say so and ask the student to scroll there." : "") +
         (paper.pointedAt ? ` The student is pointing at sentence ${paper.pointedAt} in the paper.` : "")
+      : "",
+    (body.models ?? []).length
+      ? `3D models on the page (the last is the newest): ${(body.models ?? [])
+          .slice(-3)
+          .map((m) => `${String(m.title).slice(0, 80)}, showing ${String(m.view).slice(0, 20)}, parts: ${(m.parts ?? []).slice(0, 30).map((x) => String(x).slice(0, 30)).join(", ")}`)
+          .join("; ")}. model_focus and model_view act on the newest.`
       : "",
     `Lines on the page: ${body.lines.map((l) => `${l.id} (${l.tokens} tokens)`).join(", ") || "none yet"}`,
     body.hasPhoto
@@ -366,7 +374,9 @@ export async function POST(req: Request) {
           : "The student tapped to ask for your help."
         : body.trigger === "wrap_up"
           ? "The student is ending the session. Wrap up."
-          : body.trigger === "paper_opened"
+          : body.trigger === "paper_opened" && paper && paper.kind !== "paper"
+            ? `The student just opened this ${paper.kind === "poem" ? "poem" : paper.kind === "play" ? "play" : "text"}. Don't summarise it or say what it means. In two or three short beats: greet it warmly in a few words (its title and author if shown, nothing more), invite a first slow read${paper.kind === "poem" ? ", aloud if they can" : ""}, and ask one open question about their first response: what they notice, feel, or find strange. Point at nothing yet.`
+            : body.trigger === "paper_opened"
             ? "The student just opened this paper. In three to five short beats: the problem it tackles, as a situation they can picture; the paper's key idea and how it works, in its own terms, building one picture of it as you go, one part per beat (usually a scene of who and what is involved, or a diagram if it is a pipeline); then one question that gets them thinking about the idea. Highlight the sentence that states the main contribution as you name it."
           : body.trigger === "watched"
             ? `The student just played the simulation and watched it. What happened: ${String(body.watched ?? "").slice(0, 600)}. Compare it with any prediction they marked or said, and ask them to explain the difference or why it happened.`
@@ -377,7 +387,7 @@ export async function POST(req: Request) {
 
   const started = Date.now();
   const schema = tutorTurnSchema(explaining || paper ? MOVES : allowedMoves(lastRung));
-  const system = [TUTOR_SYSTEM_PROMPT, reviewing ? REVIEW_PROMPT : paper ? PAPER_PROMPT : explaining ? EXPLAIN_PROMPT : ""].filter(Boolean).join("\n\n");
+  const system = [TUTOR_SYSTEM_PROMPT, reviewing ? REVIEW_PROMPT : paper ? (paper.kind === "paper" ? PAPER_PROMPT : LITERATURE_PROMPT) : explaining ? EXPLAIN_PROMPT : ""].filter(Boolean).join("\n\n");
   const cacheKey = `tutor-${createHash("sha256").update(system).update(paper?.text ?? "").digest("hex").slice(0, 32)}`;
   const known = new Set(body.lines.map((l) => l.id));
   // The student closed the page or cut the tutor off: stop writing the turn.
@@ -443,7 +453,7 @@ export async function POST(req: Request) {
               return ctrl.abort();
             }
             checker.strip(beat);
-            if (!beat.say && !beat.write.length && !beat.draw && !beat.highlights.length && !beat.annotations.length) continue;
+            if (!beat.say && !beat.write.length && !beat.draw && !beat.highlights.length && !beat.annotations.length && !beat.model) continue;
           }
           checker.commit(beat);
           sent.push(beat);
@@ -646,7 +656,7 @@ function fallbackTurn(say: string): PublicTurn {
   return {
     move: "ask_plan",
     say,
-    beats: say ? [{ say, write: [], draw: null, continue_figure: false, highlights: [], annotations: [] }] : [],
+    beats: say ? [{ say, write: [], draw: null, continue_figure: false, highlights: [], annotations: [], model: null, model_focus: null, model_view: null }] : [],
     simulate: null,
     skill: { concept: "", evidence: "none" },
     card: null,
@@ -658,6 +668,9 @@ function describeInk(beats: Beat[], simulate: TutorTurn["simulate"]): string {
   const ink = beats.flatMap((b) => [
     ...b.write.map((w) => `wrote "${w}"`),
     ...(b.draw ? [`${b.continue_figure ? "added to the figure: " : ""}${describeFigure(b.draw)}`] : []),
+    ...(b.model ? [`put a ${describeModel(b.model)} on the page`] : []),
+    ...(b.model_focus ? [`lit up ${b.model_focus} on the 3D model`] : []),
+    ...(b.model_view ? [`switched the 3D model to ${b.model_view}`] : []),
     ...b.highlights.map((h) => `${h.kind}ed ${h.ref}${h.note ? ` with margin note "${h.note}"` : ""}`),
     ...b.annotations.map((a) => {
       const where = a.from_token == null ? a.line_id : `${a.line_id} tokens ${a.from_token}-${a.to_token ?? a.from_token}`;
@@ -683,5 +696,10 @@ function describeFigure(f: NonNullable<Beat["draw"]>): string {
     return `drew a scene${f.title ? ` "${f.title}"` : ""}: ${f.things
       .map((t) => `${t.what}${t.count ? ` ×${t.count}` : ""}${t.caption ? ` "${t.caption}"` : ""}${t.says ? ` saying "${t.says}"` : ""} (row ${t.row}, col ${t.col})`)
       .join(", ")}${f.arrows.length ? `; arrows ${f.arrows.map((a) => `${a.from}→${a.to}`).join(", ")}` : ""}${f.marks.length ? `; marked ${f.marks.map((m) => `${m.kind} on ${m.on}${m.note ? ` "${m.note}"` : ""}`).join(", ")}` : ""}`;
+  if (f.kind === "timeline") return `drew a timeline${f.title ? ` "${f.title}"` : ""}: ${f.events.map((e) => `${e.when} ${e.what}`).join(" → ")}`;
+  if (f.kind === "venn")
+    return `drew a Venn diagram of ${f.sets.map((x) => x.label).join(" and ")}: ${f.items.map((i) => `"${i.text}" in ${i.in.length ? i.in.map((k) => f.sets[k]?.label ?? k).join(" & ") : "neither"}`).join(", ")}`;
+  if (f.kind === "tree") return `drew a tree${f.title ? ` "${f.title}"` : ""}: ${f.nodes.map((n) => `${n.text}${n.parent ? ` (under ${n.parent}${n.edge ? `, branch "${n.edge}"` : ""})` : ""}`).join(", ")}`;
+  if (f.kind === "cycle") return `drew a cycle${f.title ? ` "${f.title}"` : ""}: ${f.stages.map((x) => x.text).join(" → ")} → back to the start`;
   return `wrote steps: ${f.lines.map((l) => l.math).join(" ; ")}`;
 }

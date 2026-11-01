@@ -8,6 +8,9 @@ const beat = (say: string, more: Partial<Beat> = {}): Beat => ({
   write: [],
   draw: null,
   continue_figure: false,
+  model: null,
+  model_focus: null,
+  model_view: null,
   highlights: [],
   annotations: [],
   ...more,
@@ -80,7 +83,7 @@ test("the checker reads the student's page against the tutor's reading", () => {
 
 test("beats are held to the turn's limits as they arrive", () => {
   const check = new BeatChecker({ paperText: null, lines: new Set(["L1"]) });
-  const long = check.sanitize(beat("  Here.  ", { write: ["a = 1", "b = 2", "c = 3"], highlights: [{ ref: "p1.s1", kind: "highlight", note: null }] }))!;
+  const long = check.sanitize(beat("  Here.  ", { write: ["a = 1", "b = 2", "c = 3"], highlights: [{ ref: "p1.s1", quote: null, kind: "highlight", note: null }] }))!;
   assert.equal(long.say, "Here.");
   assert.deepEqual(long.write, ["a = 1", "b = 2"], "at most two lines a beat");
   assert.deepEqual(long.highlights, [], "highlights are for papers only");
@@ -99,13 +102,13 @@ test("in paper mode only sentences in the paper can be highlighted", () => {
   const b = check.sanitize(
     beat("They propose a router.", {
       highlights: [
-        { ref: "p1.s1", kind: "highlight", note: "  the main idea  " },
-        { ref: "p9.s9", kind: "underline", note: null },
-        { ref: "made up", kind: "underline", note: null },
+        { ref: "p1.s1", quote: null, kind: "highlight", note: "  the main idea  " },
+        { ref: "p9.s9", quote: null, kind: "underline", note: null },
+        { ref: "made up", quote: null, kind: "underline", note: null },
       ],
     }),
   )!;
-  assert.deepEqual(b.highlights, [{ ref: "p1.s1", kind: "highlight", note: "the main idea" }]);
+  assert.deepEqual(b.highlights, [{ ref: "p1.s1", quote: null, kind: "highlight", note: "the main idea" }]);
 });
 
 test("a slip in the tutor's math is caught across beats, and cut if it comes back", () => {
@@ -144,7 +147,7 @@ test("beside a paper the tutor writes only math or a key term, and never the sam
     beat("Here's their idea.", {
       write: ["small test group → larger community"],
       draw: { kind: "scene", title: "From testing to a populated community", things: [], arrows: [], marks: [] },
-      highlights: [{ ref: "p1.s2", kind: "highlight", note: "the bottleneck" }],
+      highlights: [{ ref: "p1.s2", quote: null, kind: "highlight", note: "the bottleneck" }],
     }),
   )!;
   assert.deepEqual(first.write, [], "a summary line with arrows is left for the drawing");
@@ -152,7 +155,7 @@ test("beside a paper the tutor writes only math or a key term, and never the sam
   const next = check.sanitize(
     beat("They call it this.", {
       write: ["social simulacra = members made up by GPT-3", "a populated community from testing"],
-      highlights: [{ ref: "p1.s1", kind: "underline", note: "a populated community" }],
+      highlights: [{ ref: "p1.s1", quote: null, kind: "underline", note: "a populated community" }],
     }),
   )!;
   assert.deepEqual(next.write, ["social simulacra = members made up by GPT-3"], "a key term is kept, one line a phrase");
@@ -162,9 +165,9 @@ test("beside a paper the tutor writes only math or a key term, and never the sam
 test("beside a paper, one picture a turn and two highlights at most", () => {
   const check = new BeatChecker({ paperText: "[p1.s1] A. [p1.s2] B. [p1.s3] C.", lines: new Set() });
   const scene = { kind: "scene" as const, title: null, things: [], arrows: [], marks: [] };
-  const a = check.sanitize(beat("One.", { draw: scene, highlights: [{ ref: "p1.s1", kind: "highlight", note: null }, { ref: "p1.s2", kind: "highlight", note: null }] }))!;
+  const a = check.sanitize(beat("One.", { draw: scene, highlights: [{ ref: "p1.s1", quote: null, kind: "highlight", note: null }, { ref: "p1.s2", quote: null, kind: "highlight", note: null }] }))!;
   check.commit(a);
-  const b = check.sanitize(beat("Two.", { draw: scene, highlights: [{ ref: "p1.s3", kind: "highlight", note: null }] }))!;
+  const b = check.sanitize(beat("Two.", { draw: scene, highlights: [{ ref: "p1.s3", quote: null, kind: "highlight", note: null }] }))!;
   assert.equal(b.draw, null, "a second picture is left out");
   assert.deepEqual(b.highlights, [], "and a third highlight");
   const c = check.sanitize(beat("More of it.", { draw: scene, continue_figure: true }))!;

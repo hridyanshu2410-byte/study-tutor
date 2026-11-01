@@ -15,7 +15,7 @@ export default function ResetPage() {
   return (
     <main className="auth">
       <form className="auth-card auth-form" onSubmit={submit}>
-        <h1 className="brand">Tutor</h1>
+        <h1 className="brand">CoInk</h1>
         <label>
           New password
           <input name="password" type="password" autoComplete="new-password" minLength={8} required />

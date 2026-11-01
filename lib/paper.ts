@@ -7,9 +7,15 @@ import type { Box } from "./ink.ts";
 
 // A run of text on a page, with its box as fractions of the page (0..1, y down).
 export type TextRun = { str: string; box: Box; eol: boolean };
-export type PaperSentence = { id: string; text: string; boxes: Box[] };
+// `words` (when known) are where each word of the text starts and its box,
+// so one word or phrase can be marked. `line` is a poem's line number.
+export type PaperSentence = { id: string; text: string; boxes: Box[]; words?: { at: number; n: number; box: Box }[]; line?: number };
 export type PaperPage = { n: number; src: string; w: number; h: number; sentences: PaperSentence[] };
-export type Paper = { id: string; title: string; pages: PaperPage[]; pageCount: number };
+// What is being read: a research paper, or literature (a poem, prose such as
+// a story, novel or essay, or a play), which is read in a different way.
+export type DocKind = "paper" | "poem" | "prose" | "play";
+export type Paper = { id: string; title: string; pages: PaperPage[]; pageCount: number; kind?: DocKind; clipped?: boolean };
+export const isLiterature = (kind: DocKind | undefined) => kind === "poem" || kind === "prose" || kind === "play";
 
 const ABBREV = /\b(e\.g|i\.e|et al|etc|vs|Fig|Figs|Eq|Eqs|Sec|Tab|cf|approx|resp|Dr|Mr|Ms|No|Vol|pp|al)\.$/i;
 
@@ -130,7 +136,7 @@ export function mergeLines(boxes: Box[]): Box[] {
 // page, cut to a budget so a long paper stays affordable. Pages the student is
 // looking at are always kept whole.
 export function paperDigest(paper: Paper, budget = 120_000, keep: number[] = []): { text: string; truncated: boolean } {
-  const pageText = (p: PaperPage) => `\n=== Page ${p.n} ===\n` + p.sentences.map((s) => `[${s.id}] ${s.text}`).join("\n");
+  const pageText = (p: PaperPage) => `\n=== Page ${p.n} ===\n` + p.sentences.map((s) => `[${s.id}]${s.line ? ` (line ${s.line})` : ""} ${s.text}`).join("\n");
   const pages = paper.pages.map((p) => ({ n: p.n, text: pageText(p) }));
   let used = pages.filter((p) => keep.includes(p.n)).reduce((n, p) => n + p.text.length, 0);
   let truncated = paper.pageCount > paper.pages.length;
@@ -143,7 +149,8 @@ export function paperDigest(paper: Paper, budget = 120_000, keep: number[] = [])
     truncated = true;
     return `\n=== Page ${p.n} === (left out for length)`;
   });
-  return { text: `Title: ${paper.title}\n${kept.join("\n")}`, truncated };
+  const what = paper.kind === "poem" ? "Poem" : paper.kind === "play" ? "Play" : paper.kind === "prose" ? "Prose" : "Paper";
+  return { text: `${what}: ${paper.title}\n${kept.join("\n")}`, truncated: truncated || !!paper.clipped };
 }
 
 // A best guess at the title: the largest text near the top of page one.
@@ -166,4 +173,41 @@ export function findSentence(paper: Paper, id: string): { page: PaperPage; sente
   const page = m ? paper.pages.find((p) => p.n === Number(m[1])) : undefined;
   const sentence = page?.sentences.find((s) => s.id === id);
   return page && sentence ? { page, sentence } : null;
+}
+
+// The boxes of one word or phrase inside a sentence, to mark just that. Exact
+// when the words' places are known; otherwise estimated from where its
+// letters fall along the sentence's lines. Null when the phrase isn't there.
+export function phraseBoxes(s: PaperSentence, quote: string): Box[] | null {
+  const norm = (t: string) => t.toLowerCase().replace(/[‘’]/g, "'").replace(/[“”]/g, '"');
+  const q = norm(quote.trim().replace(/^["'“‘]+|["'”’.,;:!?]+$/g, ""));
+  if (!q) return null;
+  const text = norm(s.text);
+  const from = text.indexOf(q);
+  if (from < 0) return null;
+  const to = from + q.length;
+  if (s.words?.length) {
+    const hit = s.words.filter((w) => w.at < to && w.at + w.n > from);
+    if (!hit.length) return null;
+    // trim the first and last word to the phrase when it starts or ends inside them
+    return mergeLines(
+      hit.map((w, i) => {
+        const a = i === 0 ? Math.max(0, from - w.at) / w.n : 0;
+        const b = i === hit.length - 1 ? Math.min(w.n, to - w.at) / w.n : 1;
+        return { ...w.box, x: w.box.x + w.box.w * a, w: w.box.w * Math.max(0.15, b - a) };
+      }),
+    );
+  }
+  // estimate: spread the sentence's letters along its boxes in order
+  const total = s.boxes.reduce((n, b) => n + b.w, 0) || 1;
+  const perChar = total / Math.max(1, s.text.length);
+  const out: Box[] = [];
+  let pos = 0;
+  for (const b of s.boxes) {
+    const chars = b.w / perChar;
+    const a = Math.max(from, pos), e = Math.min(to, pos + chars);
+    if (e > a) out.push({ ...b, x: b.x + (a - pos) * perChar, w: (e - a) * perChar });
+    pos += chars;
+  }
+  return out.length ? out : null;
 }

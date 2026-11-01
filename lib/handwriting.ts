@@ -7,6 +7,7 @@ import { spanBox, unionBox } from "./ink.ts";
 import hand from "./tutor-hand/kalam.json" with { type: "json" };
 import { drawFigure, extendFigure, figureRoom, type FigureLayout } from "./figures.ts";
 import type { Figure } from "./figure-schema.ts";
+import { isMath, layoutMath, type MathBox } from "./math-ink.ts";
 
 // `w` is the pen's width for the stroke, thinner for small writing.
 export type PenStroke = { points: [number, number][]; start: number; end: number; w?: number };
@@ -40,6 +41,7 @@ export type Annotation = {
 
 type Font = { xHeight: number; capHeight: number; glyphs: Record<string, { w: number; s: number[][] }> };
 const font = hand as Font;
+addSymbols(font);
 
 // ---------- randomness that is stable for a given seed ----------
 export function seeded(seed: number) {
@@ -205,6 +207,11 @@ const ALIAS: Record<string, string> = {
   "‐": "-", "‑": "-", "∙": "·", "⋅": "·", "∗": "*", "⟶": "→", "⟹": "⇒", "⟺": "⇔", "≡": "=", "∼": "~", "≅": "≈",
   "ϵ": "ε", "∘": "°", "⊆": "⊂", "ℓ": "l", "ℝ": "R", "ℕ": "N", "ℤ": "Z", "ℚ": "Q", "ℂ": "C", "⟨": "<", "⟩": ">",
   "∣": "|", "∥": "|", "⁄": "/", "∕": "/", "⋯": "…", "✓": "√", "\u00a0": " ",
+  "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O", "Ρ": "P", "Τ": "T",
+  "Υ": "Y", "Χ": "X", "ϕ": "φ", "ϑ": "θ", "ς": "σ", "ι": "i", "ο": "o", "υ": "u", "µ": "μ", "ϱ": "ρ", "ϖ": "π",
+  "⟂": "⊥", "⇄": "⇌", "⇆": "⇌", "⟷": "↔", "⟼": "↦", "⟸": "⇐", "⟵": "←", "⇢": "→", "➝": "→", "➔": "→", "×": "×",
+  "∶": ":", "″": "″", "‴": "″", "∡": "∠", "⦟": "∠", "▵": "△", "∆": "Δ", "Ø": "∅", "ø": "∅", "⨯": "×", "✕": "×",
+  "⊂": "⊂", "∁": "C", "℘": "p", "♯": "#", "♭": "b", "□": "[", "◻": "[", "▢": "[",
 };
 // Anything else falls back to its plain letter (é to e), or to a gap.
 const glyph = (ch: string) =>
@@ -258,7 +265,12 @@ function reversePoints(flat: number[]): number[] {
 const ROOT_TOP = Math.max(...(font.glyphs["√"]?.s ?? [[0, 0]]).flatMap((st) => st.filter((_, k) => k % 2 === 1)));
 const ROOT_W = Math.max(font.glyphs["√"]?.w ?? 0, ...(font.glyphs["√"]?.s ?? [[0, 0]]).flatMap((st) => st.filter((_, k) => k % 2 === 0)).map((x) => x + 16));
 
-export function measureText(text: string, size: number): number {
+// Characters written as two: °C, ½-style fractions the hand lacks, ligatures.
+const EXPAND: Record<string, string> = { "℃": "°C", "℉": "°F", "Ω": "Ω", "⅓": "1/3", "⅔": "2/3", "⅛": "1/8", "ﬁ": "fi", "ﬂ": "fl", "№": "No", "™": "TM", "∛": "³√", "∜": "⁴√" };
+const expand = (t: string) => (/[℃℉⅓⅔⅛ﬁﬂ№™∛∜]/.test(t) ? [...t].map((c) => EXPAND[c] ?? c).join("") : t);
+
+function measurePlain(text: string, size: number): number {
+  text = expand(text);
   const scale = size / font.capHeight;
   let w = 0;
   for (const ch of text) w += advance(ch) * scale * (ch === " " ? SPACE : TRACK);
@@ -268,7 +280,8 @@ export function measureText(text: string, size: number): number {
 // Writes glyph by glyph the way a hand does: the baseline wanders, letters
 // vary a little in size, slope and spacing, each word leans its own way, and
 // the pen travels in the air between strokes, pausing longer between words.
-export function write(pen: Pen, text: string, x: number, baseline: number, size: number, rng: Rng) {
+function writePlain(pen: Pen, text: string, x: number, baseline: number, size: number, rng: Rng) {
+  text = expand(text);
   const scale = size / font.capHeight;
   const width = pen.width;
   pen.width = penWidth(size);
@@ -314,7 +327,7 @@ export function write(pen: Pen, text: string, x: number, baseline: number, size:
       if (under) {
         // the bar, in the same movement, from the top of the long arm
         const [tx, ty] = pts.reduce((a, b) => (b[1] < a[1] ? b : a));
-        const end = cursor + advance(ch) * scale * TRACK + measureText(under, size) + size * 0.08;
+        const end = cursor + advance(ch) * scale * TRACK + measurePlain(under, size) + size * 0.08;
         const tilt = jitter(rng, size * 0.04);
         pts.splice(pts.findIndex((p) => p[0] === tx && p[1] === ty) + 1);
         for (let k = 1; k <= 6; k++) pts.push([tx + ((end - tx) * k) / 6, ty + (tilt * k) / 6]);
@@ -330,8 +343,202 @@ export function write(pen: Pen, text: string, x: number, baseline: number, size:
   pen.width = width;
 }
 
+// ---------- math, laid out like a board ----------
+// How a run of the hand's letters measures: its width, and how far its
+// strokes reach above and below the baseline.
+function glyphMetrics(text: string, size: number) {
+  const scale = size / font.capHeight;
+  let top = 0, bottom = 0;
+  for (const ch of text) {
+    const mini = small(ch);
+    const g = mini?.g ?? glyph(ch);
+    const k = mini?.k ?? 1;
+    const dy = mini ? mini.dy : 0;
+    for (const st of g.s)
+      for (let i = 1; i < st.length; i += 2) {
+        const y = st[i] * k + dy;
+        if (y > top) top = y;
+        if (y < bottom) bottom = y;
+      }
+  }
+  return { w: measurePlain(text, size), asc: Math.max(top, font.xHeight * 0.6) * scale, desc: Math.max(-bottom, 0) * scale };
+}
+
+const layouts = new Map<string, MathBox>();
+function mathBox(text: string, size: number): MathBox {
+  const key = `${size.toFixed(2)}|${text}`;
+  let box = layouts.get(key);
+  if (!box) {
+    box = layoutMath(text, size, glyphMetrics);
+    if (layouts.size > 400) layouts.clear();
+    layouts.set(key, box);
+  }
+  return box;
+}
+
+// How far a piece of writing reaches above and below its baseline.
+export function textExtent(text: string, size: number): { w: number; asc: number; desc: number } {
+  if (isMath(text)) {
+    const b = mathBox(text, size);
+    return { w: b.w, asc: b.asc, desc: b.desc };
+  }
+  return glyphMetrics(text, size);
+}
+
+export function measureText(text: string, size: number): number {
+  return isMath(text) ? mathBox(text, size).w : measurePlain(text, size);
+}
+
+// Writes plain words with the hand, or math (TeX, or $...$ in words) laid
+// out in two dimensions: numerator, bar, denominator; a root's tick, arm and
+// bar, then what is under it; a bracket, what it holds, the closing bracket.
+export function write(pen: Pen, text: string, x: number, baseline: number, size: number, rng: Rng) {
+  if (!isMath(text)) return writePlain(pen, text, x, baseline, size, rng);
+  const box = mathBox(text, size);
+  const width = pen.width;
+  for (const it of box.items) {
+    if (it.t === "text") {
+      writePlain(pen, it.s, x + it.x, baseline + it.y, it.size, rng);
+      continue;
+    }
+    pen.width = penWidth(size) * 0.95;
+    const pts = it.pts.map(([px, py]) => [x + px + jitter(rng, 0.6), baseline + py + jitter(rng, 0.6)] as [number, number]);
+    pen.lift(50 + rng() * 40);
+    pen.draw(pts, 1.4);
+    pen.width = width;
+  }
+  pen.lift(60);
+}
+
+// ---------- symbols the traced hand doesn't have ----------
+// Built from the pen's own strokes (lines, arcs) and from letters it has,
+// so they sit in the same hand: set symbols, logic, geometry, chemistry arrows,
+// double-struck letters and the Greek capitals Kalam lacks.
+function addSymbols(f: Font) {
+  const C = f.capHeight;
+  const g = f.glyphs;
+  const arc = (cx: number, cy: number, rx: number, ry: number, a0: number, a1: number, n = 24) => {
+    const out: number[] = [];
+    for (let i = 0; i <= n; i++) {
+      const a = a0 + ((a1 - a0) * i) / n;
+      out.push(cx + Math.cos(a) * rx, cy + Math.sin(a) * ry);
+    }
+    return out;
+  };
+  const copy = (ch: string, dx = 0, dy = 0, sx = 1, sy = 1): number[][] =>
+    (g[ch]?.s ?? []).map((st) => st.map((v, i) => (i % 2 === 0 ? v * sx + dx : v * sy + dy)));
+  const ext = (ch: string) => {
+    const xs = (g[ch]?.s ?? []).flatMap((st) => st.filter((_, i) => i % 2 === 0));
+    const ys = (g[ch]?.s ?? []).flatMap((st) => st.filter((_, i) => i % 2 === 1));
+    return { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
+  };
+  const put = (ch: string, w: number, s: number[][]) => {
+    if (!g[ch] && s.length && s.every((st) => st.length >= 4)) g[ch] = { w, s };
+  };
+  const ring = (cx: number, cy: number, r: number) => arc(cx, cy, r, r, Math.PI * 0.6, Math.PI * 2.65, 28);
+  const dotAt = (x: number, y: number) => [x, y, x + C * 0.02, y + C * 0.02];
+  const head = (x: number, y: number, ang: number, len = C * 0.22) => [
+    x - len * Math.cos(ang - 0.5), y - len * Math.sin(ang - 0.5), x, y, x - len * Math.cos(ang + 0.5), y - len * Math.sin(ang + 0.5),
+  ];
+  const mid = C * 0.42;
+
+  put("∅", C * 0.95, [ring(C * 0.47, C * 0.45, C * 0.4), [C * 0.1, -C * 0.12, C * 0.84, C * 1.02]]);
+  put("∠", C * 1.05, [[C * 0.85, C * 0.9, C * 0.08, 0, C * 0.95, 0]]);
+  put("⊥", C * 0.95, [[C * 0.47, C * 0.95, C * 0.47, 0], [C * 0.06, 0, C * 0.88, 0]]);
+  put("⊤", C * 0.95, [[C * 0.06, C * 0.95, C * 0.88, C * 0.95], [C * 0.47, C * 0.95, C * 0.47, 0]]);
+  put("∥", C * 0.75, [[C * 0.22, C, C * 0.22, -C * 0.1], [C * 0.5, C, C * 0.5, -C * 0.1]]);
+  put("‖", C * 0.75, [[C * 0.22, C, C * 0.22, -C * 0.1], [C * 0.5, C, C * 0.5, -C * 0.1]]);
+  put("△", C * 1.0, [[C * 0.08, 0, C * 0.5, C * 0.9, C * 0.92, 0, C * 0.06, 0.02 * C]]);
+  put("∴", C * 0.9, [dotAt(C * 0.42, C * 0.7), dotAt(C * 0.14, C * 0.08), dotAt(C * 0.72, C * 0.08)]);
+  put("∵", C * 0.9, [dotAt(C * 0.14, C * 0.7), dotAt(C * 0.72, C * 0.7), dotAt(C * 0.42, C * 0.08)]);
+  put("⋮", C * 0.5, [dotAt(C * 0.22, C * 0.85), dotAt(C * 0.22, C * 0.47), dotAt(C * 0.22, C * 0.09)]);
+  put("⋱", C * 0.9, [dotAt(C * 0.12, C * 0.85), dotAt(C * 0.42, C * 0.47), dotAt(C * 0.72, C * 0.09)]);
+  put("⋯", C * 1.1, [dotAt(C * 0.15, mid), dotAt(C * 0.5, mid), dotAt(C * 0.85, mid)]);
+  put("≡", C * 0.9, [[C * 0.08, C * 0.66, C * 0.8, C * 0.66], [C * 0.08, mid, C * 0.8, mid], [C * 0.08, C * 0.18, C * 0.8, C * 0.18]]);
+  put("⇌", C * 1.2, [
+    [C * 0.06, C * 0.56, C * 1.08, C * 0.56, C * 0.84, C * 0.76],
+    [C * 1.08, C * 0.3, C * 0.06, C * 0.3, C * 0.3, C * 0.1],
+  ]);
+  put("↔", C * 1.25, [[C * 0.08, mid, C * 1.12, mid], head(C * 1.12, mid, 0), head(C * 0.08, mid, Math.PI)]);
+  put("↦", C * 1.15, [[C * 0.08, mid + C * 0.2, C * 0.08, mid - C * 0.2], [C * 0.08, mid, C * 1.02, mid], head(C * 1.02, mid, 0)]);
+  put("↗", C * 0.95, [[C * 0.1, C * 0.05, C * 0.82, C * 0.85], head(C * 0.82, C * 0.85, Math.PI / 4)]);
+  put("↘", C * 0.95, [[C * 0.1, C * 0.85, C * 0.82, C * 0.05], head(C * 0.82, C * 0.05, -Math.PI / 4)]);
+  if (g["⇒"]) put("⇐", g["⇒"].w, copy("⇒", ext("⇒").x0 + ext("⇒").x1, 0, -1, 1));
+  if (g["<"]) {
+    const w = g["<"].w;
+    put("≪", w * 1.3, [...copy("<", 0, C * 0.05, 0.8, 0.8), ...copy("<", w * 0.45, C * 0.05, 0.8, 0.8)]);
+  }
+  if (g[">"]) {
+    const w = g[">"].w;
+    put("≫", w * 1.3, [...copy(">", 0, C * 0.05, 0.8, 0.8), ...copy(">", w * 0.45, C * 0.05, 0.8, 0.8)]);
+  }
+  if (g["±"]) {
+    const e = ext("±");
+    put("∓", g["±"].w, copy("±", 0, e.y0 + e.y1, 1, -1));
+  }
+  if (g["⊂"]) {
+    const e = ext("⊂");
+    put("⊃", g["⊂"].w, copy("⊂", e.x0 + e.x1, 0, -1, 1));
+    put("⊆", g["⊂"].w, [...copy("⊂", 0, C * 0.2, 1, 0.82), [e.x0, C * 0.02, e.x1, C * 0.02]]);
+    put("⊇", g["⊂"].w, [...copy("⊂", e.x0 + e.x1, C * 0.2, -1, 0.82), [e.x0, C * 0.02, e.x1, C * 0.02]]);
+    put("⊄", g["⊂"].w, [...copy("⊂"), [e.x0 + (e.x1 - e.x0) * 0.25, -C * 0.1, e.x0 + (e.x1 - e.x0) * 0.75, C * 0.95]]);
+  }
+  if (g["∈"]) {
+    const e = ext("∈");
+    put("∋", g["∈"].w, copy("∈", e.x0 + e.x1, 0, -1, 1));
+    put("∉", g["∈"].w, [...copy("∈"), [e.x0 + (e.x1 - e.x0) * 0.2, -C * 0.12, e.x0 + (e.x1 - e.x0) * 0.8, C * 0.9]]);
+  }
+  put("⊕", C * 0.95, [ring(C * 0.47, mid, C * 0.36), [C * 0.11, mid, C * 0.83, mid], [C * 0.47, mid + C * 0.36, C * 0.47, mid - C * 0.36]]);
+  put("⊗", C * 0.95, [ring(C * 0.47, mid, C * 0.36), [C * 0.22, mid + C * 0.25, C * 0.72, mid - C * 0.25], [C * 0.22, mid - C * 0.25, C * 0.72, mid + C * 0.25]]);
+  put("⊙", C * 0.95, [ring(C * 0.47, mid, C * 0.36), dotAt(C * 0.47, mid)]);
+  put("∘", C * 0.55, [ring(C * 0.27, mid, C * 0.15)]);
+  if (g["∫"]) {
+    const w = g["∫"].w;
+    put("∬", w * 1.45, [...copy("∫"), ...copy("∫", w * 0.45)]);
+    put("∭", w * 1.9, [...copy("∫"), ...copy("∫", w * 0.45), ...copy("∫", w * 0.9)]);
+    const e = ext("∫");
+    put("∮", w, [...copy("∫"), ring((e.x0 + e.x1) / 2, (e.y0 + e.y1) / 2, C * 0.2)]);
+  }
+  if (g["∏"]) {
+    const e = ext("∏");
+    put("∐", g["∏"].w, copy("∏", 0, e.y0 + e.y1, 1, -1));
+  }
+  if (g["h"]) put("ℏ", g["h"].w, [...copy("h"), [ext("h").x0 - C * 0.05, C * 0.72, ext("h").x0 + C * 0.42, C * 0.86]]);
+  for (const [bb, L] of [["ℝ", "R"], ["ℕ", "N"], ["ℙ", "P"], ["ℤ", "Z"], ["ℚ", "Q"], ["ℂ", "C"]] as const) {
+    if (!g[L]) continue;
+    const e = ext(L);
+    const extra = L === "Z" ? [e.x1 - C * 0.12, e.y1, e.x0 + C * 0.02, e.y0] : L === "Q" || L === "C" ? [e.x0 + C * 0.2, e.y1 - C * 0.14, e.x0 + C * 0.2, e.y0 + C * 0.14] : [e.x0 + C * 0.2, e.y1, e.x0 + C * 0.2, e.y0];
+    put(bb, g[L].w, [...copy(L), extra]);
+  }
+  put("Γ", C * 0.85, [[C * 0.15, 0, C * 0.15, C, C * 0.78, C]]);
+  put("Π", C * 1.0, [[C * 0.08, C, C * 0.9, C], [C * 0.22, C, C * 0.22, 0], [C * 0.76, C, C * 0.76, 0]]);
+  put("Λ", C * 0.95, [[C * 0.05, 0, C * 0.47, C, C * 0.89, 0]]);
+  put("Ξ", C * 0.9, [[C * 0.08, C, C * 0.8, C], [C * 0.18, mid + C * 0.08, C * 0.7, mid + C * 0.08], [C * 0.08, 0, C * 0.8, 0]]);
+  if (g["O"]) {
+    const e = ext("O");
+    put("Θ", g["O"].w, [...copy("O"), [e.x0 + C * 0.14, (e.y0 + e.y1) / 2, e.x1 - C * 0.14, (e.y0 + e.y1) / 2]]);
+  }
+  put("⌊", C * 0.55, [[C * 0.2, C, C * 0.2, -C * 0.1, C * 0.5, -C * 0.1]]);
+  put("⌋", C * 0.55, [[C * 0.35, C, C * 0.35, -C * 0.1, C * 0.05, -C * 0.1]]);
+  put("⌈", C * 0.55, [[C * 0.5, C, C * 0.2, C, C * 0.2, -C * 0.1]]);
+  put("⌉", C * 0.55, [[C * 0.05, C, C * 0.35, C, C * 0.35, -C * 0.1]]);
+  put("⟨", C * 0.5, [[C * 0.38, C, C * 0.1, mid, C * 0.38, -C * 0.12]]);
+  put("⟩", C * 0.5, [[C * 0.1, C, C * 0.38, mid, C * 0.1, -C * 0.12]]);
+  put("†", C * 0.7, [[C * 0.33, C, C * 0.33, -C * 0.15], [C * 0.08, C * 0.68, C * 0.58, C * 0.68]]);
+  put("‡", C * 0.7, [[C * 0.33, C, C * 0.33, -C * 0.15], [C * 0.08, C * 0.72, C * 0.58, C * 0.72], [C * 0.08, C * 0.2, C * 0.58, C * 0.2]]);
+  put("⊢", C * 0.85, [[C * 0.12, C, C * 0.12, 0], [C * 0.12, mid, C * 0.75, mid]]);
+  put("⊨", C * 0.85, [[C * 0.12, C, C * 0.12, 0], [C * 0.12, mid + C * 0.14, C * 0.75, mid + C * 0.14], [C * 0.12, mid - C * 0.14, C * 0.75, mid - C * 0.14]]);
+  put("∖", C * 0.7, [[C * 0.08, C, C * 0.62, -C * 0.05]]);
+  put("⊙", C * 0.95, [ring(C * 0.47, mid, C * 0.36), dotAt(C * 0.47, mid)]);
+  put("ℵ", C * 0.95, [[C * 0.12, C * 0.95, C * 0.82, 0], [C * 0.75, C * 0.95, C * 0.62, C * 0.5], [C * 0.3, C * 0.45, C * 0.18, 0]]);
+  if (g["="] && g[":"]) put("≔", g["="].w + g[":"].w * 0.7, [...copy(":", 0, 0), ...copy("=", g[":"].w * 0.6, 0)]);
+  if (g["≈"]) put("≃", g["≈"].w, [...copy("≈", 0, C * 0.08, 1, 0.6), [ext("≈").x0, C * 0.12, ext("≈").x1, C * 0.12]]);
+  if (g["~"]) put("≅", g["~"].w, [...copy("~", 0, C * 0.25), [ext("~").x0, C * 0.32, ext("~").x1, C * 0.32], [ext("~").x0, C * 0.12, ext("~").x1, C * 0.12]]);
+  if (g["√"]) put("✓", g["√"].w, copy("√", 0, 0, 1, 0.7));
+}
+
 // ---------- a whole turn ----------
-export type Mark = { boxes: Box[]; kind: "highlight" | "underline"; note: string | null; edge: number };
+export type Mark = { boxes: Box[]; kind: "highlight" | "underline" | "circle"; note: string | null; edge: number };
 
 export type PlanOptions = {
   // Lines of math the tutor writes in its own space, below everything on the page.
@@ -444,6 +651,16 @@ export class TurnPlanner {
     return { x: left + jitter(this.rng, 6), y: bottom + this.size * 1.1 };
   }
 
+  // Holds a free spot w × h for something that isn't ink (a 3D model), placed
+  // as a figure would be, so this turn's later ink keeps clear of it.
+  reserve(w: number, h: number): Box {
+    const at = this.spot(w, h);
+    const box = { x: at.x, y: at.y, w, h };
+    this.occupied.push(box);
+    this.parts.push(box);
+    return box;
+  }
+
   plan(ink: BeatInk): PenPlan {
     const rng = this.rng;
     const size = this.size;
@@ -496,6 +713,12 @@ export class TurnPlanner {
     for (const m of ink.marks ?? []) {
       if (!m.boxes.length) continue;
       pen.lift(pen.t ? 200 : 0);
+      if (m.kind === "circle") {
+        // a loop round the word itself, a little tighter than round a student's line
+        pen.width = penWidth(size);
+        const u = m.boxes.reduce(unionBox);
+        circle(pen, { x: u.x + 6, y: u.y + 4, w: Math.max(4, u.w - 12), h: Math.max(4, u.h - 8) }, rng);
+      }
       if (!m.note?.trim() || !col) continue;
       const u = m.boxes.reduce(unionBox);
       const rows = wrapWords(m.note.trim(), size, lane);
