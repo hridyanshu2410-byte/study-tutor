@@ -538,7 +538,7 @@ function addSymbols(f: Font) {
 }
 
 // ---------- a whole turn ----------
-export type Mark = { boxes: Box[]; kind: "highlight" | "underline"; note: string | null; edge: number };
+export type Mark = { boxes: Box[]; kind: "highlight" | "underline" | "circle"; note: string | null; edge: number };
 
 export type PlanOptions = {
   // Lines of math the tutor writes in its own space, below everything on the page.
@@ -703,6 +703,12 @@ export class TurnPlanner {
     for (const m of ink.marks ?? []) {
       if (!m.boxes.length) continue;
       pen.lift(pen.t ? 200 : 0);
+      if (m.kind === "circle") {
+        // a loop round the word itself, a little tighter than round a student's line
+        pen.width = penWidth(size);
+        const u = m.boxes.reduce(unionBox);
+        circle(pen, { x: u.x + 6, y: u.y + 4, w: Math.max(4, u.w - 12), h: Math.max(4, u.h - 8) }, rng);
+      }
       if (!m.note?.trim() || !col) continue;
       const u = m.boxes.reduce(unionBox);
       const rows = wrapWords(m.note.trim(), size, lane);

@@ -7,7 +7,7 @@ import { zodResponseFormat } from "openai/helpers/zod";
 import { adminClient, createClient } from "@/lib/supabase/server";
 import { researchMode } from "@/lib/supabase/env";
 import { conditionOf, dailyTutorLimit, startOfUtcDay, type Condition } from "@/lib/study";
-import { allowedMoves, EXPLAIN_PROMPT, LADDER, MOVES, PAPER_PROMPT, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, tutorTurnSchema, type Beat, type PublicTurn, type TurnEnd, type TutorRequest, type TutorTurn } from "@/lib/tutor";
+import { allowedMoves, EXPLAIN_PROMPT, LADDER, LITERATURE_PROMPT, MOVES, PAPER_PROMPT, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, tutorTurnSchema, type Beat, type PublicTurn, type TurnEnd, type TutorRequest, type TutorTurn } from "@/lib/tutor";
 import { BeatChecker, readingFlag, TurnScanner } from "@/lib/turn-stream";
 
 // The tutor runs on Claude when ANTHROPIC_API_KEY is set, otherwise on OpenAI
@@ -321,6 +321,7 @@ export async function POST(req: Request) {
           truncated: Boolean(body.paper.truncated) || body.paper.text.length > 160_000,
           visible: (Array.isArray(body.paper.visiblePages) ? body.paper.visiblePages : []).filter(Number.isInteger).slice(0, 6),
           pointedAt: typeof body.paper.pointedAt === "string" && /^p\d+\.s\d+$/.test(body.paper.pointedAt) ? body.paper.pointedAt : null,
+          kind: (["poem", "prose", "play"] as const).find((k) => k === body.paper?.kind) ?? ("paper" as const),
         }
       : null;
   const reference = reviewing ? png(body.review?.answerImage ?? undefined) : undefined;
@@ -346,7 +347,7 @@ export async function POST(req: Request) {
       : `Problem the student is working on: ${body.problem.trim() || "not stated; infer it from the page"}`,
     weakSpots.length ? `Concepts this student has slipped on before: ${weakSpots.join(", ")}` : "",
     paper
-      ? `Reading the paper "${paper.title}". Pages on screen: ${paper.visible.join(", ") || "none (they are looking at the workspace)"}.` +
+      ? `Reading ${paper.kind === "paper" ? "the paper" : paper.kind === "poem" ? "the poem" : paper.kind === "play" ? "the play" : "the text"} "${paper.title}". Pages on screen: ${paper.visible.join(", ") || "none (they are looking at the workspace)"}.` +
         (paper.truncated ? " Parts of the paper were left out of the text for length; if asked about them, say so and ask the student to scroll there." : "") +
         (paper.pointedAt ? ` The student is pointing at sentence ${paper.pointedAt} in the paper.` : "")
       : "",
@@ -366,7 +367,9 @@ export async function POST(req: Request) {
           : "The student tapped to ask for your help."
         : body.trigger === "wrap_up"
           ? "The student is ending the session. Wrap up."
-          : body.trigger === "paper_opened"
+          : body.trigger === "paper_opened" && paper && paper.kind !== "paper"
+            ? `The student just opened this ${paper.kind === "poem" ? "poem" : paper.kind === "play" ? "play" : "text"}. Don't summarise it or say what it means. In two or three short beats: greet it warmly in a few words (its title and author if shown, nothing more), invite a first slow read${paper.kind === "poem" ? ", aloud if they can" : ""}, and ask one open question about their first response: what they notice, feel, or find strange. Point at nothing yet.`
+            : body.trigger === "paper_opened"
             ? "The student just opened this paper. In three to five short beats: the problem it tackles, as a situation they can picture; the paper's key idea and how it works, in its own terms, building one picture of it as you go, one part per beat (usually a scene of who and what is involved, or a diagram if it is a pipeline); then one question that gets them thinking about the idea. Highlight the sentence that states the main contribution as you name it."
           : body.trigger === "watched"
             ? `The student just played the simulation and watched it. What happened: ${String(body.watched ?? "").slice(0, 600)}. Compare it with any prediction they marked or said, and ask them to explain the difference or why it happened.`
@@ -377,7 +380,7 @@ export async function POST(req: Request) {
 
   const started = Date.now();
   const schema = tutorTurnSchema(explaining || paper ? MOVES : allowedMoves(lastRung));
-  const system = [TUTOR_SYSTEM_PROMPT, reviewing ? REVIEW_PROMPT : paper ? PAPER_PROMPT : explaining ? EXPLAIN_PROMPT : ""].filter(Boolean).join("\n\n");
+  const system = [TUTOR_SYSTEM_PROMPT, reviewing ? REVIEW_PROMPT : paper ? (paper.kind === "paper" ? PAPER_PROMPT : LITERATURE_PROMPT) : explaining ? EXPLAIN_PROMPT : ""].filter(Boolean).join("\n\n");
   const cacheKey = `tutor-${createHash("sha256").update(system).update(paper?.text ?? "").digest("hex").slice(0, 32)}`;
   const known = new Set(body.lines.map((l) => l.id));
   // The student closed the page or cut the tutor off: stop writing the turn.

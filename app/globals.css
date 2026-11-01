@@ -506,3 +506,16 @@ button.danger-solid { background: #b91c1c; color: #fff; }
   .palette-rule { width: 1px; height: 24px; margin: 0 4px; }
 }
 .page.tool-line, .page.tool-arrow, .page.tool-rect, .page.tool-ellipse { cursor: crosshair; }
+
+/* ---------- read dialog ---------- */
+
+.read-dialog { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: rgba(15, 23, 42, 0.28); padding: 16px; }
+.read-dialog form { width: min(560px, 100%); max-height: calc(100vh - 32px); overflow: auto; background: #fff; border-radius: 16px; padding: 22px; box-shadow: 0 20px 60px rgba(15, 23, 42, 0.25); display: flex; flex-direction: column; gap: 12px; }
+.read-dialog h2 { margin: 0; font-family: var(--font-tutor), cursive; font-weight: 400; font-size: 30px; color: var(--tutor); }
+.read-dialog .quiet { margin: 0; color: var(--quiet); font-size: 14px; line-height: 1.45; }
+.read-dialog label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--quiet); }
+.read-dialog input, .read-dialog select, .read-dialog textarea { font: inherit; font-size: 15px; color: var(--ink); padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+.read-dialog textarea { font-family: Georgia, "Times New Roman", serif; line-height: 1.5; resize: vertical; }
+.read-actions { display: flex; gap: 8px; align-items: center; }
+.read-actions .spacer { flex: 1; }
+.read-actions .primary { background: #1f2a44; color: #fff; border-color: #1f2a44; }

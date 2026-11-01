@@ -40,8 +40,9 @@ import AccountMenu from "./AccountMenu";
 import { flushCloud, loadCloud, logEvent, saveCloud, type Account } from "@/lib/cloud";
 import { picturesFrom, type PageImage } from "@/lib/photo";
 import { drawSim, playButton, runSeconds, SIM_H, SIM_W, simResult, type PageSim } from "@/lib/sims";
-import { findSentence, paperDigest, type Paper } from "@/lib/paper";
+import { findSentence, isLiterature, paperDigest, phraseBoxes, type DocKind, type Paper } from "@/lib/paper";
 import { openPaper } from "@/lib/paper-pdf";
+import { typesetText } from "@/lib/text-doc";
 import { deletePaper, loadPaper, savePaper } from "@/lib/paper-store";
 import { reportHtml, reportStats, reportTitle, type JournalEntry, type ReportAnalysis, type ReportRequest, type SessionReport } from "@/lib/session-report";
 import { deleteReport, loadReports, saveReport } from "@/lib/report-store";
@@ -196,6 +197,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const [paperTitle, setPaperTitle] = useState<string | null>(null);
   const [opening, setOpening] = useState<string | null>(null);
   const paperInput = useRef<HTMLInputElement>(null);
+  // The "Read" dialog: paste a poem or passage, or pick a PDF or text file.
+  const [reading, setReading] = useState<{ title: string; text: string; kind: DocKind | "auto" } | null>(null);
   const [importing, setImporting] = useState(false);
   const photoInput = useRef<HTMLInputElement>(null);
   const { memory, memoryRef, update: updateMemory, storageFull, loaded } = useStudyMemory(account);
@@ -548,6 +551,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
                   truncated: paper.current.digest.truncated,
                   visiblePages: visiblePages(),
                   pointedAt: trigger === "pause" ? null : sentenceAt(),
+                  kind: paper.current.data.kind ?? "paper",
                 }
               : null,
             lines: lines.map((l) => ({ id: l.id, tokens: l.tokens.length })),
@@ -741,7 +745,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       const found = paper.current ? findSentence(paper.current.data, h.ref) : null;
       const at = found ? paperPage(found.page.n) : null;
       if (!found || !at) return [];
-      const boxes = found.sentence.boxes.map((b) => ({ x: at.x + b.x * at.w - 2, y: at.y + b.y * at.h - 1, w: b.w * at.w + 4, h: b.h * at.h + 2 }));
+      // just the word or phrase it names, when it names one
+      const exact = h.quote ? phraseBoxes(found.sentence, h.quote) : null;
+      const boxes = (exact ?? found.sentence.boxes).map((b) => ({ x: at.x + b.x * at.w - 2, y: at.y + b.y * at.h - 1, w: b.w * at.w + 4, h: b.h * at.h + 2 }));
       return boxes.length ? [{ boxes, kind: h.kind, note: h.note, edge: at.x + at.w }] : [];
     });
     const plan = s.planner.plan({
@@ -1829,15 +1835,25 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
   // Study a paper: its pages go down the left, the workspace is to the right,
   // and the tutor opens with the big picture.
-  const studyPaper = async (file: File) => {
+  // What the Read dialog was given: a file (a PDF, or a .txt), or pasted text.
+  const studyPaper = async (source: { file: File; kind: DocKind | "auto" } | { title: string; text: string; kind: DocKind | "auto" }) => {
     const busyPage = strokes.current.length || tutorInk.current.length || images.current.length || paper.current;
-    if (busyPage && !confirm("Start a fresh page for this paper? Your current page will be cleared.")) return;
+    if (busyPage && !confirm("Start a fresh page for this reading? Your current page will be cleared.")) return;
     setError(null);
-    setOpening("Reading the paper…");
+    setReading(null);
+    setOpening("Opening…");
     try {
-      const data = await openPaper(file, (done, total) => setOpening(`Reading page ${Math.min(done + 1, total)} of ${total}…`));
+      let data: Paper;
+      if ("text" in source) data = await typesetText(source.title, source.text, source.kind === "paper" ? "prose" : source.kind);
+      else if (/\.pdf$/i.test(source.file.name) || source.file.type === "application/pdf") {
+        data = await openPaper(source.file, (done, total) => setOpening(`Reading page ${Math.min(done + 1, total)} of ${total}…`));
+        data.kind = source.kind === "auto" ? "paper" : source.kind;
+      } else {
+        const text = await source.file.text();
+        data = await typesetText(source.file.name.replace(/\.(txt|md|text)$/i, ""), text, source.kind === "auto" || source.kind === "paper" ? "auto" : source.kind);
+      }
       if (!data.pages.some((p) => p.sentences.length))
-        throw new Error("That PDF has no text layer (it may be a scan), so I can't read it. Try the publisher's or arXiv's PDF.");
+        throw new Error("That file has no text I can read (a PDF may be a scan). Try a PDF with selectable text, or paste the text.");
       await savePaper(data).catch(() => flash("This paper is too big to keep on this device; it'll need reopening next time."));
       if (paper.current) deletePaper(paper.current.ref.id);
       hush();
@@ -1860,7 +1876,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       dirty.current = true;
       save();
       logEvent(account, "paper_opened", { pages: data.pages.length, page_count: data.pageCount, sentences: data.pages.reduce((n, p) => n + p.sentences.length, 0) }, sessionId.current);
-      setCaption(`Got "${data.title}". Give me a second to read it…`);
+      setCaption(isLiterature(data.kind) ? `"${data.title}". Let me open it…` : `Got "${data.title}". Give me a second to read it…`);
       // The tutor's first look should see the pages, not blank paper.
       await Promise.all(
         (paper.current?.pages ?? []).slice(0, 2).map((img) => {
@@ -1870,14 +1886,14 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       );
       askTutor("paper_opened");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "That paper couldn't be opened.");
+      setError(e instanceof Error ? e.message : "That couldn't be opened.");
     } finally {
       setOpening(null);
     }
   };
 
   const closePaper = () => {
-    if (!paper.current || !confirm("Close the paper? Your notes and the tutor's drawings stay on the page.")) return;
+    if (!paper.current || !confirm("Close this reading? Your notes and the tutor's drawings stay on the page.")) return;
     deletePaper(paper.current.ref.id);
     setPaper(null);
     save();
@@ -1961,22 +1977,22 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
               {hasPhoto && <button onClick={removePhotos}>Remove photo</button>}
               {paperTitle ? (
                 <button onClick={closePaper} title={paperTitle}>
-                  Close paper
+                  Close reading
                 </button>
               ) : (
-                <button onClick={() => paperInput.current?.click()} disabled={!!opening} title="Open a research paper (PDF) to read and discuss together">
-                  {opening ?? "Study a paper"}
+                <button onClick={() => setReading({ title: "", text: "", kind: "auto" })} disabled={!!opening} title="Read a poem, a story, a play, a chapter or a research paper together">
+                  {opening ?? "Read"}
                 </button>
               )}
               <input
                 ref={paperInput}
                 type="file"
-                accept="application/pdf"
+                accept="application/pdf,.pdf,text/plain,.txt,.md"
                 hidden
                 onChange={(e) => {
                   const f = e.target.files?.[0];
                   e.target.value = "";
-                  if (f) studyPaper(f);
+                  if (f) studyPaper({ file: f, kind: reading?.kind ?? "auto" });
                 }}
               />
               <input
@@ -2126,6 +2142,50 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       {toast && (
         <div className="toast" role="status">
           {toast}
+        </div>
+      )}
+
+      {reading && (
+        <div className="read-dialog" role="dialog" aria-modal="true" aria-label="Read something together">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (reading.text.trim()) studyPaper({ title: reading.title, text: reading.text, kind: reading.kind });
+            }}
+          >
+            <h2>Read together</h2>
+            <p className="quiet">Paste a poem, a passage or a chapter, or open a PDF or text file. We&apos;ll read it side by side and talk it through.</p>
+            <label>
+              Title (optional)
+              <input value={reading.title} onChange={(e) => setReading({ ...reading, title: e.target.value })} placeholder="Ozymandias, Percy Bysshe Shelley" />
+            </label>
+            <label>
+              What is it?
+              <select value={reading.kind} onChange={(e) => setReading({ ...reading, kind: e.target.value as DocKind | "auto" })}>
+                <option value="auto">Work it out for me</option>
+                <option value="poem">A poem</option>
+                <option value="prose">A story, novel, essay or article</option>
+                <option value="play">A play or script</option>
+                <option value="paper">A research paper (PDF)</option>
+              </select>
+            </label>
+            <label>
+              The text
+              <textarea value={reading.text} onChange={(e) => setReading({ ...reading, text: e.target.value })} rows={9} placeholder={"I met a traveller from an antique land,\nWho said—\"Two vast and trunkless legs of stone\nStand in the desert. . . ."} />
+            </label>
+            <div className="read-actions">
+              <button type="button" onClick={() => paperInput.current?.click()}>
+                Open a file…
+              </button>
+              <span className="spacer" />
+              <button type="button" onClick={() => setReading(null)}>
+                Cancel
+              </button>
+              <button type="submit" className="primary" disabled={!reading.text.trim()}>
+                Start reading
+              </button>
+            </div>
+          </form>
         </div>
       )}
 
