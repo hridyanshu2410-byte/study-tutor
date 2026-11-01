@@ -10,7 +10,8 @@
 // for the old parts, and only the new tags need drawing.
 
 import type { Box } from "./ink.ts";
-import { arrow, jitter, measureText, seeded, write, type Pen, type Rng } from "./handwriting.ts";
+import { arrow, jitter, measureText, seeded, textExtent, write, type Pen, type Rng } from "./handwriting.ts";
+import { equalsAt } from "./math-ink.ts";
 import { compile } from "./expr.ts";
 import type { Figure } from "./figure-schema.ts";
 import { boxExit, curveThrough, dot, head, line, ring, roundBox, wrapTo, type Pt } from "./pen-shapes.ts";
@@ -325,16 +326,24 @@ function forces(pen: Pen, fig: Extract<Figure, { kind: "forces" }>, x: number, y
 // sign's place comes from the first part, so lines added later line up too.
 function steps(pen: Pen, fig: Extract<Figure, { kind: "steps" }>, x: number, y: number, size: number, part: Part, fixed?: FigureLayout): FigureLayout {
   const parts = fig.lines.slice(0, 10).map((l) => {
-    const i = l.math.indexOf("=");
+    const i = equalsAt(l.math);
     return i < 0 ? { pre: "", rest: l.math, note: l.note } : { pre: l.math.slice(0, i).trimEnd() + " ", rest: l.math.slice(i), note: l.note };
   });
   const eqX = fixed?.eqX ?? Math.max(0, ...parts.map((p) => measureText(p.pre, size)));
   const restW = fixed?.restW ?? Math.max(0, ...parts.map((p) => measureText(p.rest, size)));
+  // Each line sits below the one before by as much as the two need: more for
+  // a fraction or a matrix than for a plain line.
+  let base = y;
+  let prevDesc = 0;
   parts.forEach((p, i) => {
     const rng = part(`line:${i}`);
-    const base = y + size * 1.4 + i * size * 2.3;
+    const a = textExtent(p.pre, size), b = textExtent(p.rest, size);
+    const asc = Math.max(a.asc, b.asc, size), desc = Math.max(a.desc, b.desc, size * 0.3);
+    base += i ? Math.max(size * 2.3, prevDesc + asc + size * 0.9) : Math.max(size * 1.4, asc + size * 0.3);
+    prevDesc = desc;
     pen.lift(i ? 160 : 0);
-    write(pen, p.pre + p.rest, x + eqX - measureText(p.pre, size), base, size, rng);
+    if (p.pre) write(pen, p.pre, x + eqX - measureText(p.pre, size), base, size, rng);
+    write(pen, p.rest, x + eqX, base, size, rng);
     if (p.note) {
       const nx = x + eqX + Math.max(restW, measureText(p.rest, size)) + size * 1.2;
       line(pen, [nx, base - size * 0.95], [nx, base + size * 0.15], rng, 2);

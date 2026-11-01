@@ -5,7 +5,7 @@ import { CONSENT_SECTIONS, CONSENT_VERSION, INTAKE_AI_USE, INTAKE_LEVELS } from 
 import ConsentForm from "./ConsentForm";
 
 export const dynamic = "force-dynamic";
-export const metadata = { title: "Before you start · Tutor" };
+export const metadata = { title: "Before you start · CoInk" };
 
 export default async function ConsentPage() {
   if (!researchMode) redirect("/");

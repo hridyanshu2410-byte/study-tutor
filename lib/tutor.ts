@@ -22,7 +22,7 @@ export const beatSchema = z.object({
   write: z
     .array(z.string())
     .describe(
-      "The math you write while saying this phrase, usually zero or one short line: an example problem, an equation, a step, a formula, a key term. Plain characters only (x², √, π, →, ≠, ±, /). No sentences; at most a word like \"Try:\" before the math. Never the answer to the student's problem before worked_solution.",
+      "The math you write while saying this phrase, usually zero or one short line: an example problem, an equation, a step, a formula, a chemical equation, a key term. Write math in LaTeX and it is handwritten properly laid out, as on a board: \\frac{dy}{dx}, x^{2}, \\sqrt{x+1}, \\int_0^1 x^2\\,dx, \\sum_{n=1}^{\\infty}, \\lim_{x \\to 0}, \\vec{F}, \\begin{pmatrix} 1 & 2 \\\\ 3 & 4 \\end{pmatrix}, \\begin{cases}...\\end{cases}, \\ce{2H2 + O2 -> 2H2O}, Greek and set symbols (\\theta, \\in, \\mathbb{R}, \\subseteq, \\angle, \\perp, \\therefore). Plain words around math go in $...$ style: \"Try: $x^2 - 5x + 6 = 0$\". No sentences; at most a word like \"Try:\" before the math. Never the answer to the student's problem before worked_solution.",
     ),
   draw: FigureSchema.nullable().describe(
     "A figure you draw while saying this phrase, or the next part of one: a graph, number line, shape, flow, table, force diagram, aligned equation steps, a diagram, bars, or a freehand sketch. Null for none.",
@@ -199,7 +199,7 @@ What you put on the student's lines, like a tutor's pen:
 - Marks: circle (the main way to point), underline (something missing or worth a second look), strike (only when the student asks you to correct it, or at next_step and later), check (tick a correct line, sparingly), question (a small question mark beside it).
 - A note is a few words you write, at most about six, the way a tutor jots in the margin: a question ("what's d/dx of x²?"), a nudge ("inside function?"), or, only from next_step onward, the correction itself. Put the note after the mark it belongs to and set arrow to true to connect them, so the student sees circle, then arrow, then your words. Prefer placement "right" unless the line is long; "above" for a part near the start of a line.
 - Put each mark in the beat whose words point at it ("this sign here"). Most turns need no ink, or one mark and one short note. Never write the final answer as a note before worked_solution.
-- Write math in notes with plain characters a person would write: x², √, π, ≠, ±, →, and / for fractions.
+- Write math in notes as a person would: plain characters for something short (x², √, π, ≠, →), LaTeX for anything with structure (\\frac{1}{2}, x^{n-1}, \\sqrt{b^2-4ac}); it is written by hand, laid out properly.
 
 Honesty: if the problem is clearly a graded assignment, coach the ideas on a parallel example rather than working the submitted question.
 

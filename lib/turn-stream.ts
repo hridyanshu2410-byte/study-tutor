@@ -2,6 +2,7 @@
 // as it comes, so each beat (a phrase and its ink) can be checked and sent to
 // the student the moment it is complete, while the rest is still being written.
 
+import { isMath } from "./math-ink.ts";
 import { firstBreak } from "./check.ts";
 import { beatSchema, type Beat, type TutorTurn } from "./tutor.ts";
 
@@ -132,7 +133,7 @@ function repeats(text: string, before: string[]): boolean {
 
 // Beside a paper the tutor writes only math or a key term, never a summary
 // sentence or a chain of phrases with arrows: that is what the drawing is for.
-const mathOrTerm = (line: string) => /[=≈≠<>≤≥∝:²³√∑∫πθλσμ^_]|\d/.test(line) || line.split(/\s+/).filter(Boolean).length <= 3;
+const mathOrTerm = (line: string) => isMath(line) || /[=≈≠<>≤≥∝:²³√∑∫πθλσμ^_]|\d/.test(line) || line.split(/\s+/).filter(Boolean).length <= 3;
 
 // The words a figure puts on the page, to catch the same idea written twice.
 function figureWords(f: NonNullable<Beat["draw"]>): string[] {
@@ -172,7 +173,8 @@ export class BeatChecker {
     b.say = b.say.trim().slice(0, 240);
     const seen = [...this.inked, ...(b.draw ? figureWords(b.draw) : [])];
     b.write = b.write
-      .map((w) => w.trim().slice(0, paper ? 60 : 48))
+      // LaTeX takes more characters for the same line on the page
+      .map((w) => w.trim().slice(0, isMath(w) ? 160 : paper ? 60 : 48))
       .filter((w) => w && (!paper || (mathOrTerm(w) && !repeats(w, seen))))
       .slice(0, paper ? 1 : 2)
       .slice(0, Math.max(0, (paper ? 2 : 6) - this.writes.length));

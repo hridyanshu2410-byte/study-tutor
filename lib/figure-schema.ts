@@ -67,7 +67,7 @@ const Forces = z.object({
 const Steps = z.object({
   kind: z.literal("steps"),
   lines: z
-    .array(z.object({ math: z.string(), note: label.describe("What was done to get the next line, such as \"−5 both sides\".") }))
+    .array(z.object({ math: z.string().describe("One line, in LaTeX when it has fractions, powers, roots, integrals or matrices, such as \"\\frac{x}{2} + 3 = 7\"."), note: label.describe("What was done to get the next line, such as \"−5 both sides\".") }))
     .describe("Equation lines, written one under another and lined up on the equals sign."),
 });
 

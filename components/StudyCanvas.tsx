@@ -1873,7 +1873,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   return (
     <div className="shell">
       <header className="bar">
-        <span className="brand">Tutor</span>
+        <span className="brand">CoInk</span>
         {mode === "review" && run && currentCard ? (
           <div className="card-now" aria-live="polite">
             <span className="card-meta">

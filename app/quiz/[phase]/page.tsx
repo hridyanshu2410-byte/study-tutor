@@ -6,7 +6,7 @@ import { publicItems } from "@/lib/study-tests";
 import QuizForm from "./QuizForm";
 
 export const dynamic = "force-dynamic";
-export const metadata = { title: "Quick quiz · Tutor" };
+export const metadata = { title: "Quick quiz · CoInk" };
 
 export default async function QuizPage({ params }: { params: Promise<{ phase: string }> }) {
   const { phase } = await params;
