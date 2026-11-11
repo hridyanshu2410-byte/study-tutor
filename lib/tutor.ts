@@ -2,6 +2,7 @@ import { z } from "zod";
 import { FigureSchema } from "./figure-schema.ts";
 import { SimSchema } from "./sims.ts";
 import { Model3DSchema } from "./model3d.ts";
+import type { Manners } from "./manners.ts";
 
 export const MOVES = ["wait", "ask_plan", "point", "name_concept", "simpler_example", "next_step", "worked_solution", "affirm", "check_understanding"] as const;
 type Move = (typeof MOVES)[number];
@@ -152,6 +153,8 @@ export type TutorRequest = {
   // 3D models on the page, newest last, with the parts the tutor can point at.
   models?: { title: string; parts: string[]; view: string }[];
   speech: string | null;
+  // Study switches that break one of the tutor's manners for this session.
+  manners?: Partial<Manners>;
   lines: { id: string; tokens: number }[];
   pageImage: string; // PNG (or JPEG when there is a photo) data URL of the student's page, clean
   tokenImage: string; // the same page with each line's tokens boxed and numbered

@@ -560,6 +560,9 @@ export type PlanOptions = {
   marks?: Mark[];
   // Writing size, when it shouldn't follow the student's handwriting (beside a paper's small print).
   size?: number;
+  // A study switch that breaks a manner: notes and written math go on top of
+  // the student's own lines instead of below or beside them.
+  overLearner?: boolean;
 };
 
 // What the pen does during one spoken phrase.
@@ -588,6 +591,7 @@ export class TurnPlanner {
   private room: Box[] = [];
   private lastTarget: { box: Box; line: InkLine; ellipse: Ellipse | null } | null = null;
   private build: Build | null = null;
+  private overCount = 0;
   private lines: InkLine[];
   private opts: PlanOptions;
 
@@ -651,6 +655,14 @@ export class TurnPlanner {
     return { x: left + jitter(this.rng, 6), y: bottom + this.size * 1.1 };
   }
 
+  // On top of the student's newest line (the lowest on the page), each further
+  // written line a little lower: for the switch that breaks "the learner's line is theirs".
+  private overSpot(b: Box): { x: number; y: number } {
+    const target = this.lines.reduce((lo, l) => (l.box.y + l.box.h / 2 > lo.box.y + lo.box.h / 2 ? l : lo));
+    const k = this.overCount++;
+    return { x: target.box.x + jitter(this.rng, 6), y: target.box.y + (target.box.h - b.h) / 2 + k * this.size * 1.25 };
+  }
+
   // Holds a free spot w × h for something that isn't ink (a 3D model), placed
   // as a figure would be, so this turn's later ink keeps clear of it.
   reserve(w: number, h: number): Box {
@@ -681,8 +693,10 @@ export class TurnPlanner {
         const last = this.lastTarget;
         const anchor = last && (last.line.id === line.id || a.line_id === last.line.id) ? last : { box, line, ellipse: null };
         const width = measureText(a.text, size);
-        const spot = placeNote(a.placement ?? "right", anchor.box, anchor.line.box, width, size, this.taken());
-        if (a.arrow) {
+        const spot = this.opts.overLearner
+          ? { x: anchor.box.x + jitter(rng, 4), baseline: anchor.box.y + anchor.box.h * 0.72, side: "right" as const }
+          : placeNote(a.placement ?? "right", anchor.box, anchor.line.box, width, size, this.taken());
+        if (a.arrow && !this.opts.overLearner) {
           const target: [number, number] =
             spot.side === "right" ? [spot.x - 14, spot.baseline - size * 0.4] : [spot.x + Math.min(width, 40) / 2, spot.side === "above" ? spot.baseline + 8 : spot.baseline - size - 6];
           const startPt = anchor.ellipse ? ellipseEdgeToward(anchor.ellipse, target) : boxEdgeToward(anchor.box, target);
@@ -749,7 +763,7 @@ export class TurnPlanner {
       // the practice run uses the same random wobble as the real one, so it measures exactly
       const wobble = Math.floor(rng() * 2 ** 31);
       const b = sizeOf((p) => write(p, text, 0, 0, workSize, seeded(wobble)));
-      const at = this.spot(b.w, b.h);
+      const at = this.opts.overLearner && lines.length ? this.overSpot(b) : this.spot(b.w, b.h);
       pen.lift(pen.t ? 180 : 0);
       write(pen, text, at.x - b.x, at.y - b.y, workSize, seeded(wobble));
       const box = { x: at.x, y: at.y, w: b.w, h: b.h };

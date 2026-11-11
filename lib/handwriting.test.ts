@@ -243,3 +243,16 @@ test("what later phrases write never lands on what earlier phrases wrote", () =>
   for (let i = 0; i < parts.length; i++) for (let j = i + 1; j < parts.length; j++) assert.ok(!overlaps(parts[i], parts[j]), `parts ${i} and ${j} overlap`);
   assert.deepEqual(planner.parts, parts);
 });
+
+test("with the over-the-line switch, written math and notes land on the student's line", () => {
+  const box = lines[0].box;
+  const overlaps = (b: Box) => b.x < box.x + box.w && b.x + b.w > box.x && b.y < box.y + box.h && b.y + b.h > box.y;
+  const kept = new TurnPlanner(lines, 3).plan({ write: ["x^2"] });
+  const broken = new TurnPlanner(lines, 3, { overLearner: true }).plan({ write: ["x^2"] });
+  assert.ok(kept.box && !overlaps(kept.box));
+  assert.ok(broken.box && overlaps(broken.box));
+  const note = new TurnPlanner(lines, 3, { overLearner: true }).plan({
+    annotations: [{ kind: "note", line_id: "L1", from_token: 1, to_token: 1, text: "why?", placement: "right", arrow: true }],
+  });
+  assert.ok(note.box && overlaps(note.box));
+});
