@@ -5,7 +5,7 @@ This puts the tutor online so testers can sign up, give consent, and use it on t
 ## 1. Supabase: sign-in and database
 
 1. Create a project at [supabase.com](https://supabase.com) (the free plan is fine). Pick a region near your testers and save the database password somewhere safe.
-2. Create the tables. In the project, open **SQL Editor → New query**, paste the whole of `supabase/migrations/20261022000000_research_study.sql`, and press **Run**. Then do the same with `supabase/migrations/20261023000000_study_tools.sql` (quizzes, surveys, study arms, photo uploads). (If you use the Supabase CLI instead: `supabase link` then `supabase db push`.)
+2. Create the tables. In the project, open **SQL Editor → New query**, paste the whole of `supabase/migrations/20261022000000_research_study.sql`, and press **Run**. Then do the same with `supabase/migrations/20261023000000_study_tools.sql` (quizzes, surveys, study arms, photo uploads). Then `supabase/migrations/20261111000000_session_recordings.sql` (the private bucket for session recordings and voice, see [STUDY-SESSIONS.md](STUDY-SESSIONS.md)). (If you use the Supabase CLI instead: `supabase link` then `supabase db push`.)
 3. Open **Project Settings → API keys** and copy three values for step 2:
    - the **Project URL**
    - the **anon / publishable** key

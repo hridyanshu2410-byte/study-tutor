@@ -49,6 +49,14 @@ import type { Built, ModelStage } from "@/lib/model3d-render";
 import { deletePaper, loadPaper, savePaper } from "@/lib/paper-store";
 import { reportHtml, reportStats, reportTitle, type JournalEntry, type ReportAnalysis, type ReportRequest, type SessionReport } from "@/lib/session-report";
 import { deleteReport, loadReports, saveReport } from "@/lib/report-store";
+import { Recorder } from "@/lib/session-recorder";
+import { roundStroke, type LogEvent } from "@/lib/session-log";
+import { glanceDelay, KEPT, readManners, type Manners } from "@/lib/manners";
+import { HostRoom, plainStroke } from "@/lib/host-room";
+import { roomCode } from "@/lib/room-clock";
+import { downloadBlob, fileStem, audioExt, loadRecording } from "@/lib/recording-store";
+import { researchMode } from "@/lib/supabase/env";
+import StudyToolsPanel, { BlockSurvey, type BlockKind, type BlockRun, type RoomInfo } from "./StudyToolsPanel";
 
 type Tool = "pen" | "highlighter" | "line" | "arrow" | "rect" | "ellipse" | "eraser" | "hand" | "keep";
 const SHAPE_TOOLS: Tool[] = ["line", "arrow", "rect", "ellipse"];
@@ -80,12 +88,15 @@ type TutorState = "idle" | "thinking" | "speaking";
 type TutorInk = { id: string; plan: PenPlan; born: number; marks?: Box[]; rules?: Box[] };
 // One spoken phrase of a turn: its words, its ink and its voice, and how far along it is.
 // `region` is everything the phrase marks or draws; `figure` the whole of the figure it draws or adds to.
-type Act = { beat: Beat; model: PageModel | null; ink: TutorInk | null; clip: Clip | null; region: Box | null; figure: Box | null; started: boolean; voiceDone: boolean; inkDone: boolean };
+type Act = { beat: Beat; model: PageModel | null; ink: TutorInk | null; clip: Clip | null; region: Box | null; figure: Box | null; started: boolean; voiceDone: boolean; inkDone: boolean; said?: Extract<LogEvent, { type: "speech" }> };
 // A turn being performed. Phrases keep arriving while earlier ones are spoken;
 // each one's ink is drawn while its words are heard, and the next follows
 // when both are done.
 type Show = {
   trigger: TutorRequest["trigger"];
+  // its number in the session recording, and when the model was asked
+  turn: number;
+  calledAt: number;
   lines: InkLine[];
   planner: TurnPlanner;
   acts: Act[];
@@ -106,7 +117,7 @@ type Show = {
 };
 // Which paper is open and where its pages start; the paper itself lives in IndexedDB.
 type PaperRef = { id: string; title: string; x: number; y: number; w: number };
-type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string; images?: PageImage[]; sims?: PageSim[]; models?: PageModel[]; paper?: PaperRef | null };
+type SavedPage = { strokes: Stroke[]; tutorInk: TutorInk[]; problem: string; images?: PageImage[]; sims?: PageSim[]; models?: PageModel[]; paper?: PaperRef | null; guestInk?: Stroke[] };
 // An open paper: its pages laid out in a column on the page.
 type OpenPaper = { ref: PaperRef; data: Paper; pages: PageImage[]; digest: { text: string; truncated: boolean } };
 const PAPER_W = 700;
@@ -175,13 +186,32 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const undoStack = useRef<Stroke[][]>([]);
   const ear = useRef<Conversation | null>(null);
   const hearing = useRef(false);
-  const inFlight = useRef<{ trigger: TutorRequest["trigger"]; speech: string | null; abort: AbortController } | null>(null);
+  const inFlight = useRef<{ trigger: TutorRequest["trigger"]; speech: string | null; abort: AbortController; turn: number; calledAt: number } | null>(null);
   const lastPenAt = useRef(0);
   const stats = useRef<SessionStats>(newStats());
   const focus = useRef<Focus | null>(null);
   const lastTap = useRef<{ x: number; y: number; at: number; strokeId: string } | null>(null);
   const sessionId = useRef("");
   const lasso = useRef<[number, number][] | null>(null);
+  // ---------- study tools: the session recording, a human tutor, manners, blocks ----------
+  const recorder = useRef(new Recorder());
+  const rec = () => recorder.current.log;
+  const manners = useRef<Manners>(KEPT);
+  const [mannersShown, setMannersShown] = useState<Manners>(KEPT);
+  const [recordVoice, setRecordVoice] = useState(false);
+  const recordVoiceRef = useRef(false);
+  const [recInfo, setRecInfo] = useState<{ id: string; events: number; savedAt: number | null; error: string | null } | null>(null);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [toolsAllowed, setToolsAllowed] = useState(!researchMode || Boolean(account?.admin));
+  // the human tutor's ink, live from their device
+  const guestInk = useRef(new Map<string, Stroke>());
+  const hostRoom = useRef<HostRoom | null>(null);
+  const [room, setRoom] = useState<RoomInfo | null>(null);
+  const [blocks, setBlocks] = useState<BlockRun | null>(null);
+  const blocksRef = useRef<BlockRun | null>(null);
+  const [blockSurvey, setBlockSurvey] = useState<{ n: number; of: number } | null>(null);
+  // when the student's words began, for the recording
+  const speechFrom = useRef<number | null>(null);
 
   const [tool, setTool] = useState<Tool>("pen");
   const [ink, setInk] = useState(INKS[0]);
@@ -234,8 +264,15 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     stats.current = newStats();
     setCanListen(speechInputSupported());
     ear.current = new Conversation({
-      onUtterance: (text) => askTutor("spoke", text),
+      onUtterance: (text) => {
+        const log = rec();
+        if (log) log.push({ t: log.now(speechFrom.current ?? undefined), type: "speech", who: "student", text, end: log.now() });
+        speechFrom.current = null;
+        // with a human tutor in the room the words are recorded, and the AI stays quiet
+        if (!hostRoom.current && !blockSurveyOpen.current) askTutor("spoke", text);
+      },
       onHearing: (h) => {
+        if (h && !hearing.current && speechFrom.current == null) speechFrom.current = performance.now();
         hearing.current = h;
         setHeard(h);
       },
@@ -248,6 +285,23 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     document.fonts?.ready.then(() => (dirty.current = true));
     tutorFont.current = `${getComputedStyle(document.documentElement).getPropertyValue("--font-tutor").trim() || "cursive"}, cursive`;
     restorePage();
+    // Study tools: switches from the address (?break=overLine,inkAtOnce, ?tools=1), then the first recording.
+    try {
+      const q = new URLSearchParams(location.search);
+      if (q.has("tools")) sessionStorage.setItem("coink:tools", q.get("tools") === "0" ? "0" : "1");
+      if (q.has("break")) sessionStorage.setItem("coink:break", q.get("break") ?? "");
+      if (sessionStorage.getItem("coink:tools") === "1") setToolsAllowed(true);
+      const broken = readManners(sessionStorage.getItem("coink:break") ?? "");
+      manners.current = broken;
+      setMannersShown(broken);
+    } catch {
+      // storage blocked: the default manners
+    }
+    recorder.current.setMeta({ userId: account?.userId ?? null, participant: account?.participantCode ?? null, condition: account?.condition ?? null });
+    recorder.current.onSaved = (file, error) => setRecInfo({ id: file.id, events: file.events.length, savedAt: file.savedAt, error });
+    void startRecording();
+    const onHide = () => void recorder.current.save(false);
+    window.addEventListener("pagehide", onHide);
     // the voices of the things said while thinking, fetched once so they come out at once
     const warm = setTimeout(() => !stateRef.current.muted && keepClips(ALL_LINES), 2500);
     // In research mode the account copy of the page wins, unless the tester
@@ -268,11 +322,41 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           // Offline: the local copy is shown and syncs on the next save.
         });
     }
-    return () => clearTimeout(warm);
+    return () => {
+      clearTimeout(warm);
+      window.removeEventListener("pagehide", onHide);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Starts this session's recording (and ends the last one): the page as it
+  // stands is its first event.
+  const startRecording = () =>
+    recorder.current.begin(sessionId.current, manners.current, (log) => {
+      log.tutor = hostRoom.current ? "human" : "ai";
+      log.problem = stateRef.current.problem;
+      const b = blocksRef.current;
+      log.block = b ? { n: b.index + 1, of: b.order.length, label: b.order[b.index] } : null;
+      log.snapshot(
+        strokes.current.map((x) => ({ ...x, points: x.points })),
+        [
+          ...tutorInk.current.filter((t) => t.born !== Infinity).map((t) => ({ id: t.id, strokes: t.plan.strokes })),
+          ...[...guestInk.current.values()].map((g) => ({ id: g.id, strokes: [{ points: g.points.map(([x, y]) => [x, y] as [number, number]), start: 0, end: 0, w: g.size }] })),
+        ],
+      );
+      if (recordVoiceRef.current && !hostRoom.current) void recorder.current.startVoice().catch((e) => setError(e instanceof Error ? e.message : "The microphone could not be recorded."));
+    });
+  // A new session id means a new recording.
+  const restartRecording = () => {
+    void startRecording();
+    hostRoom.current?.sendPage();
+  };
+  const blockSurveyOpen = useRef(false);
+
   const applyPage = (saved: SavedPage | null) => {
+    const log = rec();
+    if (log) log.erase("student", [...strokes.current.map((x) => x.id), ...tutorInk.current.map((t) => t.id), ...guestInk.current.keys()], "page");
+    guestInk.current = new Map((saved?.guestInk ?? []).map((g) => [g.id, g]));
     strokes.current = saved?.strokes ?? [];
     tutorInk.current = (saved?.tutorInk ?? []).map((t) => ({ ...t, born: 0 }));
     setImages(saved?.images ?? []);
@@ -291,6 +375,11 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     setProblem(saved?.problem ?? "");
     undoStack.current = [];
     dirty.current = true;
+    if (log)
+      log.snapshot(
+        strokes.current.map((x) => ({ ...x, points: x.points })),
+        tutorInk.current.map((t) => ({ id: t.id, strokes: t.plan.strokes })),
+      );
   };
 
   // The study page lives in storage; a review session uses a scratch page
@@ -318,7 +407,12 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     if (stateRef.current.mode === "review") return;
     // ink for phrases not yet spoken isn't on the page yet
     const ink = tutorInk.current.filter((t) => t.born !== Infinity);
-    const page: SavedPage = { strokes: strokes.current, tutorInk: ink, problem: stateRef.current.problem, images: images.current, sims: sims.current, models: models.current.map((m) => ({ ...m, shownAt: undefined })), paper: paper.current?.ref ?? null };
+    const page: SavedPage = { strokes: strokes.current, tutorInk: ink, problem: stateRef.current.problem, images: images.current, sims: sims.current, models: models.current.map((m) => ({ ...m, shownAt: undefined })), paper: paper.current?.ref ?? null, guestInk: [...guestInk.current.values()] };
+    const log = rec();
+    if (log && log.problem !== stateRef.current.problem) {
+      log.problem = stateRef.current.problem;
+      log.push({ t: log.now(), type: "note", kind: "problem", text: log.problem });
+    }
     if (account) saveCloud(account.userId, "page", page);
     try {
       localStorage.setItem(pageKey, JSON.stringify(page));
@@ -488,6 +582,13 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           ctx.fill(pathFor(s, drawing.current?.stroke.id === s.id ? drawing.current.simulate : false));
         }
       for (const t of tutorInk.current) drawTutorInk(ctx, t, now, tutorPaths.current);
+      // the human tutor's ink, in the tutor's colour
+      for (const g of guestInk.current.values()) {
+        ctx.fillStyle = g.color;
+        ctx.fill(pathFor(g, g.points.every((q) => q[2] === 0.5)));
+      }
+      rec()?.view(cam, w, h);
+      hostRoom.current?.view(cam, w, h);
       if (focus.current && Date.now() - focus.current.at < FOCUS_MS) {
         const [fx, fy] = focus.current.world;
         ctx.save();
@@ -521,6 +622,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   // ---------- tutor ----------
   const askTutor = useCallback(
     async (trigger: TutorRequest["trigger"], speech: string | null = null, watched: string | null = null) => {
+      // A human tutor has the pen, or the learner is rating a block: the AI tutor stays out of it.
+      if (hostRoom.current || blockSurveyOpen.current) return;
       const busy = inFlight.current;
       if (busy) {
         // A glance at the page waits its turn; the student's own words never do.
@@ -532,7 +635,11 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       if (pauseTimer.current) clearTimeout(pauseTimer.current);
       const lines = groupLines(strokes.current.filter((s) => s.kind !== "highlight"));
       if (!lines.length && !speech && !watched && !stateRef.current.problem.trim() && !images.current.length && !paper.current) return;
+      const log = rec();
       if (trigger !== "pause") {
+        // what this cut short, for the recording
+        if (log && busy) log.push({ t: log.now(), type: "interrupt", by: trigger, turn: busy.turn, beat: null, during: "thinking" });
+        else if (log && show.current?.playing) log.push({ t: log.now(), type: "interrupt", by: trigger, turn: show.current.turn, beat: show.current.acts.indexOf(show.current.playing) + 1, during: "speaking" });
         stopShow();
         stopSpeaking();
         quietAside();
@@ -540,7 +647,14 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
 
       if (trigger !== "pause") noteStudent(trigger, speech, watched);
       const abort = new AbortController();
-      const mine = { trigger, speech, abort };
+      const turn = log?.nextTurn() ?? 0;
+      const calledAt = performance.now();
+      if (log) {
+        const f = trigger === "pause" ? null : focusOn(lines);
+        log.push({ t: log.now(), type: "trigger", turn, trigger, speech, focus: f });
+        log.push({ t: log.now(), type: "model_call", turn, trigger, lines: lines.length });
+      }
+      const mine = { trigger, speech, abort, turn, calledAt };
       inFlight.current = mine;
       changedSinceTutor.current = false;
       setTutorState("thinking");
@@ -575,6 +689,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
             trigger,
             speech,
             watched,
+            manners: manners.current,
             idleSeconds: lastPenAt.current ? (Date.now() - lastPenAt.current) / 1000 : undefined,
             focus: trigger === "pause" ? null : focusOn(lines),
             hasPhoto: images.current.length > 0,
@@ -615,8 +730,11 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           inFlight.current = null;
           answered();
           if (!res.ok && !data.say) throw new Error(data.error ?? `Tutor error ${res.status}`);
-          if (trigger === "pause" && hearing.current) return settle();
-          const s = beginShow(trigger, lines);
+          if (trigger === "pause" && hearing.current && !manners.current.speakAtOnce) {
+            if (log) log.push({ t: log.now(), type: "turn_dropped", turn, why: "student started speaking" });
+            return settle();
+          }
+          const s = beginShow(trigger, lines, turn, calledAt);
           for (const b of data.beats ?? []) addBeat(s, b);
           endShow(s, data as TurnEnd);
           return;
@@ -637,12 +755,13 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
             }
             if (!s && (e.beat || e.turn)) {
               // Don't talk over a student who started speaking while we looked.
-              if (trigger === "pause" && hearing.current) {
+              if (trigger === "pause" && hearing.current && !manners.current.speakAtOnce) {
                 abort.abort();
                 inFlight.current = null;
+                if (log) log.push({ t: log.now(), type: "turn_dropped", turn, why: "student started speaking" });
                 return settle();
               }
-              s = beginShow(trigger, lines);
+              s = beginShow(trigger, lines, turn, calledAt);
             }
             if (s && e.beat) addBeat(s, e.beat, ahead);
             else if (s && e.turn) endShow(s, e.turn);
@@ -651,12 +770,16 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           for (const c of ahead.values()) c.stop();
         }
         if (inFlight.current === mine) inFlight.current = null;
-        if (!s) return settle();
+        if (!s) {
+          if (log) log.push({ t: log.now(), type: "model_end", turn, move: "wait", beats: 0, ms: Math.round(performance.now() - calledAt) });
+          return settle();
+        }
         // the stream broke off before the end of the turn: finish what was said
         if (!s.end) endShow(s, { move: "ask_plan", say: s.acts.map((a) => a.beat.say).join(" "), simulate: null, skill: { concept: "", evidence: "none" }, card: null, review_result: null });
       } catch (e) {
         if (abort.signal.aborted) return; // replaced by a newer turn
         if (inFlight.current === mine) inFlight.current = null;
+        if (log) log.push({ t: log.now(), type: "model_error", turn, error: e instanceof Error ? e.message.slice(0, 200) : "unreachable" });
         setError(e instanceof Error ? e.message : "The tutor could not be reached.");
         if (show.current?.acts.length) {
           // say what has arrived, then stop
@@ -717,9 +840,12 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     quietAside();
     const mine = { clip, speaking: false };
     aside.current = mine;
+    let said: Extract<LogEvent, { type: "speech" }> | null = null;
     clip.play(
       () => {
         if (aside.current !== mine) return;
+        const log = rec();
+        if (log) said = log.push({ t: log.now(), type: "speech", who: "tutor", text, end: null, aside: true, voice: "audio" });
         mine.speaking = true;
         setTutorState("speaking");
         stateRef.current.tutorState = "speaking";
@@ -727,6 +853,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         setCaption(text);
       },
       () => {
+        const log = rec();
+        if (said && said.end == null && log) said.end = log.now();
         if (aside.current !== mine) return;
         aside.current = null;
         const s = show.current;
@@ -753,7 +881,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     aside.current = null;
   };
 
-  const beginShow = (trigger: TutorRequest["trigger"], lines: InkLine[]): Show => {
+  const beginShow = (trigger: TutorRequest["trigger"], lines: InkLine[], turn = 0, calledAt = performance.now()): Show => {
     stopShow();
     const cam = camera.current;
     const p = paper.current;
@@ -768,8 +896,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       // the caption panel covers the bottom of the screen
       column: p ? { x: p.ref.x + p.ref.w + 70, top: Math.max(p.ref.y, cam.y + 80 / cam.z), bottom: cam.y + viewBox().h - 180 / cam.z } : undefined,
       size: p ? 19 : undefined,
+      overLearner: manners.current.overLine,
     });
-    const s: Show = { trigger, lines, planner, acts: [], next: 0, playing: null, breathing: false, end: null, said: "", sentence: "", shown: "", timers: [], region: null, figure: null };
+    const s: Show = { trigger, turn, calledAt, lines, planner, acts: [], next: 0, playing: null, breathing: false, end: null, said: "", sentence: "", shown: "", timers: [], region: null, figure: null };
     show.current = s;
     return s;
   };
@@ -814,6 +943,22 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     ahead?.delete(beat.say);
     if (!clip && beat.say && !stateRef.current.muted) clip = prepareClip(beat.say);
     s.acts.push({ beat, model, ink, clip, region, figure: plan.figure ?? null, started: false, voiceDone: false, inkDone: !ink });
+    const log = rec();
+    if (log)
+      log.push({
+        t: log.now(),
+        type: "model_beat",
+        turn: s.turn,
+        beat: s.acts.length,
+        say: beat.say,
+        ink: [
+          ...beat.write.map((w) => `write ${w}`),
+          ...(beat.draw ? [`draw ${beat.draw.kind}`] : []),
+          ...beat.annotations.map((a) => `${a.kind} ${a.line_id}${a.from_token != null ? `#${a.from_token}${a.to_token != null && a.to_token !== a.from_token ? `-${a.to_token}` : ""}` : ""}${a.text ? ` "${a.text}"` : ""}`),
+          ...beat.highlights.map((h) => `${h.kind} ${h.ref}`),
+          ...(beat.model ? ["model"] : []),
+        ],
+      });
     // the answer came before the line said while thinking could start: skip that line
     if (aside.current && !aside.current.speaking) quietAside();
     if (!s.playing && !s.breathing && !aside.current) playNext(s);
@@ -823,6 +968,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const endShow = (s: Show, end: TurnEnd) => {
     if (show.current !== s || s.end) return;
     s.end = end;
+    const log = rec();
+    if (log) log.push({ t: log.now(), type: "model_end", turn: s.turn, move: end.move, beats: s.acts.length, ms: Math.round(performance.now() - s.calledAt) });
     if (end.simulate) placeSim(end.simulate, s.lines);
     if (!s.playing && s.next >= s.acts.length) finishShow(s);
   };
@@ -848,6 +995,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       if (act.started || show.current !== s) return;
       act.started = true;
       const speaking = words ? (ms ?? speechMs(words)) : 0;
+      const log = rec();
+      const beatNo = s.acts.indexOf(act) + 1;
+      if (log && words) act.said = log.push({ t: log.now(), type: "speech", who: "tutor", text: words, end: null, turn: s.turn, beat: beatNo, voice: act.clip ? "audio" : "silent" });
       // the model appears, and the part named lights up, as the words begin
       if (act.model) act.model.shownAt = performance.now();
       const target = act.model ?? models.current.at(-1);
@@ -855,7 +1005,22 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       if (act.ink) {
         // the pen keeps pace so the phrase's ink is done about when its words are
         if (words) act.ink.plan = retime(act.ink.plan, Math.min(1, speaking / Math.max(1, act.ink.plan.duration)));
+        // the switch that breaks "the hand takes time": all of the phrase's ink at once
+        if (manners.current.inkAtOnce) act.ink.plan = { ...act.ink.plan, strokes: act.ink.plan.strokes.map((x) => ({ ...x, start: 0, end: 0 })), duration: 0 };
         act.ink.born = performance.now();
+        if (log)
+          log.push({
+            t: log.now(act.ink.born),
+            type: "tutor_ink",
+            id: act.ink.id,
+            turn: s.turn,
+            beat: beatNo,
+            strokes: act.ink.plan.strokes.map(roundStroke),
+            duration: Math.round(act.ink.plan.duration),
+            ...(act.ink.marks?.length ? { marks: act.ink.marks } : {}),
+            ...(act.ink.rules?.length ? { rules: act.ink.rules } : {}),
+            ...(manners.current.inkAtOnce ? { atOnce: true } : {}),
+          });
         later(s, () => {
           act.inkDone = true;
           after(s, act);
@@ -864,6 +1029,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       fillCaption(s, words, speaking, () => act.voiceDone);
       if (!act.clip) later(s, () => {
         act.voiceDone = true;
+        endSaid(act);
         after(s, act);
       }, speaking);
       dirty.current = true;
@@ -872,6 +1038,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       act.clip.play(begin, () => {
         act.voiceDone = true;
         begin(0);
+        endSaid(act);
         // the words are all said, whatever the estimate was
         if (show.current === s) setCaption(s.shown);
         after(s, act);
@@ -885,6 +1052,12 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         begin(null);
       }, 7000);
     } else begin(null);
+  };
+
+  // The phrase's words are all said: its end, in the recording.
+  const endSaid = (act: Act) => {
+    const log = rec();
+    if (log && act.said && act.said.end == null) act.said.end = log.now();
   };
 
   // A phrase is over once its words and its ink both are; a breath, then the next.
@@ -936,6 +1109,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     remember(end);
     if (s.trigger === "wrap_up") {
       makeReport();
+      void recorder.current.save(true);
       const st = stats.current;
       logEvent(
         account,
@@ -955,7 +1129,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     if (!s) return;
     show.current = null;
     s.timers.forEach(clearTimeout);
-    for (const a of s.acts) a.clip?.stop();
+    for (const a of s.acts) {
+      a.clip?.stop();
+      endSaid(a);
+    }
     tutorInk.current = tutorInk.current.filter((t) => t.born !== Infinity);
     if (s.shown) setCaption(s.shown);
     noteTutor(s, null);
@@ -1114,6 +1291,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
           playNextSilently(s, a);
         } else {
           a.voiceDone = true;
+          endSaid(a);
           after(s, a);
         }
       } else a.voiceDone = false;
@@ -1190,6 +1368,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const freshPage = () => {
     strokes.current = [];
     tutorInk.current = [];
+    guestInk.current.clear();
     setImages([]);
     setPaper(null);
     sims.current = [];
@@ -1199,6 +1378,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     tutorPaths.current.clear();
     undoStack.current = [];
     sessionId.current = crypto.randomUUID();
+    restartRecording();
     stats.current = newStats();
     changedSinceTutor.current = false;
     if (pauseTimer.current) clearTimeout(pauseTimer.current);
@@ -1265,6 +1445,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     setRun(null);
     restorePage();
     sessionId.current = crypto.randomUUID();
+    restartRecording();
     stats.current = newStats();
     const upcoming = memoryRef.current.cards.map((c) => new Date(c.fsrs.due).getTime()).filter((d) => d > Date.now());
     const next = upcoming.length ? Math.min(...upcoming) : null;
@@ -1554,11 +1735,15 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     if (pauseTimer.current) clearTimeout(pauseTimer.current);
     // In the "on request" study arm the tutor only answers when asked or spoken to.
     if (account?.condition === "on_request") return;
+    // A human tutor is watching instead.
+    if (hostRoom.current) return;
+    const atOnce = manners.current.speakAtOnce;
     pauseTimer.current = setTimeout(() => {
-      if (!changedSinceTutor.current || drawing.current) return;
-      if (stateRef.current.tutorState === "speaking" || hearing.current) return schedulePause();
+      // The switch that breaks "a glance is not a turn" looks mid-stroke and mid-sentence too.
+      if (!changedSinceTutor.current || (drawing.current && !atOnce)) return;
+      if (stateRef.current.tutorState === "speaking" || (hearing.current && !atOnce)) return schedulePause();
       askTutor("pause");
-    }, paper.current ? PAPER_WATCH_MS : WATCH_MS);
+    }, glanceDelay(manners.current, Boolean(paper.current)));
   };
 
   // ---------- input ----------
@@ -1570,11 +1755,17 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const eraseAt = (sx: number, sy: number) => {
     const [wx, wy] = screenToWorld(camera.current, sx, sy);
     const before = strokes.current.length;
-    strokes.current = strokes.current.filter((s) => distanceToStroke(s, wx, wy) > 12 / camera.current.z);
     const reach = 12 / camera.current.z;
-    tutorInk.current = tutorInk.current.filter(
-      (t) => !t.plan.strokes.some((st) => st.points.some(([x, y]) => Math.abs(x - wx) < reach && Math.abs(y - wy) < reach)),
-    );
+    const rubbed = [
+      ...strokes.current.filter((s) => distanceToStroke(s, wx, wy) <= reach),
+      ...[...guestInk.current.values()].filter((s) => distanceToStroke(s, wx, wy) <= reach),
+    ].map((s) => s.id);
+    strokes.current = strokes.current.filter((s) => distanceToStroke(s, wx, wy) > reach);
+    for (const id of rubbed) guestInk.current.delete(id);
+    const tutorRubbed = tutorInk.current.filter((t) => t.plan.strokes.some((st) => st.points.some(([x, y]) => Math.abs(x - wx) < reach && Math.abs(y - wy) < reach)));
+    tutorInk.current = tutorInk.current.filter((t) => !tutorRubbed.includes(t));
+    rec()?.erase("student", [...rubbed, ...tutorRubbed.map((t) => t.id)], "eraser");
+    hostRoom.current?.erased([...rubbed, ...tutorRubbed.map((t) => t.id)]);
     // Rubbing out a simulation's dashed frame takes it off the page.
     const onEdge = (b: Box) =>
       wx > b.x - reach && wx < b.x + b.w + reach && wy > b.y - reach && wy < b.y + b.h + reach &&
@@ -1603,6 +1794,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       // A second finger turns a stroke-in-progress into a pinch.
       if (drawing.current) {
         strokes.current = strokes.current.filter((s) => s.id !== drawing.current!.stroke.id);
+        rec()?.dropLive(drawing.current.stroke.id);
+        hostRoom.current?.erased([drawing.current.stroke.id]);
         drawing.current = null;
       }
       pinch.current = pinchOf(touches);
@@ -1656,8 +1849,9 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       ...(tool === "highlighter" ? { kind: "highlight" as const } : shape ? { kind: "shape" as const, anchor: [wx, wy] as [number, number] } : {}),
     };
     strokes.current.push(stroke);
+    rec()?.strokeBegin(stroke.id, e.nativeEvent.timeStamp || undefined);
     drawing.current = { stroke, pointerId: e.pointerId, simulate: e.pointerType !== "pen" };
-    if (pauseTimer.current) clearTimeout(pauseTimer.current);
+    if (pauseTimer.current && !manners.current.speakAtOnce) clearTimeout(pauseTimer.current);
     dirty.current = true;
   };
 
@@ -1713,13 +1907,17 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         const last = events[events.length - 1];
         const [wx, wy] = screenToWorld(camera.current, last.clientX - r.left, last.clientY - r.top);
         d.stroke.points = shapePoints(tool, d.stroke.anchor, [wx, wy], e.shiftKey);
+        hostRoom.current?.studentStroke(d.stroke, false);
         dirty.current = true;
         return;
       }
+      const log = rec();
       for (const ev of events) {
         const [wx, wy] = screenToWorld(camera.current, ev.clientX - r.left, ev.clientY - r.top);
         d.stroke.points.push([wx, wy, ev.pointerType === "pen" ? ev.pressure : 0.5] as Point);
+        log?.strokePoint(d.stroke.id, ev.timeStamp || undefined);
       }
+      hostRoom.current?.studentStroke(d.stroke, false);
       if (holdTimer.current) clearTimeout(holdTimer.current);
       if (d.stroke.kind !== "highlight") {
         const held = d.stroke;
@@ -1780,10 +1978,13 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       if (d.stroke.kind === "shape" && d.stroke.anchor && d.stroke.points.length < 2) {
         // a tap with a shape tool draws nothing
         strokes.current = strokes.current.filter((s) => s !== d.stroke);
+        rec()?.dropLive(d.stroke.id);
         dirty.current = true;
         return;
       }
       delete d.stroke.anchor;
+      rec()?.strokeEnd("student", d.stroke, e.nativeEvent.timeStamp || undefined);
+      hostRoom.current?.studentStroke(d.stroke, true);
       if (d.stroke.kind !== "shape" && d.stroke.kind !== "highlight" && gesture(d.stroke)) {
         dirty.current = true;
         return;
@@ -1819,6 +2020,10 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       if (prev && Date.now() - prev.at < 450 && Math.hypot(prev.x - x, prev.y - y) * z < 24) {
         lastTap.current = null;
         remove([stroke.id, prev.strokeId]);
+        rec()?.erase("student", [stroke.id, prev.strokeId], "tap");
+        hostRoom.current?.erased([stroke.id, prev.strokeId]);
+        const log = rec();
+        if (log) log.push({ t: log.now(), type: "point", x: Math.round(x), y: Math.round(y) });
         undoStack.current.splice(-2);
         save();
         focus.current = { world: [x, y], at: Date.now() };
@@ -1851,6 +2056,8 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       const hit = strokes.current.filter(near).map((s) => s.id);
       if (hit.length) {
         remove([...hit, stroke.id]);
+        rec()?.erase("student", [...hit, stroke.id], "scribble");
+        hostRoom.current?.erased([...hit, stroke.id]);
         changedSinceTutor.current = true;
         save();
         schedulePause();
@@ -1932,6 +2139,17 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   const undo = useCallback(() => {
     const prev = undoStack.current.pop();
     if (!prev) return;
+    const now = new Set(strokes.current.map((x) => x.id));
+    const then = new Set(prev.map((x) => x.id));
+    const removed = [...now].filter((id) => !then.has(id));
+    const back = prev.filter((x) => !now.has(x.id));
+    const log = rec();
+    if (log) {
+      log.erase("student", removed, "undo");
+      if (back.length) log.push({ t: log.now(), type: "restore", who: "student", ids: back.map((x) => x.id) });
+    }
+    hostRoom.current?.erased(removed);
+    for (const b of back) hostRoom.current?.studentStroke(b, true);
     strokes.current = prev;
     changedSinceTutor.current = true;
     dirty.current = true;
@@ -1996,10 +2214,12 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     undoStack.current.push([...strokes.current]);
     strokes.current = [];
     tutorInk.current = [];
+    guestInk.current.clear();
     setImages([]);
     paths.current.clear();
     tutorPaths.current.clear();
     sessionId.current = crypto.randomUUID();
+    restartRecording();
     sims.current = [];
     setModels([]);
     simRuns.current.clear();
@@ -2012,6 +2232,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     hush();
     strokes.current = [];
     tutorInk.current = [];
+    guestInk.current.clear();
     setImages([]);
     setPaper(null);
     sims.current = [];
@@ -2021,6 +2242,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
     tutorPaths.current.clear();
     undoStack.current = [];
     sessionId.current = crypto.randomUUID();
+    restartRecording();
     stats.current = newStats();
     setProblem("");
     setCaption("Fresh page. What are we working on next?");
@@ -2095,6 +2317,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       hush();
       strokes.current = [];
       tutorInk.current = [];
+      guestInk.current.clear();
       paths.current.clear();
       tutorPaths.current.clear();
       undoStack.current = [];
@@ -2104,6 +2327,7 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
       simRuns.current.clear();
       setImages([]);
       sessionId.current = crypto.randomUUID();
+      restartRecording();
       stats.current = newStats();
       setPaper(layoutPaper(data, { id: data.id, title: data.title, x: 0, y: 0, w: PAPER_W }));
       setProblem(data.title);
@@ -2154,12 +2378,159 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
   // Tapping the tutor while it talks cuts it short, like raising a hand.
   const interrupt = () => {
     if (stateRef.current.tutorState !== "speaking") return;
+    const log = rec();
+    const sh = show.current;
+    if (log) log.push({ t: log.now(), type: "interrupt", by: "tap", turn: sh?.turn ?? null, beat: sh?.playing ? sh.acts.indexOf(sh.playing) + 1 : null, during: "speaking" });
     inFlight.current?.abort.abort();
     inFlight.current = null;
     stopShow();
     stopSpeaking();
     settle();
   };
+
+  // ---------- study tools ----------
+  const setMannersNow = (m: Manners) => {
+    manners.current = m;
+    setMannersShown(m);
+    try {
+      sessionStorage.setItem("coink:break", Object.entries(m).filter(([, v]) => v).map(([k]) => k).join(","));
+    } catch {
+      // only a convenience
+    }
+    // the switches belong to a session: changing them starts a new recording
+    if (rec()?.events.length) {
+      sessionId.current = crypto.randomUUID();
+      restartRecording();
+    } else if (rec()) rec()!.manners = m;
+  };
+
+  const setVoice = async (on: boolean) => {
+    recordVoiceRef.current = on;
+    setRecordVoice(on);
+    if (hostRoom.current) return; // the room records with the call's microphone
+    try {
+      if (on) await recorder.current.startVoice();
+      else await recorder.current.stopVoice();
+    } catch (e) {
+      recordVoiceRef.current = false;
+      setRecordVoice(false);
+      setError(e instanceof Error ? e.message : "The microphone could not be recorded.");
+    }
+  };
+
+  const downloadRecording = async () => {
+    await recorder.current.save(true);
+    const id = rec()?.id ?? recInfo?.id;
+    const stored = id ? await loadRecording(id) : undefined;
+    if (!stored) return flash("Nothing recorded yet.");
+    const stem = fileStem(stored.file);
+    downloadBlob(new Blob([JSON.stringify(stored.file)], { type: "application/json" }), `${stem}.coink.json`);
+    for (const a of stored.audio ?? []) downloadBlob(a.blob, `${stem}-${a.who}.${audioExt(a.mime)}`);
+  };
+
+  const openRoom = async () => {
+    if (hostRoom.current) return;
+    hush();
+    const code = roomCode();
+    const link = `${location.origin}/tutor-pen?room=${code}`;
+    // the human tutor's session is a session of its own
+    sessionId.current = crypto.randomUUID();
+    const r = new HostRoom({
+      code,
+      recorder: recorder.current,
+      recordVoice: recordVoiceRef.current,
+      guestInk: guestInk.current,
+      sessionId: () => sessionId.current,
+      page: () => ({
+        strokes: strokes.current.map(plainStroke),
+        tutor: tutorInk.current
+          .filter((t) => t.born !== Infinity)
+          .flatMap((t) => t.plan.strokes.map((st, i) => ({ id: `${t.id}:${i}`, color: TUTOR_INK, size: st.w ?? 3.6, points: st.points.map(([x, y]) => [x, y, 0.5] as [number, number, number]) }))),
+        guest: [...guestInk.current.values()].map(plainStroke),
+        problem: stateRef.current.problem,
+      }),
+      onInk: (id) => {
+        if (id) paths.current.delete(id);
+        dirty.current = true;
+      },
+      onState: (st) =>
+        setRoom((cur) => {
+          if (cur && st.guest && st.guest !== cur.guest) setCaption(`${st.guest} is here. Write and talk as you normally would.`);
+          return cur ? { ...cur, ...st } : cur;
+        }),
+      onSaid: (text) => setCaption(text),
+    });
+    hostRoom.current = r;
+    await recorder.current.stopVoice();
+    await startRecording();
+    setRoom({ code, link, status: "connecting", guest: null, call: null, offsetMs: null });
+    setCaption("A tutor is joining from another device. Write as you normally would.");
+    await r.open();
+  };
+
+  const closeRoom = async () => {
+    const r = hostRoom.current;
+    if (!r) return;
+    await r.close();
+    hostRoom.current = null;
+    setRoom(null);
+    save();
+    sessionId.current = crypto.randomUUID();
+    restartRecording();
+    setCaption("The tutor session has ended and is saved.");
+  };
+
+  // ---------- a solo session in blocks ----------
+  const mannersFor = (kind: BlockKind): Manners => (kind === "standard" ? KEPT : { ...KEPT, [kind]: true });
+  const runBlock = (b: BlockRun) => {
+    blocksRef.current = b;
+    setBlocks(b);
+    manners.current = mannersFor(b.order[b.index]);
+    setMannersShown(manners.current);
+    newProblem(); // a fresh page and a new recording, with this block's manners
+    setCaption(`Part ${b.index + 1} of ${b.order.length}. Write your problem anywhere on the page.`);
+  };
+  const startBlocks = (order: BlockKind[], minutes: number) => {
+    if (!order.length) return;
+    setToolsOpen(false);
+    runBlock({ order, minutes, index: 0, endsAt: Date.now() + minutes * 60_000 });
+  };
+  const endBlock = () => {
+    const b = blocksRef.current;
+    if (!b || blockSurveyOpen.current) return;
+    hush();
+    blockSurveyOpen.current = true;
+    setToolsOpen(false);
+    setBlockSurvey({ n: b.index + 1, of: b.order.length });
+  };
+  const submitBlock = async (r: { ratings: Record<string, number>; answers: Record<string, string> }) => {
+    const b = blocksRef.current;
+    const log = rec();
+    if (log) log.push({ t: log.now(), type: "survey", ratings: r.ratings, answers: r.answers });
+    if (b) logEvent(account, "block_survey", { block: b.index + 1, of: b.order.length, kind: b.order[b.index], ...r.ratings, ...r.answers, recording: log?.id ?? null }, sessionId.current);
+    blockSurveyOpen.current = false;
+    setBlockSurvey(null);
+    if (!b) return;
+    if (b.index + 1 < b.order.length) runBlock({ ...b, index: b.index + 1, endsAt: Date.now() + b.minutes * 60_000 });
+    else stopBlocks("All parts are done. Thank you!");
+  };
+  const stopBlocks = (message = "Blocks stopped.") => {
+    blocksRef.current = null;
+    setBlocks(null);
+    manners.current = KEPT;
+    setMannersShown(KEPT);
+    sessionId.current = crypto.randomUUID();
+    restartRecording();
+    setCaption(message);
+  };
+  useEffect(() => {
+    if (!blocks) return;
+    const id = setInterval(() => {
+      if (blocksRef.current && Date.now() >= blocksRef.current.endsAt) endBlock();
+    }, 1000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blocks]);
 
   const status =
     tutorState === "speaking"
@@ -2246,6 +2617,11 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
               />
             </>
           )}
+          {mode === "study" && toolsAllowed && (
+            <button className={toolsOpen ? "on" : ""} onClick={() => setToolsOpen((o) => !o)} aria-expanded={toolsOpen} title="Study session tools: recording, a human tutor, the tutor's manners">
+              Session{room ? <span className="badge">tutor</span> : blocks ? <span className="badge">{blocks.index + 1}</span> : null}
+            </button>
+          )}
           {mode === "study" && (
             <button className={reports ? "on" : ""} onClick={showReports} aria-expanded={!!reports} title="Reports of your past sessions">
               Reports
@@ -2261,6 +2637,29 @@ export default function StudyCanvas({ account }: { account: Account | null }) {
         </div>
         {account && <AccountMenu account={account} sessionId={sessionId} onSignOut={flushCloud} />}
       </header>
+
+      {toolsOpen && mode === "study" && (
+        <StudyToolsPanel
+          manners={mannersShown}
+          onManners={setMannersNow}
+          recordVoice={recordVoice}
+          onRecordVoice={(on) => void setVoice(on)}
+          recording={recInfo}
+          onSaveNow={() => void recorder.current.save(true)}
+          onDownload={() => void downloadRecording()}
+          room={room}
+          onOpenRoom={() => void openRoom()}
+          onCloseRoom={() => void closeRoom()}
+          blocks={blocks}
+          onStartBlocks={startBlocks}
+          onEndBlock={endBlock}
+          onStopBlocks={() => stopBlocks()}
+          cloud={Boolean(account)}
+          onClose={() => setToolsOpen(false)}
+        />
+      )}
+
+      {blockSurvey && <BlockSurvey n={blockSurvey.n} of={blockSurvey.of} onSubmit={(r) => void submitBlock(r)} />}
 
       {panelOpen && mode === "study" && (
         <ReviewPanel

@@ -68,6 +68,20 @@ Scheduling is FSRS through [ts-fsrs](https://github.com/open-spaced-repetition/t
 
 Each tutor turn also reports the concept the moment is about and whether the page shows a slip, progress or a solved step. That evidence (counted once per session) and how well each concept's cards are being recalled make up the mastery percentage. The weakest concepts go back to the tutor on every turn so it can watch for them.
 
+## Study sessions
+
+For the DIS study there is a session recorder with a replay tool, a tutor pen that lets a person tutor from a second device, and switches that turn off one of the tutor's manners, run as timed blocks with ratings after each. How to run a pair session and a solo session is in [STUDY-SESSIONS.md](STUDY-SESSIONS.md).
+
+| Piece | Where |
+| --- | --- |
+| Session file format, the page at any moment, events CSV | `lib/session-log.ts` |
+| The four counts taken from a recording | `lib/session-measures.ts` |
+| Recording the current session, saving it, voice | `lib/session-recorder.ts`, `lib/mic-recorder.ts`, `lib/recording-store.ts` |
+| The manners and their switches | `lib/manners.ts` |
+| Tutor pen: the room, clock matching, the voice call | `lib/tutor-room.ts`, `lib/room-clock.ts`, `lib/host-room.ts`, `components/TutorPen.tsx`, `app/api/room/` |
+| Researcher panel and block ratings | `components/StudyToolsPanel.tsx` |
+| Replay | `components/Replay.tsx`, `app/replay/` |
+
 ## Scripts
 
 - `npm test` runs the ink and handwriting tests.

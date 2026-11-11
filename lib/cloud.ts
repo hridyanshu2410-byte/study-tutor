@@ -18,7 +18,7 @@ export type Account = {
   postQuiz: boolean;
 };
 
-export type EventKind = "card_created" | "review_graded" | "review_started" | "deck_imported" | "feedback" | "session_finished" | "survey" | "test" | "photo_added" | "sim_watched" | "paper_opened";
+export type EventKind = "card_created" | "review_graded" | "review_started" | "deck_imported" | "feedback" | "session_finished" | "survey" | "test" | "photo_added" | "sim_watched" | "paper_opened" | "block_survey";
 
 type Column = "page" | "memory";
 

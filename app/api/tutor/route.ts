@@ -10,6 +10,7 @@ import { conditionOf, dailyTutorLimit, startOfUtcDay, type Condition } from "@/l
 import { describeModel } from "@/lib/model3d";
 import { allowedMoves, EXPLAIN_PROMPT, LADDER, LITERATURE_PROMPT, MOVES, PAPER_PROMPT, REVIEW_PROMPT, TUTOR_SYSTEM_PROMPT, tutorTurnSchema, type Beat, type PublicTurn, type TurnEnd, type TutorRequest, type TutorTurn } from "@/lib/tutor";
 import { BeatChecker, readingFlag, TurnScanner } from "@/lib/turn-stream";
+import { brokenManners, readManners, WRITE_STEP_PROMPT } from "@/lib/manners";
 
 // The tutor runs on Claude when ANTHROPIC_API_KEY is set, otherwise on OpenAI
 // (OPENAI_TUTOR_MODEL, default GPT-6 Sol). TUTOR_PROVIDER forces one.
@@ -386,8 +387,16 @@ export async function POST(req: Request) {
     .join("\n\n");
 
   const started = Date.now();
-  const schema = tutorTurnSchema(explaining || paper ? MOVES : allowedMoves(lastRung));
-  const system = [TUTOR_SYSTEM_PROMPT, reviewing ? REVIEW_PROMPT : paper ? (paper.kind === "paper" ? PAPER_PROMPT : LITERATURE_PROMPT) : explaining ? EXPLAIN_PROMPT : ""].filter(Boolean).join("\n\n");
+  // A study session can break "point before you write": the tutor then writes the next step itself.
+  const manners = readManners(body.manners);
+  const writesStep = manners.writeStep && !reviewing && !paper && !explaining;
+  const schema = tutorTurnSchema(explaining || paper || writesStep ? MOVES : allowedMoves(lastRung));
+  const system = [
+    TUTOR_SYSTEM_PROMPT,
+    reviewing ? REVIEW_PROMPT : paper ? (paper.kind === "paper" ? PAPER_PROMPT : LITERATURE_PROMPT) : explaining ? EXPLAIN_PROMPT : writesStep ? WRITE_STEP_PROMPT : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
   const cacheKey = `tutor-${createHash("sha256").update(system).update(paper?.text ?? "").digest("hex").slice(0, 32)}`;
   const known = new Set(body.lines.map((l) => l.id));
   // The student closed the page or cut the tutor off: stop writing the turn.
@@ -556,6 +565,7 @@ export async function POST(req: Request) {
           ...record,
           mode: reviewing ? "review" : "study",
           condition,
+          manners_broken: brokenManners(manners),
           has_photo: Boolean(body.hasPhoto),
           paper: paper?.title ?? null,
           problem: body.problem.slice(0, 500),
